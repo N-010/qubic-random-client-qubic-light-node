@@ -1,5 +1,13 @@
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
+};
 use rand::Rng;
 use rand::seq::SliceRandom;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
@@ -9,19 +17,62 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep, timeout};
+use tonic::transport::Server;
+use tonic::{Request, Response, Status};
+
+pub mod lightnodepb {
+    tonic::include_proto!("lightnode");
+}
+
+const LIGHTNODE_FILE_DESCRIPTOR_SET: &[u8] =
+    tonic::include_file_descriptor_set!("lightnode_descriptor");
 
 const DEFAULT_PORT: u16 = 21841;
+const DEFAULT_API_PORT: u16 = 8090;
+const DEFAULT_GRPC_PORT: u16 = 50051;
 const HEADER_SIZE: usize = 8;
 const MAX_FRAME_SIZE: usize = 0x00FF_FFFF;
 const EXCHANGE_PUBLIC_PEERS_TYPE: u8 = 0;
 const NUMBER_OF_EXCHANGED_PEERS: usize = 4;
 const EXCHANGE_PUBLIC_PEERS_FRAME_SIZE: usize = HEADER_SIZE + NUMBER_OF_EXCHANGED_PEERS * 4;
 const DEFAULT_DNS_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_API_TIMEOUT_MS: u64 = 6_000;
+
+const BROADCAST_TICK_TYPE: u8 = 3;
+const BROADCAST_TRANSACTION_TYPE: u8 = 24;
+const REQUEST_CURRENT_TICK_INFO_TYPE: u8 = 27;
+const RESPOND_CURRENT_TICK_INFO_TYPE: u8 = 28;
+const REQUEST_TICK_TRANSACTIONS_TYPE: u8 = 29;
+const REQUEST_ENTITY_TYPE: u8 = 31;
+const RESPOND_ENTITY_TYPE: u8 = 32;
+const END_RESPONSE_TYPE: u8 = 35;
+
+const REQUEST_TICK_TRANSACTION_FLAGS_SIZE: usize = 1024 / 8;
+const REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE: usize = 4 + REQUEST_TICK_TRANSACTION_FLAGS_SIZE;
+const RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE: usize = 16;
+const RESPOND_ENTITY_MIN_PAYLOAD_SIZE: usize = 72;
+const TRANSACTION_BASE_SIZE: usize = 80;
+const SIGNATURE_SIZE: usize = 64;
+
+#[derive(Clone, Copy, Debug, Serialize)]
+struct TickStatus {
+    epoch: u16,
+    tick: u32,
+    initial_tick: u32,
+    tick_duration_ms: u16,
+    aligned_votes: u16,
+    misaligned_votes: u16,
+}
 
 #[derive(Clone, Debug)]
 struct Config {
     listen_addr: SocketAddrV4,
+    api_listen_addr: SocketAddrV4,
+    api_enabled: bool,
+    api_timeout: Duration,
+    grpc_listen_addr: SocketAddr,
+    grpc_enabled: bool,
     network_port: u16,
     target_outbound: usize,
     max_incoming: usize,
@@ -50,6 +101,7 @@ struct NodeState {
     pending_dials: HashSet<SocketAddrV4>,
     seen_order: VecDeque<[u8; 32]>,
     seen_set: HashSet<[u8; 32]>,
+    latest_tick: Option<TickStatus>,
     max_seen: usize,
     next_peer_id: u64,
 }
@@ -68,6 +120,7 @@ impl NodeState {
             pending_dials: HashSet::new(),
             seen_order: VecDeque::new(),
             seen_set: HashSet::new(),
+            latest_tick: None,
             max_seen: max_seen.max(1_000),
             next_peer_id: 1,
         }
@@ -213,6 +266,90 @@ impl NodeState {
         }
         selected
     }
+
+    fn update_latest_tick(&mut self, tick_status: TickStatus) {
+        if let Some(current) = self.latest_tick {
+            let is_newer_epoch = tick_status.epoch > current.epoch;
+            let is_same_epoch_newer_tick =
+                tick_status.epoch == current.epoch && tick_status.tick >= current.tick;
+            let enrich_same_tick = tick_status.epoch == current.epoch
+                && tick_status.tick == current.tick
+                && tick_status.initial_tick != 0
+                && current.initial_tick == 0;
+
+            if is_newer_epoch || is_same_epoch_newer_tick || enrich_same_tick {
+                self.latest_tick = Some(tick_status);
+            }
+        } else {
+            self.latest_tick = Some(tick_status);
+        }
+    }
+
+    fn latest_tick(&self) -> Option<TickStatus> {
+        self.latest_tick
+    }
+
+    fn peer_candidates(&self, network_port: u16) -> Vec<SocketAddrV4> {
+        let mut peers = HashSet::<SocketAddrV4>::new();
+
+        for session in self.sessions.values() {
+            if is_bogon(session.remote.ip()) {
+                continue;
+            }
+            if session.outbound {
+                peers.insert(session.remote);
+            } else {
+                peers.insert(SocketAddrV4::new(*session.remote.ip(), network_port));
+            }
+        }
+
+        for peer in &self.known_peers {
+            if is_bogon(peer.ip()) {
+                continue;
+            }
+            peers.insert(*peer);
+        }
+
+        peers.into_iter().collect()
+    }
+}
+
+#[derive(Clone)]
+struct ApiState {
+    node_state: Arc<Mutex<NodeState>>,
+    config: Arc<Config>,
+}
+
+#[derive(Debug, Serialize)]
+struct BalanceResponse {
+    wallet: String,
+    public_key_hex: String,
+    tick: u32,
+    spectrum_index: i32,
+    incoming_amount: i64,
+    outgoing_amount: i64,
+    balance: i64,
+    number_of_incoming_transfers: u32,
+    number_of_outgoing_transfers: u32,
+    latest_incoming_transfer_tick: u32,
+    latest_outgoing_transfer_tick: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct TickTransaction {
+    source_public_key_hex: String,
+    destination_public_key_hex: String,
+    amount: i64,
+    tick: u32,
+    input_type: u16,
+    input_size: u16,
+    input_hex: String,
+    signature_hex: String,
+}
+
+#[derive(Clone)]
+struct GrpcService {
+    api: ApiState,
 }
 
 #[tokio::main]
@@ -261,18 +398,46 @@ async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
 
     println!(
-        "Qubic light relay started at {} | target_outbound={} | max_incoming={} | seed_peers={} | traffic_log={}",
+        "Qubic light relay started at {} | target_outbound={} | max_incoming={} | seed_peers={} | traffic_log={} | api={}({}) | grpc={}({})",
         config.listen_addr,
         config.target_outbound,
         config.max_incoming,
         config.seed_peers.len(),
-        config.traffic_log
+        config.traffic_log,
+        config.api_enabled,
+        config.api_listen_addr,
+        config.grpc_enabled,
+        config.grpc_listen_addr
     );
     if config.seed_peers.is_empty() {
         println!("No seed peers configured. Use --peer <ip[:port]> to join the public network.");
     }
 
     let shared_config = Arc::new(config);
+
+    if shared_config.api_enabled {
+        let api_state = ApiState {
+            node_state: Arc::clone(&state),
+            config: Arc::clone(&shared_config),
+        };
+        tokio::spawn(async move {
+            if let Err(err) = run_api_server(api_state).await {
+                eprintln!("API server stopped: {err}");
+            }
+        });
+    }
+
+    if shared_config.grpc_enabled {
+        let grpc_state = ApiState {
+            node_state: Arc::clone(&state),
+            config: Arc::clone(&shared_config),
+        };
+        tokio::spawn(async move {
+            if let Err(err) = run_grpc_server(grpc_state).await {
+                eprintln!("gRPC server stopped: {err}");
+            }
+        });
+    }
 
     let accept_state = Arc::clone(&state);
     let accept_config = Arc::clone(&shared_config);
@@ -289,6 +454,289 @@ async fn main() -> std::io::Result<()> {
     tokio::signal::ctrl_c().await?;
     println!("Shutdown signal received, stopping.");
     Ok(())
+}
+
+async fn run_api_server(api_state: ApiState) -> std::io::Result<()> {
+    let app = Router::new()
+        .route("/api/status", get(api_status))
+        .route("/api/balance/{wallet}", get(api_balance))
+        .route("/api/ticks/{tick}/transactions", get(api_tick_transactions))
+        .with_state(api_state.clone());
+
+    let listener = TcpListener::bind(api_state.config.api_listen_addr).await?;
+    println!("API listening on {}", api_state.config.api_listen_addr);
+
+    axum::serve(listener, app)
+        .await
+        .map_err(|err| std::io::Error::other(err.to_string()))
+}
+
+async fn run_grpc_server(api_state: ApiState) -> std::io::Result<()> {
+    let service = GrpcService {
+        api: api_state.clone(),
+    };
+    let reflection = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(LIGHTNODE_FILE_DESCRIPTOR_SET)
+        .build_v1()
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    println!("gRPC listening on {}", api_state.config.grpc_listen_addr);
+
+    Server::builder()
+        .add_service(reflection)
+        .add_service(lightnodepb::light_node_server::LightNodeServer::new(
+            service,
+        ))
+        .serve(api_state.config.grpc_listen_addr)
+        .await
+        .map_err(|err| std::io::Error::other(err.to_string()))
+}
+
+async fn api_status(State(api): State<ApiState>) -> impl IntoResponse {
+    match query_current_tick_info(Arc::clone(&api.node_state), Arc::clone(&api.config)).await {
+        Ok(status) => {
+            let mut locked = api.node_state.lock().await;
+            locked.update_latest_tick(status);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "source": "network",
+                    "status": status
+                })),
+            )
+        }
+        Err(network_err) => {
+            let cached = { api.node_state.lock().await.latest_tick() };
+            if let Some(status) = cached {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "ok": true,
+                        "source": "cache",
+                        "status": status,
+                        "warning": network_err
+                    })),
+                )
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": network_err
+                    })),
+                )
+            }
+        }
+    }
+}
+
+async fn api_balance(Path(wallet): Path<String>, State(api): State<ApiState>) -> impl IntoResponse {
+    let public_key = match parse_wallet_public_key(&wallet) {
+        Ok(pk) => pk,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": err
+                })),
+            );
+        }
+    };
+
+    match query_balance(
+        Arc::clone(&api.node_state),
+        Arc::clone(&api.config),
+        &wallet,
+        public_key,
+    )
+    .await
+    {
+        Ok(balance) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "balance": balance
+            })),
+        ),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": err
+            })),
+        ),
+    }
+}
+
+async fn api_tick_transactions(
+    Path(tick): Path<u32>,
+    State(api): State<ApiState>,
+) -> impl IntoResponse {
+    match query_tick_transactions(Arc::clone(&api.node_state), Arc::clone(&api.config), tick).await
+    {
+        Ok(transactions) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "tick": tick,
+                "count": transactions.len(),
+                "transactions": transactions
+            })),
+        ),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": err
+            })),
+        ),
+    }
+}
+
+#[tonic::async_trait]
+impl lightnodepb::light_node_server::LightNode for GrpcService {
+    async fn get_status(
+        &self,
+        _request: Request<lightnodepb::GetStatusRequest>,
+    ) -> Result<Response<lightnodepb::GetStatusResponse>, Status> {
+        match query_current_tick_info(
+            Arc::clone(&self.api.node_state),
+            Arc::clone(&self.api.config),
+        )
+        .await
+        {
+            Ok(status) => {
+                let mut locked = self.api.node_state.lock().await;
+                locked.update_latest_tick(status);
+                Ok(Response::new(lightnodepb::GetStatusResponse {
+                    ok: true,
+                    source: "network".to_string(),
+                    status: Some(map_tick_status(status)),
+                    warning: String::new(),
+                    error: String::new(),
+                }))
+            }
+            Err(network_err) => {
+                let cached = { self.api.node_state.lock().await.latest_tick() };
+                if let Some(status) = cached {
+                    Ok(Response::new(lightnodepb::GetStatusResponse {
+                        ok: true,
+                        source: "cache".to_string(),
+                        status: Some(map_tick_status(status)),
+                        warning: network_err,
+                        error: String::new(),
+                    }))
+                } else {
+                    Ok(Response::new(lightnodepb::GetStatusResponse {
+                        ok: false,
+                        source: String::new(),
+                        status: None,
+                        warning: String::new(),
+                        error: network_err,
+                    }))
+                }
+            }
+        }
+    }
+
+    async fn get_balance(
+        &self,
+        request: Request<lightnodepb::GetBalanceRequest>,
+    ) -> Result<Response<lightnodepb::GetBalanceResponse>, Status> {
+        let wallet = request.into_inner().wallet;
+        let public_key = parse_wallet_public_key(&wallet).map_err(Status::invalid_argument)?;
+
+        match query_balance(
+            Arc::clone(&self.api.node_state),
+            Arc::clone(&self.api.config),
+            &wallet,
+            public_key,
+        )
+        .await
+        {
+            Ok(balance) => Ok(Response::new(lightnodepb::GetBalanceResponse {
+                ok: true,
+                balance: Some(map_balance(balance)),
+                error: String::new(),
+            })),
+            Err(err) => Ok(Response::new(lightnodepb::GetBalanceResponse {
+                ok: false,
+                balance: None,
+                error: err,
+            })),
+        }
+    }
+
+    async fn get_tick_transactions(
+        &self,
+        request: Request<lightnodepb::GetTickTransactionsRequest>,
+    ) -> Result<Response<lightnodepb::GetTickTransactionsResponse>, Status> {
+        let tick = request.into_inner().tick;
+        match query_tick_transactions(
+            Arc::clone(&self.api.node_state),
+            Arc::clone(&self.api.config),
+            tick,
+        )
+        .await
+        {
+            Ok(transactions) => Ok(Response::new(lightnodepb::GetTickTransactionsResponse {
+                ok: true,
+                tick,
+                transactions: transactions
+                    .into_iter()
+                    .map(map_transaction)
+                    .collect::<Vec<_>>(),
+                error: String::new(),
+            })),
+            Err(err) => Ok(Response::new(lightnodepb::GetTickTransactionsResponse {
+                ok: false,
+                tick,
+                transactions: Vec::new(),
+                error: err,
+            })),
+        }
+    }
+}
+
+fn map_tick_status(status: TickStatus) -> lightnodepb::TickStatus {
+    lightnodepb::TickStatus {
+        epoch: status.epoch as u32,
+        tick: status.tick,
+        initial_tick: status.initial_tick,
+        tick_duration_ms: status.tick_duration_ms as u32,
+        aligned_votes: status.aligned_votes as u32,
+        misaligned_votes: status.misaligned_votes as u32,
+    }
+}
+
+fn map_balance(balance: BalanceResponse) -> lightnodepb::Balance {
+    lightnodepb::Balance {
+        wallet: balance.wallet,
+        public_key_hex: balance.public_key_hex,
+        tick: balance.tick,
+        spectrum_index: balance.spectrum_index,
+        incoming_amount: balance.incoming_amount,
+        outgoing_amount: balance.outgoing_amount,
+        balance: balance.balance,
+        number_of_incoming_transfers: balance.number_of_incoming_transfers,
+        number_of_outgoing_transfers: balance.number_of_outgoing_transfers,
+        latest_incoming_transfer_tick: balance.latest_incoming_transfer_tick,
+        latest_outgoing_transfer_tick: balance.latest_outgoing_transfer_tick,
+    }
+}
+
+fn map_transaction(tx: TickTransaction) -> lightnodepb::Transaction {
+    lightnodepb::Transaction {
+        source_public_key_hex: tx.source_public_key_hex,
+        destination_public_key_hex: tx.destination_public_key_hex,
+        amount: tx.amount,
+        tick: tx.tick,
+        input_type: tx.input_type as u32,
+        input_size: tx.input_size as u32,
+        input_hex: tx.input_hex,
+        signature_hex: tx.signature_hex,
+    }
 }
 
 async fn accept_loop(listener: TcpListener, state: Arc<Mutex<NodeState>>, config: Arc<Config>) {
@@ -522,23 +970,33 @@ async fn process_incoming_frame(
     let message_type = frame[3];
     let dejavu = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
 
-    if message_type == EXCHANGE_PUBLIC_PEERS_TYPE {
-        let discovered = parse_exchange_public_peers(&frame, config.network_port);
-        if !discovered.is_empty() {
-            let mut locked = state.lock().await;
-            for peer in discovered {
-                let _ = locked.add_discovered_peer(peer);
-            }
-        }
-    }
+    let discovered = if message_type == EXCHANGE_PUBLIC_PEERS_TYPE {
+        parse_exchange_public_peers(&frame, config.network_port)
+    } else {
+        Vec::new()
+    };
+    let tick_update = parse_tick_status_from_frame(&frame);
 
     if !config.relay_all && dejavu != 0 {
+        let mut locked = state.lock().await;
+        if let Some(status) = tick_update {
+            locked.update_latest_tick(status);
+        }
+        for peer in discovered {
+            let _ = locked.add_discovered_peer(peer);
+        }
         return;
     }
 
     let digest = *blake3::hash(&frame).as_bytes();
     let targets = {
         let mut locked = state.lock().await;
+        if let Some(status) = tick_update {
+            locked.update_latest_tick(status);
+        }
+        for peer in discovered {
+            let _ = locked.add_discovered_peer(peer);
+        }
         if !locked.mark_seen(digest) {
             if config.traffic_log {
                 let (size, message_type, dejavu) = frame_meta(&frame);
@@ -760,9 +1218,534 @@ fn collect_peers_from_json(
     }
 }
 
+fn build_request_frame(message_type: u8, dejavu: u32, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let size = HEADER_SIZE + payload.len();
+    if !(HEADER_SIZE..=MAX_FRAME_SIZE).contains(&size) {
+        return Err(format!("Invalid frame size {size}"));
+    }
+
+    let mut frame = Vec::with_capacity(size);
+    frame.push((size & 0xFF) as u8);
+    frame.push(((size >> 8) & 0xFF) as u8);
+    frame.push(((size >> 16) & 0xFF) as u8);
+    frame.push(message_type);
+    frame.extend_from_slice(&dejavu.to_le_bytes());
+    frame.extend_from_slice(payload);
+    Ok(frame)
+}
+
+fn frame_payload(frame: &[u8]) -> Result<&[u8], String> {
+    if frame.len() < HEADER_SIZE {
+        return Err("Frame is smaller than header".to_string());
+    }
+
+    let frame_size = decode_frame_size(frame);
+    if frame_size != frame.len() {
+        return Err(format!(
+            "Frame length mismatch: header={frame_size} actual={}",
+            frame.len()
+        ));
+    }
+    Ok(&frame[HEADER_SIZE..])
+}
+
+fn parse_tick_status_from_frame(frame: &[u8]) -> Option<TickStatus> {
+    if frame.len() < HEADER_SIZE {
+        return None;
+    }
+
+    match frame[3] {
+        RESPOND_CURRENT_TICK_INFO_TYPE => {
+            let payload = frame_payload(frame).ok()?;
+            parse_current_tick_info_payload(payload).ok()
+        }
+        BROADCAST_TICK_TYPE => {
+            let payload = frame_payload(frame).ok()?;
+            if payload.len() < 8 {
+                return None;
+            }
+            Some(TickStatus {
+                epoch: read_u16(payload, 2)?,
+                tick: read_u32(payload, 4)?,
+                initial_tick: 0,
+                tick_duration_ms: 0,
+                aligned_votes: 0,
+                misaligned_votes: 0,
+            })
+        }
+        _ => None,
+    }
+}
+
+async fn query_current_tick_info(
+    state: Arc<Mutex<NodeState>>,
+    config: Arc<Config>,
+) -> Result<TickStatus, String> {
+    let mut peers = {
+        let locked = state.lock().await;
+        locked.peer_candidates(config.network_port)
+    };
+    if peers.is_empty() {
+        return Err("No known peers available".to_string());
+    }
+
+    {
+        let mut rng = rand::rng();
+        peers.shuffle(&mut rng);
+    }
+
+    let mut last_err = String::new();
+    for peer in peers {
+        match query_current_tick_info_from_peer(peer, config.api_timeout).await {
+            Ok(info) => return Ok(info),
+            Err(err) => {
+                last_err = format!("{peer}: {err}");
+            }
+        }
+    }
+    Err(format!(
+        "Failed to query current tick info from peers: {last_err}"
+    ))
+}
+
+async fn query_current_tick_info_from_peer(
+    peer: SocketAddrV4,
+    timeout_duration: Duration,
+) -> Result<TickStatus, String> {
+    let mut stream = connect_to_peer(peer, timeout_duration).await?;
+    send_handshake_frame(&mut stream, timeout_duration).await?;
+
+    let dejavu = random_non_zero_u32();
+    let request = build_request_frame(REQUEST_CURRENT_TICK_INFO_TYPE, dejavu, &[])?;
+    write_frame(&mut stream, &request, timeout_duration).await?;
+
+    let deadline = Instant::now() + timeout_duration;
+    loop {
+        let frame = read_frame_until_deadline(&mut stream, deadline).await?;
+        let response_dejavu = frame_dejavu(&frame)?;
+        if response_dejavu != dejavu {
+            continue;
+        }
+
+        match frame[3] {
+            RESPOND_CURRENT_TICK_INFO_TYPE => {
+                let payload = frame_payload(&frame)?;
+                return parse_current_tick_info_payload(payload);
+            }
+            END_RESPONSE_TYPE => {
+                return Err("Peer returned END_RESPONSE without tick info".to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn query_balance(
+    state: Arc<Mutex<NodeState>>,
+    config: Arc<Config>,
+    wallet: &str,
+    public_key: [u8; 32],
+) -> Result<BalanceResponse, String> {
+    let mut peers = {
+        let locked = state.lock().await;
+        locked.peer_candidates(config.network_port)
+    };
+    if peers.is_empty() {
+        return Err("No known peers available".to_string());
+    }
+
+    {
+        let mut rng = rand::rng();
+        peers.shuffle(&mut rng);
+    }
+
+    let mut last_err = String::new();
+    for peer in peers {
+        match query_balance_from_peer(peer, config.api_timeout, wallet, public_key).await {
+            Ok(info) => return Ok(info),
+            Err(err) => {
+                last_err = format!("{peer}: {err}");
+            }
+        }
+    }
+    Err(format!("Failed to query balance from peers: {last_err}"))
+}
+
+async fn query_balance_from_peer(
+    peer: SocketAddrV4,
+    timeout_duration: Duration,
+    wallet: &str,
+    public_key: [u8; 32],
+) -> Result<BalanceResponse, String> {
+    let mut stream = connect_to_peer(peer, timeout_duration).await?;
+    send_handshake_frame(&mut stream, timeout_duration).await?;
+
+    let dejavu = random_non_zero_u32();
+    let request = build_request_frame(REQUEST_ENTITY_TYPE, dejavu, &public_key)?;
+    write_frame(&mut stream, &request, timeout_duration).await?;
+
+    let deadline = Instant::now() + timeout_duration;
+    loop {
+        let frame = read_frame_until_deadline(&mut stream, deadline).await?;
+        let response_dejavu = frame_dejavu(&frame)?;
+        if response_dejavu != dejavu {
+            continue;
+        }
+
+        match frame[3] {
+            RESPOND_ENTITY_TYPE => {
+                let payload = frame_payload(&frame)?;
+                return parse_balance_payload(wallet, payload);
+            }
+            END_RESPONSE_TYPE => {
+                return Err("Peer returned END_RESPONSE without balance data".to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn query_tick_transactions(
+    state: Arc<Mutex<NodeState>>,
+    config: Arc<Config>,
+    tick: u32,
+) -> Result<Vec<TickTransaction>, String> {
+    let mut peers = {
+        let locked = state.lock().await;
+        locked.peer_candidates(config.network_port)
+    };
+    if peers.is_empty() {
+        return Err("No known peers available".to_string());
+    }
+
+    {
+        let mut rng = rand::rng();
+        peers.shuffle(&mut rng);
+    }
+
+    let mut last_err = String::new();
+    for peer in peers {
+        match query_tick_transactions_from_peer(peer, config.api_timeout, tick).await {
+            Ok(txs) => return Ok(txs),
+            Err(err) => {
+                last_err = format!("{peer}: {err}");
+            }
+        }
+    }
+    Err(format!(
+        "Failed to query tick transactions from peers: {last_err}"
+    ))
+}
+
+async fn query_tick_transactions_from_peer(
+    peer: SocketAddrV4,
+    timeout_duration: Duration,
+    tick: u32,
+) -> Result<Vec<TickTransaction>, String> {
+    let mut stream = connect_to_peer(peer, timeout_duration).await?;
+    send_handshake_frame(&mut stream, timeout_duration).await?;
+
+    let dejavu = random_non_zero_u32();
+    let mut payload = vec![0u8; REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE];
+    payload[0..4].copy_from_slice(&tick.to_le_bytes());
+
+    let request = build_request_frame(REQUEST_TICK_TRANSACTIONS_TYPE, dejavu, &payload)?;
+    write_frame(&mut stream, &request, timeout_duration).await?;
+
+    let deadline = Instant::now() + timeout_duration;
+    let mut transactions = Vec::<TickTransaction>::new();
+    loop {
+        let frame = read_frame_until_deadline(&mut stream, deadline).await?;
+        let response_dejavu = frame_dejavu(&frame)?;
+        if response_dejavu != dejavu {
+            continue;
+        }
+
+        match frame[3] {
+            BROADCAST_TRANSACTION_TYPE => {
+                let tx_payload = frame_payload(&frame)?;
+                transactions.push(parse_transaction_payload(tx_payload)?);
+            }
+            END_RESPONSE_TYPE => return Ok(transactions),
+            _ => {}
+        }
+    }
+}
+
+async fn connect_to_peer(
+    peer: SocketAddrV4,
+    timeout_duration: Duration,
+) -> Result<TcpStream, String> {
+    let stream = timeout(timeout_duration, TcpStream::connect(peer))
+        .await
+        .map_err(|_| format!("connect timeout after {} ms", timeout_duration.as_millis()))
+        .and_then(|result| result.map_err(|err| err.to_string()))?;
+
+    if let Err(err) = stream.set_nodelay(true) {
+        return Err(format!("set_nodelay failed: {err}"));
+    }
+    Ok(stream)
+}
+
+async fn send_handshake_frame(
+    stream: &mut TcpStream,
+    timeout_duration: Duration,
+) -> Result<(), String> {
+    let handshake = build_exchange_public_peers_frame([
+        Ipv4Addr::new(0, 0, 0, 0),
+        Ipv4Addr::new(0, 0, 0, 0),
+        Ipv4Addr::new(0, 0, 0, 0),
+        Ipv4Addr::new(0, 0, 0, 0),
+    ]);
+    write_frame(stream, &handshake, timeout_duration).await
+}
+
+async fn write_frame(
+    stream: &mut TcpStream,
+    frame: &[u8],
+    timeout_duration: Duration,
+) -> Result<(), String> {
+    timeout(timeout_duration, stream.write_all(frame))
+        .await
+        .map_err(|_| format!("write timeout after {} ms", timeout_duration.as_millis()))
+        .and_then(|result| result.map_err(|err| err.to_string()))
+}
+
+async fn read_frame_until_deadline(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
+    let mut header = [0u8; HEADER_SIZE];
+    read_exact_until_deadline(stream, &mut header, deadline).await?;
+
+    let frame_size = decode_frame_size(&header);
+    if !(HEADER_SIZE..=MAX_FRAME_SIZE).contains(&frame_size) {
+        return Err(format!("Invalid frame size {frame_size}"));
+    }
+
+    let payload_size = frame_size - HEADER_SIZE;
+    let mut frame = Vec::<u8>::with_capacity(frame_size);
+    frame.extend_from_slice(&header);
+
+    if payload_size > 0 {
+        let mut payload = vec![0u8; payload_size];
+        read_exact_until_deadline(stream, &mut payload, deadline).await?;
+        frame.extend_from_slice(&payload);
+    }
+
+    Ok(frame)
+}
+
+async fn read_exact_until_deadline(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> Result<(), String> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| "request timeout".to_string())?;
+
+    timeout(remaining, stream.read_exact(buffer))
+        .await
+        .map_err(|_| "read timeout".to_string())
+        .and_then(|result| result.map(|_| ()).map_err(|err| err.to_string()))
+}
+
+fn frame_dejavu(frame: &[u8]) -> Result<u32, String> {
+    if frame.len() < HEADER_SIZE {
+        return Err("Frame too small".to_string());
+    }
+    Ok(u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]))
+}
+
+fn parse_current_tick_info_payload(payload: &[u8]) -> Result<TickStatus, String> {
+    if payload.len() < RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE {
+        return Err(format!(
+            "RespondCurrentTickInfo payload too small: {}",
+            payload.len()
+        ));
+    }
+
+    Ok(TickStatus {
+        tick_duration_ms: read_u16(payload, 0).ok_or_else(|| "tickDuration missing".to_string())?,
+        epoch: read_u16(payload, 2).ok_or_else(|| "epoch missing".to_string())?,
+        tick: read_u32(payload, 4).ok_or_else(|| "tick missing".to_string())?,
+        aligned_votes: read_u16(payload, 8).ok_or_else(|| "aligned votes missing".to_string())?,
+        misaligned_votes: read_u16(payload, 10)
+            .ok_or_else(|| "misaligned votes missing".to_string())?,
+        initial_tick: read_u32(payload, 12).ok_or_else(|| "initial tick missing".to_string())?,
+    })
+}
+
+fn parse_balance_payload(wallet: &str, payload: &[u8]) -> Result<BalanceResponse, String> {
+    if payload.len() < RESPOND_ENTITY_MIN_PAYLOAD_SIZE {
+        return Err(format!(
+            "RespondEntity payload too small: {}",
+            payload.len()
+        ));
+    }
+
+    let incoming_amount =
+        read_i64(payload, 32).ok_or_else(|| "incomingAmount missing".to_string())?;
+    let outgoing_amount =
+        read_i64(payload, 40).ok_or_else(|| "outgoingAmount missing".to_string())?;
+
+    Ok(BalanceResponse {
+        wallet: wallet.to_string(),
+        public_key_hex: format!("0x{}", bytes_to_hex(&payload[0..32])),
+        tick: read_u32(payload, 64).ok_or_else(|| "tick missing".to_string())?,
+        spectrum_index: read_i32(payload, 68).ok_or_else(|| "spectrumIndex missing".to_string())?,
+        incoming_amount,
+        outgoing_amount,
+        balance: incoming_amount - outgoing_amount,
+        number_of_incoming_transfers: read_u32(payload, 48)
+            .ok_or_else(|| "numberOfIncomingTransfers missing".to_string())?,
+        number_of_outgoing_transfers: read_u32(payload, 52)
+            .ok_or_else(|| "numberOfOutgoingTransfers missing".to_string())?,
+        latest_incoming_transfer_tick: read_u32(payload, 56)
+            .ok_or_else(|| "latestIncomingTransferTick missing".to_string())?,
+        latest_outgoing_transfer_tick: read_u32(payload, 60)
+            .ok_or_else(|| "latestOutgoingTransferTick missing".to_string())?,
+    })
+}
+
+fn parse_transaction_payload(payload: &[u8]) -> Result<TickTransaction, String> {
+    if payload.len() < TRANSACTION_BASE_SIZE + SIGNATURE_SIZE {
+        return Err(format!("Transaction payload too small: {}", payload.len()));
+    }
+
+    let input_size = read_u16(payload, 78).ok_or_else(|| "inputSize missing".to_string())? as usize;
+    let expected_size = TRANSACTION_BASE_SIZE + input_size + SIGNATURE_SIZE;
+    if payload.len() != expected_size {
+        return Err(format!(
+            "Transaction payload size mismatch: expected {expected_size}, got {}",
+            payload.len()
+        ));
+    }
+
+    let input_start = TRANSACTION_BASE_SIZE;
+    let input_end = input_start + input_size;
+    let signature_start = input_end;
+
+    Ok(TickTransaction {
+        source_public_key_hex: format!("0x{}", bytes_to_hex(&payload[0..32])),
+        destination_public_key_hex: format!("0x{}", bytes_to_hex(&payload[32..64])),
+        amount: read_i64(payload, 64).ok_or_else(|| "amount missing".to_string())?,
+        tick: read_u32(payload, 72).ok_or_else(|| "tick missing".to_string())?,
+        input_type: read_u16(payload, 76).ok_or_else(|| "inputType missing".to_string())?,
+        input_size: input_size as u16,
+        input_hex: bytes_to_hex(&payload[input_start..input_end]),
+        signature_hex: bytes_to_hex(&payload[signature_start..]),
+    })
+}
+
+fn parse_wallet_public_key(input: &str) -> Result<[u8; 32], String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Wallet is empty".to_string());
+    }
+
+    if let Ok(hex_key) = parse_public_key_hex(trimmed) {
+        return Ok(hex_key);
+    }
+    parse_public_key_identity(trimmed)
+}
+
+fn parse_public_key_hex(input: &str) -> Result<[u8; 32], String> {
+    let hex = if let Some(rest) = input.strip_prefix("0x") {
+        rest
+    } else if let Some(rest) = input.strip_prefix("0X") {
+        rest
+    } else {
+        input
+    };
+    if hex.len() != 64 {
+        return Err("Public key hex must have 64 hex characters".to_string());
+    }
+
+    let mut out = [0u8; 32];
+    for (idx, slot) in out.iter_mut().enumerate() {
+        let offset = idx * 2;
+        let byte = u8::from_str_radix(&hex[offset..offset + 2], 16)
+            .map_err(|_| format!("Invalid hex at position {offset}"))?;
+        *slot = byte;
+    }
+    Ok(out)
+}
+
+fn parse_public_key_identity(identity: &str) -> Result<[u8; 32], String> {
+    let identity_upper = identity.trim().to_ascii_uppercase();
+    if identity_upper.len() != 60 {
+        return Err("Wallet identity must be 60 chars (A-Z) or 0x + 64 hex public key".to_string());
+    }
+
+    let bytes = identity_upper.as_bytes();
+    for ch in bytes {
+        if !(*ch >= b'A' && *ch <= b'Z') {
+            return Err("Identity contains invalid characters, expected only A-Z".to_string());
+        }
+    }
+
+    let mut public_key = [0u8; 32];
+    for fragment_idx in 0..4 {
+        let mut fragment_value: u64 = 0;
+        for char_idx in (0..14).rev() {
+            let index = fragment_idx * 14 + char_idx;
+            let value = (bytes[index] - b'A') as u64;
+            fragment_value = fragment_value
+                .checked_mul(26)
+                .and_then(|v| v.checked_add(value))
+                .ok_or_else(|| "Identity decoding overflow".to_string())?;
+        }
+
+        let offset = fragment_idx * 8;
+        public_key[offset..offset + 8].copy_from_slice(&fragment_value.to_le_bytes());
+    }
+
+    Ok(public_key)
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let chunk = bytes.get(offset..offset + 2)?;
+    Some(u16::from_le_bytes([chunk[0], chunk[1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let chunk = bytes.get(offset..offset + 4)?;
+    Some(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+}
+
+fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
+    let chunk = bytes.get(offset..offset + 4)?;
+    Some(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+}
+
+fn read_i64(bytes: &[u8], offset: usize) -> Option<i64> {
+    let chunk = bytes.get(offset..offset + 8)?;
+    Some(i64::from_le_bytes([
+        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+    ]))
+}
+
 fn parse_config() -> Result<Config, String> {
     let mut port = DEFAULT_PORT;
     let mut listen_ip = Ipv4Addr::new(0, 0, 0, 0);
+
+    let mut api_enabled = true;
+    let mut api_listen_ip = Ipv4Addr::new(127, 0, 0, 1);
+    let mut api_listen_port = DEFAULT_API_PORT;
+    let mut api_timeout_ms = DEFAULT_API_TIMEOUT_MS;
+    let mut grpc_enabled = true;
+    let mut grpc_listen = SocketAddr::from(([127, 0, 0, 1], DEFAULT_GRPC_PORT));
+
     let mut target_outbound = 8usize;
     let mut max_incoming = 32usize;
     let mut max_seen = 65_536usize;
@@ -799,6 +1782,37 @@ fn parse_config() -> Result<Config, String> {
                 listen_ip = value
                     .parse::<Ipv4Addr>()
                     .map_err(|_| format!("Invalid IPv4 address: {value}"))?;
+            }
+            "--api-listen" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "Missing value for --api-listen".to_string())?;
+                let addr = parse_socket_addr_v4(value)?;
+                api_listen_ip = *addr.ip();
+                api_listen_port = addr.port();
+            }
+            "--api-timeout-ms" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "Missing value for --api-timeout-ms".to_string())?;
+                api_timeout_ms = value
+                    .parse::<u64>()
+                    .map_err(|_| format!("Invalid API timeout value: {value}"))?;
+            }
+            "--no-api" => {
+                api_enabled = false;
+            }
+            "--grpc-listen" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "Missing value for --grpc-listen".to_string())?;
+                grpc_listen = parse_socket_addr(value)?;
+            }
+            "--no-grpc" => {
+                grpc_enabled = false;
             }
             "--peer" => {
                 index += 1;
@@ -887,6 +1901,11 @@ fn parse_config() -> Result<Config, String> {
 
     Ok(Config {
         listen_addr: SocketAddrV4::new(listen_ip, port),
+        api_listen_addr: SocketAddrV4::new(api_listen_ip, api_listen_port),
+        api_enabled,
+        api_timeout: Duration::from_millis(api_timeout_ms.max(1_000)),
+        grpc_listen_addr: grpc_listen,
+        grpc_enabled,
         network_port: port,
         target_outbound,
         max_incoming,
@@ -913,6 +1932,18 @@ fn parse_peer_arg(value: &str, default_port: u16) -> Result<SocketAddrV4, String
     ))
 }
 
+fn parse_socket_addr_v4(value: &str) -> Result<SocketAddrV4, String> {
+    value
+        .parse::<SocketAddrV4>()
+        .map_err(|_| format!("Invalid IPv4 socket address: {value}"))
+}
+
+fn parse_socket_addr(value: &str) -> Result<SocketAddr, String> {
+    value
+        .parse::<SocketAddr>()
+        .map_err(|_| format!("Invalid socket address: {value}"))
+}
+
 fn print_usage() {
     println!("Usage:");
     println!("  QubicLightNode [options]");
@@ -930,5 +1961,10 @@ fn print_usage() {
     println!("  --dns-lite-peers <n>     Requested lite peers count from DNS API (default: auto).");
     println!("  --dns-timeout-ms <n>     DNS API request timeout in ms (default: 5000).");
     println!("  --traffic-log            Log RX/TX/relay events for network frames.");
+    println!("  --api-listen <ip:port>   API bind address (default: 127.0.0.1:8090).");
+    println!("  --api-timeout-ms <n>     API query timeout in ms (default: 6000).");
+    println!("  --no-api                 Disable external HTTP API.");
+    println!("  --grpc-listen <ip:port>  gRPC bind address (default: 127.0.0.1:50051).");
+    println!("  --no-grpc                Disable gRPC API.");
     println!("  -h, --help               Show this help.");
 }
