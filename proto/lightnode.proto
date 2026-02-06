@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package lightnode;
+
+service LightNode {
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+  rpc GetTickTransactions(GetTickTransactionsRequest) returns (GetTickTransactionsResponse);
+}
+
+message GetStatusRequest {}
+
+message TickStatus {
+  uint32 epoch = 1;
+  uint32 tick = 2;
+  uint32 initial_tick = 3;
+  uint32 tick_duration_ms = 4;
+  uint32 aligned_votes = 5;
+  uint32 misaligned_votes = 6;
+}
+
+message GetStatusResponse {
+  bool ok = 1;
+  string source = 2;
+  TickStatus status = 3;
+  string warning = 4;
+  string error = 5;
+}
+
+message GetBalanceRequest {
+  string wallet = 1;
+}
+
+message Balance {
+  string wallet = 1;
+  string public_key_hex = 2;
+  uint32 tick = 3;
+  int32 spectrum_index = 4;
+  int64 incoming_amount = 5;
+  int64 outgoing_amount = 6;
+  int64 balance = 7;
+  uint32 number_of_incoming_transfers = 8;
+  uint32 number_of_outgoing_transfers = 9;
+  uint32 latest_incoming_transfer_tick = 10;
+  uint32 latest_outgoing_transfer_tick = 11;
+}
+
+message GetBalanceResponse {
+  bool ok = 1;
+  Balance balance = 2;
+  string error = 3;
+}
+
+message GetTickTransactionsRequest {
+  uint32 tick = 1;
+}
+
+message Transaction {
+  string source_public_key_hex = 1;
+  string destination_public_key_hex = 2;
+  int64 amount = 3;
+  uint32 tick = 4;
+  uint32 input_type = 5;
+  uint32 input_size = 6;
+  string input_hex = 7;
+  string signature_hex = 8;
+}
+
+message GetTickTransactionsResponse {
+  bool ok = 1;
+  uint32 tick = 2;
+  repeated Transaction transactions = 3;
+  string error = 4;
+}
