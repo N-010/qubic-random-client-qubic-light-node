@@ -459,7 +459,7 @@ async fn connection_worker(
 
                 while accumulated.len().saturating_sub(offset) >= HEADER_SIZE {
                     let frame_size = decode_frame_size(&accumulated[offset..offset + HEADER_SIZE]);
-                    if frame_size < HEADER_SIZE || frame_size > MAX_FRAME_SIZE {
+                    if !(HEADER_SIZE..=MAX_FRAME_SIZE).contains(&frame_size) {
                         eprintln!("Invalid frame size from {remote}: {frame_size}");
                         offset = accumulated.len();
                         break;
