@@ -1,10 +1,3 @@
-use axum::{
-    Json, Router,
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
-    routing::get,
-};
 use rand::Rng;
 use rand::seq::SliceRandom;
 use serde::Serialize;
@@ -13,10 +6,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, timeout};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -29,7 +24,6 @@ const LIGHTNODE_FILE_DESCRIPTOR_SET: &[u8] =
     tonic::include_file_descriptor_set!("lightnode_descriptor");
 
 const DEFAULT_PORT: u16 = 21841;
-const DEFAULT_API_PORT: u16 = 8090;
 const DEFAULT_GRPC_PORT: u16 = 50051;
 const HEADER_SIZE: usize = 8;
 const MAX_FRAME_SIZE: usize = 0x00FF_FFFF;
@@ -53,6 +47,7 @@ const RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE: usize = 16;
 const RESPOND_ENTITY_MIN_PAYLOAD_SIZE: usize = 72;
 const TRANSACTION_BASE_SIZE: usize = 80;
 const SIGNATURE_SIZE: usize = 64;
+const MAX_PARALLEL_PEER_QUERIES: usize = 3;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct TickStatus {
@@ -67,8 +62,6 @@ struct TickStatus {
 #[derive(Clone, Debug)]
 struct Config {
     listen_addr: SocketAddrV4,
-    api_listen_addr: SocketAddrV4,
-    api_enabled: bool,
     api_timeout: Duration,
     grpc_listen_addr: SocketAddr,
     grpc_enabled: bool,
@@ -89,7 +82,7 @@ struct Config {
 struct Session {
     remote: SocketAddrV4,
     outbound: bool,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Arc<[u8]>>,
 }
 
 #[derive(Debug)]
@@ -141,7 +134,7 @@ impl NodeState {
         &mut self,
         remote: SocketAddrV4,
         outbound: bool,
-        tx: mpsc::UnboundedSender<Vec<u8>>,
+        tx: mpsc::UnboundedSender<Arc<[u8]>>,
         network_port: u16,
     ) -> Option<u64> {
         let remote_ip = *remote.ip();
@@ -201,7 +194,7 @@ impl NodeState {
         true
     }
 
-    fn collect_targets(&self, source_peer_id: u64) -> Vec<mpsc::UnboundedSender<Vec<u8>>> {
+    fn collect_targets(&self, source_peer_id: u64) -> Vec<mpsc::UnboundedSender<Arc<[u8]>>> {
         self.sessions
             .iter()
             .filter_map(|(peer_id, session)| {
@@ -320,9 +313,40 @@ fn format_epoch_tick(status: Option<TickStatus>) -> String {
     }
 }
 
+fn pack_epoch_tick(epoch: u16, tick: u32) -> u64 {
+    ((epoch as u64) << 32) | (tick as u64)
+}
+
+fn unpack_epoch_tick(packed: u64) -> Option<(u16, u32)> {
+    if packed == 0 {
+        None
+    } else {
+        Some(((packed >> 32) as u16, packed as u32))
+    }
+}
+
+fn format_epoch_tick_packed(packed: u64) -> String {
+    match unpack_epoch_tick(packed) {
+        Some((epoch, tick)) => format!("epoch={epoch} tick={tick}"),
+        None => "epoch=? tick=?".to_string(),
+    }
+}
+
+fn tick_status_from_packed(packed: u64) -> Option<TickStatus> {
+    unpack_epoch_tick(packed).map(|(epoch, tick)| TickStatus {
+        epoch,
+        tick,
+        initial_tick: 0,
+        tick_duration_ms: 0,
+        aligned_votes: 0,
+        misaligned_votes: 0,
+    })
+}
+
 #[derive(Clone)]
 struct ApiState {
     node_state: Arc<Mutex<NodeState>>,
+    latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 }
 
@@ -401,17 +425,16 @@ async fn main() -> std::io::Result<()> {
         config.max_seen,
         &config.seed_peers,
     )));
+    let latest_epoch_tick = Arc::new(AtomicU64::new(0));
     let listener = TcpListener::bind(config.listen_addr).await?;
 
     println!(
-        "Qubic light relay started at {} | target_outbound={} | max_incoming={} | seed_peers={} | traffic_log={} | api={}({}) | grpc={}({})",
+        "Qubic light relay started at {} | target_outbound={} | max_incoming={} | seed_peers={} | traffic_log={} | grpc={}({})",
         config.listen_addr,
         config.target_outbound,
         config.max_incoming,
         config.seed_peers.len(),
         config.traffic_log,
-        config.api_enabled,
-        config.api_listen_addr,
         config.grpc_enabled,
         config.grpc_listen_addr
     );
@@ -421,21 +444,10 @@ async fn main() -> std::io::Result<()> {
 
     let shared_config = Arc::new(config);
 
-    if shared_config.api_enabled {
-        let api_state = ApiState {
-            node_state: Arc::clone(&state),
-            config: Arc::clone(&shared_config),
-        };
-        tokio::spawn(async move {
-            if let Err(err) = run_api_server(api_state).await {
-                eprintln!("API server stopped: {err}");
-            }
-        });
-    }
-
     if shared_config.grpc_enabled {
         let grpc_state = ApiState {
             node_state: Arc::clone(&state),
+            latest_epoch_tick: Arc::clone(&latest_epoch_tick),
             config: Arc::clone(&shared_config),
         };
         tokio::spawn(async move {
@@ -446,35 +458,28 @@ async fn main() -> std::io::Result<()> {
     }
 
     let accept_state = Arc::clone(&state);
+    let accept_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
     let accept_config = Arc::clone(&shared_config);
     tokio::spawn(async move {
-        accept_loop(listener, accept_state, accept_config).await;
+        accept_loop(
+            listener,
+            accept_state,
+            accept_latest_epoch_tick,
+            accept_config,
+        )
+        .await;
     });
 
     let dial_state = Arc::clone(&state);
+    let dial_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
     let dial_config = Arc::clone(&shared_config);
     tokio::spawn(async move {
-        dial_loop(dial_state, dial_config).await;
+        dial_loop(dial_state, dial_latest_epoch_tick, dial_config).await;
     });
 
     tokio::signal::ctrl_c().await?;
     println!("Shutdown signal received, stopping.");
     Ok(())
-}
-
-async fn run_api_server(api_state: ApiState) -> std::io::Result<()> {
-    let app = Router::new()
-        .route("/api/status", get(api_status))
-        .route("/api/balance/{wallet}", get(api_balance))
-        .route("/api/ticks/{tick}/transactions", get(api_tick_transactions))
-        .with_state(api_state.clone());
-
-    let listener = TcpListener::bind(api_state.config.api_listen_addr).await?;
-    println!("API listening on {}", api_state.config.api_listen_addr);
-
-    axum::serve(listener, app)
-        .await
-        .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
 async fn run_grpc_server(api_state: ApiState) -> std::io::Result<()> {
@@ -497,99 +502,21 @@ async fn run_grpc_server(api_state: ApiState) -> std::io::Result<()> {
         .map_err(|err| std::io::Error::other(err.to_string()))
 }
 
-async fn api_status(State(api): State<ApiState>) -> impl IntoResponse {
-    let cached = { api.node_state.lock().await.latest_tick() };
-    if let Some(status) = cached {
-        (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "source": "cache",
-                "status": status
-            })),
-        )
-    } else {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "No tick data in local cache yet. Wait for incoming network messages."
-            })),
-        )
-    }
-}
-
-async fn api_balance(Path(wallet): Path<String>, State(api): State<ApiState>) -> impl IntoResponse {
-    let public_key = match parse_wallet_public_key(&wallet) {
-        Ok(pk) => pk,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": err
-                })),
-            );
-        }
-    };
-
-    match query_balance(
-        Arc::clone(&api.node_state),
-        Arc::clone(&api.config),
-        &wallet,
-        public_key,
-    )
-    .await
-    {
-        Ok(balance) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "balance": balance
-            })),
-        ),
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": err
-            })),
-        ),
-    }
-}
-
-async fn api_tick_transactions(
-    Path(tick): Path<u32>,
-    State(api): State<ApiState>,
-) -> impl IntoResponse {
-    match query_tick_transactions(Arc::clone(&api.node_state), Arc::clone(&api.config), tick).await
-    {
-        Ok(transactions) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "tick": tick,
-                "count": transactions.len(),
-                "transactions": transactions
-            })),
-        ),
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": err
-            })),
-        ),
-    }
-}
-
 #[tonic::async_trait]
 impl lightnodepb::light_node_server::LightNode for GrpcService {
     async fn get_status(
         &self,
         _request: Request<lightnodepb::GetStatusRequest>,
     ) -> Result<Response<lightnodepb::GetStatusResponse>, Status> {
-        let cached = { self.api.node_state.lock().await.latest_tick() };
+        let packed = self.api.latest_epoch_tick.load(Ordering::Relaxed);
+        let cached = {
+            let cached_from_state = self.api.node_state.lock().await.latest_tick();
+            if cached_from_state.is_some() {
+                cached_from_state
+            } else {
+                tick_status_from_packed(packed)
+            }
+        };
         if let Some(status) = cached {
             Ok(Response::new(lightnodepb::GetStatusResponse {
                 ok: true,
@@ -709,7 +636,12 @@ fn map_transaction(tx: TickTransaction) -> lightnodepb::Transaction {
     }
 }
 
-async fn accept_loop(listener: TcpListener, state: Arc<Mutex<NodeState>>, config: Arc<Config>) {
+async fn accept_loop(
+    listener: TcpListener,
+    state: Arc<Mutex<NodeState>>,
+    latest_epoch_tick: Arc<AtomicU64>,
+    config: Arc<Config>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, remote_addr)) => {
@@ -725,6 +657,7 @@ async fn accept_loop(listener: TcpListener, state: Arc<Mutex<NodeState>>, config
                 }
 
                 let connection_state = Arc::clone(&state);
+                let connection_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
                 let connection_config = Arc::clone(&config);
                 tokio::spawn(async move {
                     establish_connection(
@@ -732,6 +665,7 @@ async fn accept_loop(listener: TcpListener, state: Arc<Mutex<NodeState>>, config
                         remote_v4,
                         false,
                         connection_state,
+                        connection_latest_epoch_tick,
                         connection_config,
                     )
                     .await;
@@ -745,7 +679,11 @@ async fn accept_loop(listener: TcpListener, state: Arc<Mutex<NodeState>>, config
     }
 }
 
-async fn dial_loop(state: Arc<Mutex<NodeState>>, config: Arc<Config>) {
+async fn dial_loop(
+    state: Arc<Mutex<NodeState>>,
+    latest_epoch_tick: Arc<AtomicU64>,
+    config: Arc<Config>,
+) {
     loop {
         let targets = {
             let mut locked = state.lock().await;
@@ -760,6 +698,7 @@ async fn dial_loop(state: Arc<Mutex<NodeState>>, config: Arc<Config>) {
 
         for target in targets {
             let state_for_task = Arc::clone(&state);
+            let latest_epoch_tick_for_task = Arc::clone(&latest_epoch_tick);
             let config_for_task = Arc::clone(&config);
             tokio::spawn(async move {
                 match TcpStream::connect(target).await {
@@ -767,8 +706,15 @@ async fn dial_loop(state: Arc<Mutex<NodeState>>, config: Arc<Config>) {
                         if let Err(err) = stream.set_nodelay(true) {
                             eprintln!("Failed to set TCP_NODELAY for {target}: {err}");
                         }
-                        establish_connection(stream, target, true, state_for_task, config_for_task)
-                            .await;
+                        establish_connection(
+                            stream,
+                            target,
+                            true,
+                            state_for_task,
+                            latest_epoch_tick_for_task,
+                            config_for_task,
+                        )
+                        .await;
                     }
                     Err(err) => {
                         {
@@ -790,9 +736,10 @@ async fn establish_connection(
     remote: SocketAddrV4,
     outbound: bool,
     state: Arc<Mutex<NodeState>>,
+    latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
-    let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
     let (peer_id, handshake_payload, incoming_count, outgoing_count, latest_tick) = {
         let mut locked = state.lock().await;
 
@@ -821,7 +768,7 @@ async fn establish_connection(
         )
     };
 
-    let _ = tx.send(handshake_payload);
+    let _ = tx.send(Arc::<[u8]>::from(handshake_payload));
     println!(
         "Connected {} [{}] | in={} out={} | {}",
         remote,
@@ -832,7 +779,13 @@ async fn establish_connection(
     );
 
     tokio::spawn(connection_worker(
-        stream, peer_id, remote, rx, state, config,
+        stream,
+        peer_id,
+        remote,
+        rx,
+        state,
+        latest_epoch_tick,
+        config,
     ));
 }
 
@@ -840,19 +793,20 @@ async fn connection_worker(
     stream: TcpStream,
     peer_id: u64,
     remote: SocketAddrV4,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut rx: mpsc::UnboundedReceiver<Arc<[u8]>>,
     state: Arc<Mutex<NodeState>>,
+    latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
     let (mut reader, mut writer) = stream.into_split();
     let traffic_log = config.traffic_log;
-    let writer_state = Arc::clone(&state);
+    let writer_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
 
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if traffic_log {
                 let (size, message_type, dejavu) = frame_meta(&frame);
-                let latest_tick = { writer_state.lock().await.latest_tick() };
+                let packed = writer_latest_epoch_tick.load(Ordering::Relaxed);
                 println!(
                     "TX {} | size={} type={}({}) dejavu={} | {}",
                     remote,
@@ -860,7 +814,7 @@ async fn connection_worker(
                     message_type_name(message_type),
                     message_type,
                     dejavu,
-                    format_epoch_tick(latest_tick)
+                    format_epoch_tick_packed(packed)
                 );
             }
             if writer.write_all(&frame).await.is_err() {
@@ -896,7 +850,7 @@ async fn connection_worker(
 
                     if config.traffic_log {
                         let (size, message_type, dejavu) = frame_meta(&frame);
-                        let latest_tick = { state.lock().await.latest_tick() };
+                        let packed = latest_epoch_tick.load(Ordering::Relaxed);
                         println!(
                             "RX {} | peer_id={} size={} type={}({}) dejavu={} | {}",
                             remote,
@@ -905,12 +859,18 @@ async fn connection_worker(
                             message_type_name(message_type),
                             message_type,
                             dejavu,
-                            format_epoch_tick(latest_tick)
+                            format_epoch_tick_packed(packed)
                         );
                     }
 
-                    process_incoming_frame(peer_id, frame, Arc::clone(&state), Arc::clone(&config))
-                        .await;
+                    process_incoming_frame(
+                        peer_id,
+                        frame,
+                        Arc::clone(&state),
+                        Arc::clone(&latest_epoch_tick),
+                        Arc::clone(&config),
+                    )
+                    .await;
                 }
 
                 if offset > 0 {
@@ -945,6 +905,7 @@ async fn process_incoming_frame(
     source_peer_id: u64,
     frame: Vec<u8>,
     state: Arc<Mutex<NodeState>>,
+    latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
     if frame.len() < HEADER_SIZE {
@@ -960,6 +921,12 @@ async fn process_incoming_frame(
         Vec::new()
     };
     let tick_update = parse_tick_status_from_frame(&frame);
+    if let Some(status) = tick_update {
+        latest_epoch_tick.store(
+            pack_epoch_tick(status.epoch, status.tick),
+            Ordering::Relaxed,
+        );
+    }
 
     if !config.relay_all && dejavu != 0 {
         let mut locked = state.lock().await;
@@ -1013,8 +980,9 @@ async fn process_incoming_frame(
         );
     }
 
+    let frame = Arc::<[u8]>::from(frame);
     for tx in targets {
-        let _ = tx.send(frame.clone());
+        let _ = tx.send(Arc::clone(&frame));
     }
 }
 
@@ -1282,16 +1250,59 @@ async fn query_balance(
         peers.shuffle(&mut rng);
     }
 
+    let wallet_owned = wallet.to_string();
+    let parallelism = peers.len().clamp(1, MAX_PARALLEL_PEER_QUERIES);
+    let mut join_set = JoinSet::<(SocketAddrV4, Result<BalanceResponse, String>)>::new();
+    let mut peer_iter = peers.into_iter();
+
+    for _ in 0..parallelism {
+        if let Some(peer) = peer_iter.next() {
+            let timeout_duration = config.api_timeout;
+            let wallet = wallet_owned.clone();
+            join_set.spawn(async move {
+                (
+                    peer,
+                    query_balance_from_peer(peer, timeout_duration, &wallet, public_key).await,
+                )
+            });
+        }
+    }
+
     let mut last_err = String::new();
-    for peer in peers {
-        match query_balance_from_peer(peer, config.api_timeout, wallet, public_key).await {
-            Ok(info) => return Ok(info),
-            Err(err) => {
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok((_, Ok(balance))) => {
+                join_set.abort_all();
+                return Ok(balance);
+            }
+            Ok((peer, Err(err))) => {
                 last_err = format!("{peer}: {err}");
+                if let Some(next_peer) = peer_iter.next() {
+                    let timeout_duration = config.api_timeout;
+                    let wallet = wallet_owned.clone();
+                    join_set.spawn(async move {
+                        (
+                            next_peer,
+                            query_balance_from_peer(
+                                next_peer,
+                                timeout_duration,
+                                &wallet,
+                                public_key,
+                            )
+                            .await,
+                        )
+                    });
+                }
+            }
+            Err(err) => {
+                last_err = format!("task join error: {err}");
             }
         }
     }
-    Err(format!("Failed to query balance from peers: {last_err}"))
+
+    Err(format!(
+        "Failed to query balance from peers (parallel): {last_err}"
+    ))
 }
 
 async fn query_balance_from_peer(
@@ -1346,17 +1357,50 @@ async fn query_tick_transactions(
         peers.shuffle(&mut rng);
     }
 
+    let parallelism = peers.len().clamp(1, MAX_PARALLEL_PEER_QUERIES);
+    let mut join_set = JoinSet::<(SocketAddrV4, Result<Vec<TickTransaction>, String>)>::new();
+    let mut peer_iter = peers.into_iter();
+
+    for _ in 0..parallelism {
+        if let Some(peer) = peer_iter.next() {
+            let timeout_duration = config.api_timeout;
+            join_set.spawn(async move {
+                (
+                    peer,
+                    query_tick_transactions_from_peer(peer, timeout_duration, tick).await,
+                )
+            });
+        }
+    }
+
     let mut last_err = String::new();
-    for peer in peers {
-        match query_tick_transactions_from_peer(peer, config.api_timeout, tick).await {
-            Ok(txs) => return Ok(txs),
-            Err(err) => {
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok((_, Ok(transactions))) => {
+                join_set.abort_all();
+                return Ok(transactions);
+            }
+            Ok((peer, Err(err))) => {
                 last_err = format!("{peer}: {err}");
+                if let Some(next_peer) = peer_iter.next() {
+                    let timeout_duration = config.api_timeout;
+                    join_set.spawn(async move {
+                        (
+                            next_peer,
+                            query_tick_transactions_from_peer(next_peer, timeout_duration, tick)
+                                .await,
+                        )
+                    });
+                }
+            }
+            Err(err) => {
+                last_err = format!("task join error: {err}");
             }
         }
     }
+
     Err(format!(
-        "Failed to query tick transactions from peers: {last_err}"
+        "Failed to query tick transactions from peers (parallel): {last_err}"
     ))
 }
 
@@ -1662,9 +1706,6 @@ fn parse_config() -> Result<Config, String> {
     let mut port = DEFAULT_PORT;
     let mut listen_ip = Ipv4Addr::new(0, 0, 0, 0);
 
-    let mut api_enabled = true;
-    let mut api_listen_ip = Ipv4Addr::new(127, 0, 0, 1);
-    let mut api_listen_port = DEFAULT_API_PORT;
     let mut api_timeout_ms = DEFAULT_API_TIMEOUT_MS;
     let mut grpc_enabled = true;
     let mut grpc_listen = SocketAddr::from(([127, 0, 0, 1], DEFAULT_GRPC_PORT));
@@ -1706,15 +1747,6 @@ fn parse_config() -> Result<Config, String> {
                     .parse::<Ipv4Addr>()
                     .map_err(|_| format!("Invalid IPv4 address: {value}"))?;
             }
-            "--api-listen" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --api-listen".to_string())?;
-                let addr = parse_socket_addr_v4(value)?;
-                api_listen_ip = *addr.ip();
-                api_listen_port = addr.port();
-            }
             "--api-timeout-ms" => {
                 index += 1;
                 let value = args
@@ -1723,9 +1755,6 @@ fn parse_config() -> Result<Config, String> {
                 api_timeout_ms = value
                     .parse::<u64>()
                     .map_err(|_| format!("Invalid API timeout value: {value}"))?;
-            }
-            "--no-api" => {
-                api_enabled = false;
             }
             "--grpc-listen" => {
                 index += 1;
@@ -1824,8 +1853,6 @@ fn parse_config() -> Result<Config, String> {
 
     Ok(Config {
         listen_addr: SocketAddrV4::new(listen_ip, port),
-        api_listen_addr: SocketAddrV4::new(api_listen_ip, api_listen_port),
-        api_enabled,
         api_timeout: Duration::from_millis(api_timeout_ms.max(1_000)),
         grpc_listen_addr: grpc_listen,
         grpc_enabled,
@@ -1855,12 +1882,6 @@ fn parse_peer_arg(value: &str, default_port: u16) -> Result<SocketAddrV4, String
     ))
 }
 
-fn parse_socket_addr_v4(value: &str) -> Result<SocketAddrV4, String> {
-    value
-        .parse::<SocketAddrV4>()
-        .map_err(|_| format!("Invalid IPv4 socket address: {value}"))
-}
-
 fn parse_socket_addr(value: &str) -> Result<SocketAddr, String> {
     value
         .parse::<SocketAddr>()
@@ -1884,9 +1905,7 @@ fn print_usage() {
     println!("  --dns-lite-peers <n>     Requested lite peers count from DNS API (default: auto).");
     println!("  --dns-timeout-ms <n>     DNS API request timeout in ms (default: 5000).");
     println!("  --traffic-log            Log RX/TX/relay events for network frames.");
-    println!("  --api-listen <ip:port>   API bind address (default: 127.0.0.1:8090).");
     println!("  --api-timeout-ms <n>     API query timeout in ms (default: 6000).");
-    println!("  --no-api                 Disable external HTTP API.");
     println!("  --grpc-listen <ip:port>  gRPC bind address (default: 127.0.0.1:50051).");
     println!("  --no-grpc                Disable gRPC API.");
     println!("  -h, --help               Show this help.");

@@ -211,3 +211,25 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
 - Поддерживаемые форматы кошелька в API:
   - Qubic identity (60 символов `A-Z`)
   - публичный ключ `0x` + 64 hex символа
+
+## Параллелизм и блокировки в этом клиенте
+
+- Горячий путь p2p-пересылки:
+  - обработка входящих фреймов идёт конкурентно по соединениям
+  - дедуп и маршрутизация получателей выполняются через общий `NodeState`
+- Что уже оптимизировано:
+  - в fanout больше нет копирования полного payload на каждый peer:
+    - используется `Arc<[u8]>` в outbound очередях (`UnboundedSender<Arc<[u8]>>`)
+  - `TX/RX` traffic-логи больше не берут `Mutex<NodeState>`:
+    - для быстрого чтения epoch/tick используется атомарный кэш (`AtomicU64`, packed `epoch/tick`)
+  - запросы к пирам для внешних API `balance` и `tick transactions` выполняются параллельно:
+    - используется race-запрос к нескольким пирам (`JoinSet`)
+    - ограничение параллелизма: `MAX_PARALLEL_PEER_QUERIES` (сейчас `3`)
+    - возвращается первый успешный ответ, остальные задачи отменяются
+- Где всё ещё есть блокировки:
+  - изменения `sessions / known_peers / dedup` внутри общего `NodeState` через `Mutex`
+  - это сознательный компромисс для простоты и корректности, но при высокой нагрузке может быть bottleneck
+- Рекомендации для следующих итераций:
+  - разделить `NodeState` на независимые lock-domain (например `sessions`, `known_peers`, `dedup`)
+  - заменить `unbounded` outbound очереди на bounded с backpressure/policy для медленных peers
+  - рассмотреть lock-free/actor модель для дедуп и fanout
