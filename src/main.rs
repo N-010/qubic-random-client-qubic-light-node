@@ -41,7 +41,6 @@ const DEFAULT_API_TIMEOUT_MS: u64 = 6_000;
 
 const BROADCAST_TICK_TYPE: u8 = 3;
 const BROADCAST_TRANSACTION_TYPE: u8 = 24;
-const REQUEST_CURRENT_TICK_INFO_TYPE: u8 = 27;
 const RESPOND_CURRENT_TICK_INFO_TYPE: u8 = 28;
 const REQUEST_TICK_TRANSACTIONS_TYPE: u8 = 29;
 const REQUEST_ENTITY_TYPE: u8 = 31;
@@ -314,6 +313,13 @@ impl NodeState {
     }
 }
 
+fn format_epoch_tick(status: Option<TickStatus>) -> String {
+    match status {
+        Some(status) => format!("epoch={} tick={}", status.epoch, status.tick),
+        None => "epoch=? tick=?".to_string(),
+    }
+}
+
 #[derive(Clone)]
 struct ApiState {
     node_state: Arc<Mutex<NodeState>>,
@@ -492,41 +498,24 @@ async fn run_grpc_server(api_state: ApiState) -> std::io::Result<()> {
 }
 
 async fn api_status(State(api): State<ApiState>) -> impl IntoResponse {
-    match query_current_tick_info(Arc::clone(&api.node_state), Arc::clone(&api.config)).await {
-        Ok(status) => {
-            let mut locked = api.node_state.lock().await;
-            locked.update_latest_tick(status);
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "source": "network",
-                    "status": status
-                })),
-            )
-        }
-        Err(network_err) => {
-            let cached = { api.node_state.lock().await.latest_tick() };
-            if let Some(status) = cached {
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "ok": true,
-                        "source": "cache",
-                        "status": status,
-                        "warning": network_err
-                    })),
-                )
-            } else {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": network_err
-                    })),
-                )
-            }
-        }
+    let cached = { api.node_state.lock().await.latest_tick() };
+    if let Some(status) = cached {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "source": "cache",
+                "status": status
+            })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "No tick data in local cache yet. Wait for incoming network messages."
+            })),
+        )
     }
 }
 
@@ -600,43 +589,24 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
         &self,
         _request: Request<lightnodepb::GetStatusRequest>,
     ) -> Result<Response<lightnodepb::GetStatusResponse>, Status> {
-        match query_current_tick_info(
-            Arc::clone(&self.api.node_state),
-            Arc::clone(&self.api.config),
-        )
-        .await
-        {
-            Ok(status) => {
-                let mut locked = self.api.node_state.lock().await;
-                locked.update_latest_tick(status);
-                Ok(Response::new(lightnodepb::GetStatusResponse {
-                    ok: true,
-                    source: "network".to_string(),
-                    status: Some(map_tick_status(status)),
-                    warning: String::new(),
-                    error: String::new(),
-                }))
-            }
-            Err(network_err) => {
-                let cached = { self.api.node_state.lock().await.latest_tick() };
-                if let Some(status) = cached {
-                    Ok(Response::new(lightnodepb::GetStatusResponse {
-                        ok: true,
-                        source: "cache".to_string(),
-                        status: Some(map_tick_status(status)),
-                        warning: network_err,
-                        error: String::new(),
-                    }))
-                } else {
-                    Ok(Response::new(lightnodepb::GetStatusResponse {
-                        ok: false,
-                        source: String::new(),
-                        status: None,
-                        warning: String::new(),
-                        error: network_err,
-                    }))
-                }
-            }
+        let cached = { self.api.node_state.lock().await.latest_tick() };
+        if let Some(status) = cached {
+            Ok(Response::new(lightnodepb::GetStatusResponse {
+                ok: true,
+                source: "cache".to_string(),
+                status: Some(map_tick_status(status)),
+                warning: String::new(),
+                error: String::new(),
+            }))
+        } else {
+            Ok(Response::new(lightnodepb::GetStatusResponse {
+                ok: false,
+                source: String::new(),
+                status: None,
+                warning: String::new(),
+                error: "No tick data in local cache yet. Wait for incoming network messages."
+                    .to_string(),
+            }))
         }
     }
 
@@ -823,7 +793,7 @@ async fn establish_connection(
     config: Arc<Config>,
 ) {
     let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (peer_id, handshake_payload, incoming_count, outgoing_count) = {
+    let (peer_id, handshake_payload, incoming_count, outgoing_count, latest_tick) = {
         let mut locked = state.lock().await;
 
         if !outbound && locked.incoming_count() >= config.max_incoming {
@@ -847,16 +817,18 @@ async fn establish_connection(
             build_exchange_public_peers_frame(peers_for_handshake),
             locked.incoming_count(),
             locked.outgoing_count(),
+            locked.latest_tick(),
         )
     };
 
     let _ = tx.send(handshake_payload);
     println!(
-        "Connected {} [{}] | in={} out={}",
+        "Connected {} [{}] | in={} out={} | {}",
         remote,
         if outbound { "out" } else { "in" },
         incoming_count,
-        outgoing_count
+        outgoing_count,
+        format_epoch_tick(latest_tick)
     );
 
     tokio::spawn(connection_worker(
@@ -874,18 +846,21 @@ async fn connection_worker(
 ) {
     let (mut reader, mut writer) = stream.into_split();
     let traffic_log = config.traffic_log;
+    let writer_state = Arc::clone(&state);
 
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if traffic_log {
                 let (size, message_type, dejavu) = frame_meta(&frame);
+                let latest_tick = { writer_state.lock().await.latest_tick() };
                 println!(
-                    "TX {} | size={} type={}({}) dejavu={}",
+                    "TX {} | size={} type={}({}) dejavu={} | {}",
                     remote,
                     size,
                     message_type_name(message_type),
                     message_type,
-                    dejavu
+                    dejavu,
+                    format_epoch_tick(latest_tick)
                 );
             }
             if writer.write_all(&frame).await.is_err() {
@@ -921,14 +896,16 @@ async fn connection_worker(
 
                     if config.traffic_log {
                         let (size, message_type, dejavu) = frame_meta(&frame);
+                        let latest_tick = { state.lock().await.latest_tick() };
                         println!(
-                            "RX {} | peer_id={} size={} type={}({}) dejavu={}",
+                            "RX {} | peer_id={} size={} type={}({}) dejavu={} | {}",
                             remote,
                             peer_id,
                             size,
                             message_type_name(message_type),
                             message_type,
-                            dejavu
+                            dejavu,
+                            format_epoch_tick(latest_tick)
                         );
                     }
 
@@ -949,12 +926,19 @@ async fn connection_worker(
 
     writer_task.abort();
 
-    let (in_count, out_count) = {
+    let (in_count, out_count, latest_tick) = {
         let mut locked = state.lock().await;
         let _ = locked.unregister_session(peer_id);
-        (locked.incoming_count(), locked.outgoing_count())
+        (
+            locked.incoming_count(),
+            locked.outgoing_count(),
+            locked.latest_tick(),
+        )
     };
-    println!("Disconnected {remote} | in={in_count} out={out_count}");
+    println!(
+        "Disconnected {remote} | in={in_count} out={out_count} | {}",
+        format_epoch_tick(latest_tick)
+    );
 }
 
 async fn process_incoming_frame(
@@ -989,7 +973,7 @@ async fn process_incoming_frame(
     }
 
     let digest = *blake3::hash(&frame).as_bytes();
-    let targets = {
+    let (targets, latest_tick) = {
         let mut locked = state.lock().await;
         if let Some(status) = tick_update {
             locked.update_latest_tick(status);
@@ -1001,29 +985,31 @@ async fn process_incoming_frame(
             if config.traffic_log {
                 let (size, message_type, dejavu) = frame_meta(&frame);
                 println!(
-                    "DROP_DUP peer_id={} size={} type={}({}) dejavu={}",
+                    "DROP_DUP peer_id={} size={} type={}({}) dejavu={} | {}",
                     source_peer_id,
                     size,
                     message_type_name(message_type),
                     message_type,
-                    dejavu
+                    dejavu,
+                    format_epoch_tick(locked.latest_tick())
                 );
             }
             return;
         }
-        locked.collect_targets(source_peer_id)
+        (locked.collect_targets(source_peer_id), locked.latest_tick())
     };
 
     if config.traffic_log {
         let (size, message_type, dejavu) = frame_meta(&frame);
         println!(
-            "RELAY peer_id={} -> {} peers | size={} type={}({}) dejavu={}",
+            "RELAY peer_id={} -> {} peers | size={} type={}({}) dejavu={} | {}",
             source_peer_id,
             targets.len(),
             size,
             message_type_name(message_type),
             message_type,
-            dejavu
+            dejavu,
+            format_epoch_tick(latest_tick)
         );
     }
 
@@ -1274,69 +1260,6 @@ fn parse_tick_status_from_frame(frame: &[u8]) -> Option<TickStatus> {
             })
         }
         _ => None,
-    }
-}
-
-async fn query_current_tick_info(
-    state: Arc<Mutex<NodeState>>,
-    config: Arc<Config>,
-) -> Result<TickStatus, String> {
-    let mut peers = {
-        let locked = state.lock().await;
-        locked.peer_candidates(config.network_port)
-    };
-    if peers.is_empty() {
-        return Err("No known peers available".to_string());
-    }
-
-    {
-        let mut rng = rand::rng();
-        peers.shuffle(&mut rng);
-    }
-
-    let mut last_err = String::new();
-    for peer in peers {
-        match query_current_tick_info_from_peer(peer, config.api_timeout).await {
-            Ok(info) => return Ok(info),
-            Err(err) => {
-                last_err = format!("{peer}: {err}");
-            }
-        }
-    }
-    Err(format!(
-        "Failed to query current tick info from peers: {last_err}"
-    ))
-}
-
-async fn query_current_tick_info_from_peer(
-    peer: SocketAddrV4,
-    timeout_duration: Duration,
-) -> Result<TickStatus, String> {
-    let mut stream = connect_to_peer(peer, timeout_duration).await?;
-    send_handshake_frame(&mut stream, timeout_duration).await?;
-
-    let dejavu = random_non_zero_u32();
-    let request = build_request_frame(REQUEST_CURRENT_TICK_INFO_TYPE, dejavu, &[])?;
-    write_frame(&mut stream, &request, timeout_duration).await?;
-
-    let deadline = Instant::now() + timeout_duration;
-    loop {
-        let frame = read_frame_until_deadline(&mut stream, deadline).await?;
-        let response_dejavu = frame_dejavu(&frame)?;
-        if response_dejavu != dejavu {
-            continue;
-        }
-
-        match frame[3] {
-            RESPOND_CURRENT_TICK_INFO_TYPE => {
-                let payload = frame_payload(&frame)?;
-                return parse_current_tick_info_payload(payload);
-            }
-            END_RESPONSE_TYPE => {
-                return Err("Peer returned END_RESPONSE without tick info".to_string());
-            }
-            _ => {}
-        }
     }
 }
 

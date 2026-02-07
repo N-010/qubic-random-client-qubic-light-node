@@ -152,3 +152,62 @@ These guidelines apply to app-server protocol work in `codex-rs`, especially:
   `just write-app-server-schema`
   (and `just write-app-server-schema --experimental` when experimental API fixtures are affected).
 - Validate with `cargo test -p codex-app-server-protocol`.
+
+## Qubic Network (кратко)
+
+- Базовый p2p-транспорт в этой реализации: TCP, основной порт сети `21841`.
+- Формат сетевого фрейма:
+  - `size` (3 байта, little-endian, максимум `0xFFFFFF`)
+  - `type` (1 байт)
+  - `dejavu` (4 байта, `u32`, little-endian)
+  - `payload` (переменная длина)
+- Handshake/peer exchange:
+  - Тип `0` (`EXCHANGE_PUBLIC_PEERS`)
+  - Пейлоад: 4 IPv4 адреса
+  - Узлы обмениваются пирами и расширяют локальный `known_peers`
+- Для request/response используется один и тот же `dejavu`:
+  - запрос и ответы коррелируются по `dejavu`
+  - окончание многопакетного ответа: тип `35` (`END_RESPONSE`)
+- Ключевые типы сообщений, которые использует light-клиент:
+  - `27` `REQUEST_CURRENT_TICK_INFO`
+  - `28` `RESPOND_CURRENT_TICK_INFO`
+  - `31` `REQUEST_ENTITY`
+  - `32` `RESPOND_ENTITY`
+  - `29` `REQUEST_TICK_TRANSACTIONS`
+  - `24` `BROADCAST_TRANSACTION`
+  - `35` `END_RESPONSE`
+
+## Как работает этот клиент
+
+- Роль: легкий relay-узел + внешний API (HTTP и gRPC).
+- Сетевое ядро:
+  - поддерживает входящие и исходящие TCP соединения
+  - цель исходящих соединений задается `--target-outbound` (по умолчанию `8`)
+  - цикл переподключения: `--reconnect-ms` (по умолчанию `2000` мс)
+  - дедуп пакетов по хешу (`blake3`) через скользящее окно (`--max-seen`)
+- Источники пиров:
+  - `--peer <ip[:port]>`
+  - DNS bootstrap (`api.qubic.global`, поле `litePeers`) если не задано ни одного `--peer`
+  - входящие `EXCHANGE_PUBLIC_PEERS` от других узлов
+- Ретрансляция:
+  - по умолчанию ретранслируются только сообщения с `dejavu == 0`
+  - режим полного relay: `--relay-all`
+  - детальные логи трафика: `--traffic-log`
+- Локальный HTTP API (Axum):
+  - `GET /api/status`
+  - `GET /api/balance/{wallet}`
+  - `GET /api/ticks/{tick}/transactions`
+  - bind: `--api-listen` (по умолчанию `127.0.0.1:8090`)
+  - отключить: `--no-api`
+- gRPC API (tonic):
+  - сервис `lightnode.LightNode`
+  - методы:
+    - `GetStatus`
+    - `GetBalance`
+    - `GetTickTransactions`
+  - bind: `--grpc-listen` (по умолчанию `127.0.0.1:50051`)
+  - отключить: `--no-grpc`
+  - reflection включен (можно использовать `grpcurl` без `-proto`)
+- Поддерживаемые форматы кошелька в API:
+  - Qubic identity (60 символов `A-Z`)
+  - публичный ключ `0x` + 64 hex символа
