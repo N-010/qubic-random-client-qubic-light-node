@@ -33,6 +33,7 @@ const NUMBER_OF_EXCHANGED_PEERS: usize = 4;
 const EXCHANGE_PUBLIC_PEERS_FRAME_SIZE: usize = HEADER_SIZE + NUMBER_OF_EXCHANGED_PEERS * 4;
 const DEFAULT_DNS_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_API_TIMEOUT_MS: u64 = 6_000;
+const DEFAULT_MAX_KNOWN_PEERS: usize = 500;
 
 const BROADCAST_TICK_TYPE: u8 = 3;
 const BROADCAST_TRANSACTION_TYPE: u8 = 24;
@@ -50,6 +51,11 @@ const TRANSACTION_BASE_SIZE: usize = 80;
 const SIGNATURE_SIZE: usize = 64;
 const MAX_PARALLEL_PEER_QUERIES: usize = 3;
 const OUTBOUND_QUEUE_CAPACITY: usize = 1_024;
+const READ_BUFFER_SIZE: usize = 128 * 1024;
+const ACCUMULATED_INITIAL_CAPACITY: usize = 256 * 1024;
+const ACCUMULATED_RETAIN_CAPACITY: usize = 512 * 1024;
+const ACCUMULATED_SHRINK_THRESHOLD: usize = 2 * 1024 * 1024;
+const MAX_ACCUMULATED_BUFFER: usize = MAX_FRAME_SIZE * 2;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct TickStatus {
@@ -71,6 +77,7 @@ struct Config {
     target_outbound: usize,
     max_incoming: usize,
     max_seen: usize,
+    max_known_peers: usize,
     reconnect_interval: Duration,
     relay_all: bool,
     dns_bootstrap: bool,
@@ -92,32 +99,35 @@ struct NodeState {
     sessions: HashMap<u64, Session>,
     connected_ip_refcount: HashMap<Ipv4Addr, usize>,
     known_peers: HashSet<SocketAddrV4>,
+    known_peers_order: VecDeque<SocketAddrV4>,
     pending_dials: HashSet<SocketAddrV4>,
     seen_order: VecDeque<[u8; 32]>,
     seen_set: HashSet<[u8; 32]>,
     latest_tick: Option<TickStatus>,
     max_seen: usize,
+    max_known_peers: usize,
     next_peer_id: u64,
 }
 
 impl NodeState {
-    fn new(max_seen: usize, seed_peers: &[SocketAddrV4]) -> Self {
-        let mut known_peers = HashSet::new();
-        for peer in seed_peers {
-            known_peers.insert(*peer);
-        }
-
-        Self {
+    fn new(max_seen: usize, max_known_peers: usize, seed_peers: &[SocketAddrV4]) -> Self {
+        let mut node_state = Self {
             sessions: HashMap::new(),
             connected_ip_refcount: HashMap::new(),
-            known_peers,
+            known_peers: HashSet::new(),
+            known_peers_order: VecDeque::new(),
             pending_dials: HashSet::new(),
             seen_order: VecDeque::new(),
             seen_set: HashSet::new(),
             latest_tick: None,
             max_seen: max_seen.max(1_000),
+            max_known_peers: max_known_peers.max(1_000),
             next_peer_id: 1,
+        };
+        for peer in seed_peers {
+            let _ = node_state.add_discovered_peer(*peer);
         }
+        node_state
     }
 
     fn outgoing_count(&self) -> usize {
@@ -156,8 +166,7 @@ impl NodeState {
             },
         );
         *self.connected_ip_refcount.entry(remote_ip).or_insert(0) += 1;
-        self.known_peers
-            .insert(SocketAddrV4::new(remote_ip, network_port));
+        let _ = self.add_discovered_peer(SocketAddrV4::new(remote_ip, network_port));
         self.pending_dials.remove(&remote);
         self.pending_dials
             .remove(&SocketAddrV4::new(remote_ip, network_port));
@@ -213,7 +222,17 @@ impl NodeState {
         if is_bogon(peer.ip()) {
             return false;
         }
-        self.known_peers.insert(peer)
+        if !self.known_peers.insert(peer) {
+            return false;
+        }
+        self.known_peers_order.push_back(peer);
+
+        while self.known_peers.len() > self.max_known_peers {
+            if let Some(oldest_peer) = self.known_peers_order.pop_front() {
+                self.known_peers.remove(&oldest_peer);
+            }
+        }
+        true
     }
 
     fn choose_dial_targets(&mut self, needed: usize) -> Vec<SocketAddrV4> {
@@ -425,16 +444,18 @@ async fn main() -> std::io::Result<()> {
 
     let state = Arc::new(Mutex::new(NodeState::new(
         config.max_seen,
+        config.max_known_peers,
         &config.seed_peers,
     )));
     let latest_epoch_tick = Arc::new(AtomicU64::new(0));
     let listener = TcpListener::bind(config.listen_addr).await?;
 
     println!(
-        "Qubic light relay started at {} | target_outbound={} | max_incoming={} | seed_peers={} | traffic_log={} | grpc={}({})",
+        "Qubic light relay started at {} | target_outbound={} | max_incoming={} | max_known_peers={} | seed_peers={} | traffic_log={} | grpc={}({})",
         config.listen_addr,
         config.target_outbound,
         config.max_incoming,
+        config.max_known_peers,
         config.seed_peers.len(),
         config.traffic_log,
         config.grpc_enabled,
@@ -828,14 +849,21 @@ async fn connection_worker(
         let _ = writer.shutdown().await;
     });
 
-    let mut read_buffer = vec![0u8; 128 * 1024];
-    let mut accumulated = Vec::<u8>::with_capacity(256 * 1024);
+    let mut read_buffer = vec![0u8; READ_BUFFER_SIZE];
+    let mut accumulated = Vec::<u8>::with_capacity(ACCUMULATED_INITIAL_CAPACITY);
 
     loop {
         match reader.read(&mut read_buffer).await {
             Ok(0) => break,
             Ok(read_bytes) => {
                 accumulated.extend_from_slice(&read_buffer[..read_bytes]);
+                if accumulated.len() > MAX_ACCUMULATED_BUFFER {
+                    eprintln!(
+                        "Dropping {remote}: buffered {} bytes without full parse (limit={MAX_ACCUMULATED_BUFFER})",
+                        accumulated.len()
+                    );
+                    break;
+                }
                 let mut offset = 0usize;
 
                 while accumulated.len().saturating_sub(offset) >= HEADER_SIZE {
@@ -880,6 +908,12 @@ async fn connection_worker(
                 if offset > 0 {
                     accumulated.drain(0..offset);
                 }
+
+                if accumulated.capacity() > ACCUMULATED_SHRINK_THRESHOLD
+                    && accumulated.len() < ACCUMULATED_RETAIN_CAPACITY
+                {
+                    accumulated.shrink_to(ACCUMULATED_RETAIN_CAPACITY);
+                }
             }
             Err(err) => {
                 eprintln!("Read failed from {remote}: {err}");
@@ -889,6 +923,7 @@ async fn connection_worker(
     }
 
     writer_task.abort();
+    let _ = writer_task.await;
 
     let (in_count, out_count, latest_tick) = {
         let mut locked = state.lock().await;
@@ -1140,9 +1175,8 @@ async fn fetch_seed_peers_from_dns(
     timeout: Duration,
 ) -> Result<Vec<SocketAddrV4>, String> {
     let requested_lite = lite_peers.max(1);
-    let url = format!(
-        "https://api.qubic.global/random-peers?service=bobNode&litePeers={requested_lite}"
-    );
+    let url =
+        format!("https://api.qubic.global/random-peers?service=bobNode&litePeers={requested_lite}");
 
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -1737,6 +1771,7 @@ fn parse_config() -> Result<Config, String> {
     let mut target_outbound = 8usize;
     let mut max_incoming = 32usize;
     let mut max_seen = 65_536usize;
+    let mut max_known_peers = DEFAULT_MAX_KNOWN_PEERS;
     let mut reconnect_ms = 2_000u64;
     let mut relay_all = false;
     let mut dns_bootstrap = true;
@@ -1824,6 +1859,15 @@ fn parse_config() -> Result<Config, String> {
                     .parse::<usize>()
                     .map_err(|_| format!("Invalid max seen value: {value}"))?;
             }
+            "--max-known-peers" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "Missing value for --max-known-peers".to_string())?;
+                max_known_peers = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("Invalid max known peers value: {value}"))?;
+            }
             "--reconnect-ms" => {
                 index += 1;
                 let value = args
@@ -1884,6 +1928,7 @@ fn parse_config() -> Result<Config, String> {
         target_outbound,
         max_incoming,
         max_seen,
+        max_known_peers,
         reconnect_interval: Duration::from_millis(reconnect_ms.max(200)),
         relay_all,
         dns_bootstrap,
@@ -1923,7 +1968,8 @@ fn print_usage() {
     println!("  --target-outbound <n>    Target outgoing connections (default: 8).");
     println!("  --max-incoming <n>       Max incoming connections (default: 32).");
     println!("  --max-seen <n>           Dedup window size (default: 65536).");
-    println!("  --reconnect-ms <n>       Outgoing reconnect interval in ms (default: 2000).");
+    println!("  --max-known-peers <n>    Max discovered peers kept in memory.");
+    println!("  --reconnect-ms <n>       Outgoing reconnect interval in ms (default: 500).");
     println!("  --relay-all              Relay messages even with non-zero dejavu.");
     println!("  --no-dns-bootstrap       Disable peer bootstrap from api.qubic.global.");
     println!("  --dns-lite-peers <n>     Requested lite peers count from DNS API (default: auto).");

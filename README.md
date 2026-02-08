@@ -53,24 +53,25 @@ QubicLightNode [options]
 
 All available options:
 
-| Option | Type | Default | What it does | When to use |
-|---|---|---:|---|---|
-| `--peer <ip[:port]>` | repeatable | none | Adds a manual peer. If port is omitted, uses `--port`. | Use when you have trusted/stable peers, want faster startup, or run with `--no-dns-bootstrap`. |
-| `--port <u16>` | integer | `21841` | Sets both P2P listening port and default port for peers provided without `:port`. | Change when running multiple nodes on one host, or when firewall/NAT requires a different port. |
-| `--listen-ip <ipv4>` | IPv4 | `0.0.0.0` | Sets the P2P bind IP address. | Use `127.0.0.1` for local-only testing; use a specific interface on multi-NIC hosts. |
-| `--target-outbound <n>` | integer | `8` | Desired number of outbound peer connections maintained by the reconnect loop. | Increase for better resilience/availability; decrease on low-resource or restricted environments. |
-| `--max-incoming <n>` | integer | `32` | Maximum simultaneous inbound connections. New inbound sessions are rejected after the limit. | Decrease to protect CPU/RAM or home network uplink; increase for public relay servers. |
-| `--max-seen <n>` | integer | `65536` | Size of dedup window for recently seen frame hashes (BLAKE3). | Increase under heavy traffic to reduce duplicate relays; decrease to reduce memory usage. |
-| `--reconnect-ms <n>` | milliseconds | `2000` | Interval between outbound reconnect rounds. | Lower for faster recovery after disconnects; higher to reduce dial pressure/noise. |
-| `--relay-all` | flag | off | Relays frames regardless of `dejavu`. Without this flag, only `dejavu == 0` frames are relayed. | Enable if you want full relay behavior. Keep off for a lighter/default relay profile. |
-| `--no-dns-bootstrap` | flag | off | Disables bootstrap request to `api.qubic.global`. | Use in isolated/private environments or if external bootstrap must be avoided. |
-| `--dns-lite-peers <n>` | integer | auto | Requested `litePeers` count in DNS bootstrap API call. Auto mode uses `max(target_outbound * 3, 8)`. | Increase when initial peer pool is often too small; keep auto for normal operation. |
-| `--dns-timeout-ms <n>` | milliseconds | `5000` | Timeout for DNS bootstrap HTTP request. | Increase on slow/unreliable internet; decrease for faster failover to manual peers. |
-| `--traffic-log` | flag | off | Prints detailed RX/TX/relay/dedup events for frames. | Enable for debugging/troubleshooting; disable in production for lower log volume. |
-| `--api-timeout-ms <n>` | milliseconds | `6000` | Timeout for outbound peer queries used by gRPC methods (`GetBalance`, `GetTickTransactions`). | Increase when peers are slow; decrease for more responsive API failures. |
+| Option | Type |           Default | What it does | When to use |
+|---|---|------------------:|---|---|
+| `--peer <ip[:port]>` | repeatable |              none | Adds a manual peer. If port is omitted, uses `--port`. | Use when you have trusted/stable peers, want faster startup, or run with `--no-dns-bootstrap`. |
+| `--port <u16>` | integer |           `21841` | Sets both P2P listening port and default port for peers provided without `:port`. | Change when running multiple nodes on one host, or when firewall/NAT requires a different port. |
+| `--listen-ip <ipv4>` | IPv4 |         `0.0.0.0` | Sets the P2P bind IP address. | Use `127.0.0.1` for local-only testing; use a specific interface on multi-NIC hosts. |
+| `--target-outbound <n>` | integer |               `8` | Desired number of outbound peer connections maintained by the reconnect loop. | Increase for better resilience/availability; decrease on low-resource or restricted environments. |
+| `--max-incoming <n>` | integer |              `32` | Maximum simultaneous inbound connections. New inbound sessions are rejected after the limit. | Decrease to protect CPU/RAM or home network uplink; increase for public relay servers. |
+| `--max-seen <n>` | integer |           `65536` | Size of dedup window for recently seen frame hashes (BLAKE3). | Increase under heavy traffic to reduce duplicate relays; decrease to reduce memory usage. |
+| `--max-known-peers <n>` | integer |             `500` | Maximum number of discovered peers stored in memory. Oldest entries are evicted when the limit is reached. | Decrease to reduce long-run RAM growth on noisy public networks; increase if you need a larger dialing pool. |
+| `--reconnect-ms <n>` | milliseconds |            `2000` | Interval between outbound reconnect rounds. | Lower for faster recovery after disconnects; higher to reduce dial pressure/noise. |
+| `--relay-all` | flag |               off | Relays frames regardless of `dejavu`. Without this flag, only `dejavu == 0` frames are relayed. | Enable if you want full relay behavior. Keep off for a lighter/default relay profile. |
+| `--no-dns-bootstrap` | flag |               off | Disables bootstrap request to `api.qubic.global`. | Use in isolated/private environments or if external bootstrap must be avoided. |
+| `--dns-lite-peers <n>` | integer |              auto | Requested `litePeers` count in DNS bootstrap API call. Auto mode uses `max(target_outbound * 3, 8)`. | Increase when initial peer pool is often too small; keep auto for normal operation. |
+| `--dns-timeout-ms <n>` | milliseconds |            `5000` | Timeout for DNS bootstrap HTTP request. | Increase on slow/unreliable internet; decrease for faster failover to manual peers. |
+| `--traffic-log` | flag |               off | Prints detailed RX/TX/relay/dedup events for frames. | Enable for debugging/troubleshooting; disable in production for lower log volume. |
+| `--api-timeout-ms <n>` | milliseconds |            `6000` | Timeout for outbound peer queries used by gRPC methods (`GetBalance`, `GetTickTransactions`). | Increase when peers are slow; decrease for more responsive API failures. |
 | `--grpc-listen <ip:port>` | socket address | `127.0.0.1:50051` | gRPC bind address. | Use `0.0.0.0:50051` if API must be reachable from other machines (secure externally). |
-| `--no-grpc` | flag | off | Disables gRPC server startup. | Use when you only need relay functionality and no local API. |
-| `-h`, `--help` | flag | n/a | Prints command usage and exits. | Use to verify supported options quickly. |
+| `--no-grpc` | flag |               off | Disables gRPC server startup. | Use when you only need relay functionality and no local API. |
+| `-h`, `--help` | flag |               n/a | Prints command usage and exits. | Use to verify supported options quickly. |
 
 ### Built-in Safety Floors
 
@@ -80,6 +81,7 @@ Some timeouts/intervals are clamped to minimum values even if smaller numbers ar
 - `--reconnect-ms`: minimum `200 ms`
 - `--dns-timeout-ms`: minimum `500 ms`
 - `--max-seen`: minimum effective value is `1000`
+- `--max-known-peers`: minimum effective value is `1000`
 
 ## Practical Configuration Profiles
 
