@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, timeout};
@@ -48,6 +49,7 @@ const RESPOND_ENTITY_MIN_PAYLOAD_SIZE: usize = 72;
 const TRANSACTION_BASE_SIZE: usize = 80;
 const SIGNATURE_SIZE: usize = 64;
 const MAX_PARALLEL_PEER_QUERIES: usize = 3;
+const OUTBOUND_QUEUE_CAPACITY: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 struct TickStatus {
@@ -82,7 +84,7 @@ struct Config {
 struct Session {
     remote: SocketAddrV4,
     outbound: bool,
-    tx: mpsc::UnboundedSender<Arc<[u8]>>,
+    tx: mpsc::Sender<Arc<[u8]>>,
 }
 
 #[derive(Debug)]
@@ -134,7 +136,7 @@ impl NodeState {
         &mut self,
         remote: SocketAddrV4,
         outbound: bool,
-        tx: mpsc::UnboundedSender<Arc<[u8]>>,
+        tx: mpsc::Sender<Arc<[u8]>>,
         network_port: u16,
     ) -> Option<u64> {
         let remote_ip = *remote.ip();
@@ -194,7 +196,7 @@ impl NodeState {
         true
     }
 
-    fn collect_targets(&self, source_peer_id: u64) -> Vec<mpsc::UnboundedSender<Arc<[u8]>>> {
+    fn collect_targets(&self, source_peer_id: u64) -> Vec<mpsc::Sender<Arc<[u8]>>> {
         self.sessions
             .iter()
             .filter_map(|(peer_id, session)| {
@@ -739,7 +741,7 @@ async fn establish_connection(
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
-    let (tx, rx) = mpsc::unbounded_channel::<Arc<[u8]>>();
+    let (tx, rx) = mpsc::channel::<Arc<[u8]>>(OUTBOUND_QUEUE_CAPACITY);
     let (peer_id, handshake_payload, incoming_count, outgoing_count, latest_tick) = {
         let mut locked = state.lock().await;
 
@@ -768,7 +770,9 @@ async fn establish_connection(
         )
     };
 
-    let _ = tx.send(Arc::<[u8]>::from(handshake_payload));
+    if tx.try_send(Arc::<[u8]>::from(handshake_payload)).is_err() {
+        eprintln!("Failed to queue handshake frame for {remote}");
+    }
     println!(
         "Connected {} [{}] | in={} out={} | {}",
         remote,
@@ -793,7 +797,7 @@ async fn connection_worker(
     stream: TcpStream,
     peer_id: u64,
     remote: SocketAddrV4,
-    mut rx: mpsc::UnboundedReceiver<Arc<[u8]>>,
+    mut rx: mpsc::Receiver<Arc<[u8]>>,
     state: Arc<Mutex<NodeState>>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
@@ -981,8 +985,28 @@ async fn process_incoming_frame(
     }
 
     let frame = Arc::<[u8]>::from(frame);
+    let mut dropped_due_to_full = 0usize;
     for tx in targets {
-        let _ = tx.send(Arc::clone(&frame));
+        match tx.try_send(Arc::clone(&frame)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                dropped_due_to_full += 1;
+            }
+            Err(TrySendError::Closed(_)) => {}
+        }
+    }
+
+    if config.traffic_log && dropped_due_to_full > 0 {
+        let (size, message_type, dejavu) = frame_meta(&frame);
+        println!(
+            "DROP_BACKPRESSURE peer_id={} dropped={} size={} type={}({}) dejavu={}",
+            source_peer_id,
+            dropped_due_to_full,
+            size,
+            message_type_name(message_type),
+            message_type,
+            dejavu
+        );
     }
 }
 
@@ -1117,7 +1141,7 @@ async fn fetch_seed_peers_from_dns(
 ) -> Result<Vec<SocketAddrV4>, String> {
     let requested_lite = lite_peers.max(1);
     let url = format!(
-        "https://api.qubic.global/random-peers?service=bobNode&litePeers={requested_lite}&bobPeers=4"
+        "https://api.qubic.global/random-peers?service=bobNode&litePeers={requested_lite}"
     );
 
     let client = reqwest::Client::builder()
