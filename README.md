@@ -55,8 +55,9 @@ All available options:
 
 | Option | Type |           Default | What it does | When to use |
 |---|---|------------------:|---|---|
-| `--peer <ip[:port]>` | repeatable |              none | Adds a manual peer. If port is omitted, uses `--port`. | Use when you have trusted/stable peers, want faster startup, or run with `--no-dns-bootstrap`. |
-| `--port <u16>` | integer |           `21841` | Sets both P2P listening port and default port for peers provided without `:port`. | Change when running multiple nodes on one host, or when firewall/NAT requires a different port. |
+| `--peer <ip[:port]>` | repeatable |              none | Adds a manual peer. If port is omitted, uses `--peer-port`. | Use when you have trusted/stable peers, want faster startup, or run with `--no-dns-bootstrap`. |
+| `--port <u16>` | integer |           `21841` | Sets local P2P listening port only. | Change when running multiple nodes on one host, or when local OS/firewall policies block `21841`. |
+| `--peer-port <u16>` | integer |           `21841` | Sets remote peer port used for DNS/peer-exchange discovery and for `--peer <ip>` without `:port`. | Use when connecting to a non-standard/private Qubic network port. |
 | `--listen-ip <ipv4>` | IPv4 |         `0.0.0.0` | Sets the P2P bind IP address. | Use `127.0.0.1` for local-only testing; use a specific interface on multi-NIC hosts. |
 | `--target-outbound <n>` | integer |               `8` | Desired number of outbound peer connections maintained by the reconnect loop. | Increase for better resilience/availability; decrease on low-resource or restricted environments. |
 | `--max-incoming <n>` | integer |              `32` | Maximum simultaneous inbound connections. New inbound sessions are rejected after the limit. | Decrease to protect CPU/RAM or home network uplink; increase for public relay servers. |
