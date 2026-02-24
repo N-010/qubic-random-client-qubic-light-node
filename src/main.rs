@@ -73,7 +73,7 @@ struct Config {
     api_timeout: Duration,
     grpc_listen_addr: SocketAddr,
     grpc_enabled: bool,
-    network_port: u16,
+    peer_port: u16,
     target_outbound: usize,
     max_incoming: usize,
     max_seen: usize,
@@ -147,7 +147,7 @@ impl NodeState {
         remote: SocketAddrV4,
         outbound: bool,
         tx: mpsc::Sender<Arc<[u8]>>,
-        network_port: u16,
+        peer_port: u16,
     ) -> Option<u64> {
         let remote_ip = *remote.ip();
         if self.is_ip_connected(remote_ip) {
@@ -166,10 +166,10 @@ impl NodeState {
             },
         );
         *self.connected_ip_refcount.entry(remote_ip).or_insert(0) += 1;
-        let _ = self.add_discovered_peer(SocketAddrV4::new(remote_ip, network_port));
+        let _ = self.add_discovered_peer(SocketAddrV4::new(remote_ip, peer_port));
         self.pending_dials.remove(&remote);
         self.pending_dials
-            .remove(&SocketAddrV4::new(remote_ip, network_port));
+            .remove(&SocketAddrV4::new(remote_ip, peer_port));
 
         Some(peer_id)
     }
@@ -309,7 +309,7 @@ impl NodeState {
         self.latest_tick
     }
 
-    fn peer_candidates(&self, network_port: u16) -> Vec<SocketAddrV4> {
+    fn peer_candidates(&self, peer_port: u16) -> Vec<SocketAddrV4> {
         let mut peers = HashSet::<SocketAddrV4>::new();
 
         for session in self.sessions.values() {
@@ -319,7 +319,7 @@ impl NodeState {
             if session.outbound {
                 peers.insert(session.remote);
             } else {
-                peers.insert(SocketAddrV4::new(*session.remote.ip(), network_port));
+                peers.insert(SocketAddrV4::new(*session.remote.ip(), peer_port));
             }
         }
 
@@ -428,8 +428,7 @@ async fn main() -> std::io::Result<()> {
             config.dns_lite_peers
         };
 
-        match fetch_seed_peers_from_dns(config.network_port, dns_lite_peers, config.dns_timeout)
-            .await
+        match fetch_seed_peers_from_dns(config.peer_port, dns_lite_peers, config.dns_timeout).await
         {
             Ok(mut peers) => {
                 if peers.is_empty() {
@@ -458,8 +457,9 @@ async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
 
     println!(
-        "Qubic light relay started at {} | target_outbound={} | max_incoming={} | max_known_peers={} | seed_peers={} | traffic_log={} | grpc={}({})",
+        "Qubic light relay started at {} | peer_port={} | target_outbound={} | max_incoming={} | max_known_peers={} | seed_peers={} | traffic_log={} | grpc={}({})",
         config.listen_addr,
+        config.peer_port,
         config.target_outbound,
         config.max_incoming,
         config.max_known_peers,
@@ -872,15 +872,14 @@ async fn establish_connection(
         if !outbound && locked.incoming_count() >= config.max_incoming {
             println!("Rejecting incoming {remote}: incoming limit reached.");
             locked.clear_pending_dial(remote);
-            locked.clear_pending_dial(SocketAddrV4::new(*remote.ip(), config.network_port));
+            locked.clear_pending_dial(SocketAddrV4::new(*remote.ip(), config.peer_port));
             return;
         }
 
-        let Some(peer_id) =
-            locked.register_session(remote, outbound, tx.clone(), config.network_port)
+        let Some(peer_id) = locked.register_session(remote, outbound, tx.clone(), config.peer_port)
         else {
             locked.clear_pending_dial(remote);
-            locked.clear_pending_dial(SocketAddrV4::new(*remote.ip(), config.network_port));
+            locked.clear_pending_dial(SocketAddrV4::new(*remote.ip(), config.peer_port));
             return;
         };
 
@@ -1058,7 +1057,7 @@ async fn process_incoming_frame(
     let dejavu = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
 
     let discovered = if message_type == EXCHANGE_PUBLIC_PEERS_TYPE {
-        parse_exchange_public_peers(&frame, config.network_port)
+        parse_exchange_public_peers(&frame, config.peer_port)
     } else {
         Vec::new()
     };
@@ -1231,7 +1230,7 @@ fn build_exchange_public_peers_frame(peers: [Ipv4Addr; NUMBER_OF_EXCHANGED_PEERS
     frame
 }
 
-fn parse_exchange_public_peers(frame: &[u8], network_port: u16) -> Vec<SocketAddrV4> {
+fn parse_exchange_public_peers(frame: &[u8], peer_port: u16) -> Vec<SocketAddrV4> {
     if frame.len() < EXCHANGE_PUBLIC_PEERS_FRAME_SIZE {
         return Vec::new();
     }
@@ -1243,7 +1242,7 @@ fn parse_exchange_public_peers(frame: &[u8], network_port: u16) -> Vec<SocketAdd
         if is_bogon(&ip) {
             continue;
         }
-        peers.push(SocketAddrV4::new(ip, network_port));
+        peers.push(SocketAddrV4::new(ip, peer_port));
     }
     peers
 }
@@ -1273,7 +1272,7 @@ fn random_non_zero_u32() -> u32 {
 }
 
 async fn fetch_seed_peers_from_dns(
-    network_port: u16,
+    peer_port: u16,
     lite_peers: usize,
     timeout: Duration,
 ) -> Result<Vec<SocketAddrV4>, String> {
@@ -1302,7 +1301,7 @@ async fn fetch_seed_peers_from_dns(
         .map_err(|err| format!("invalid JSON: {err}"))?;
 
     let mut peers = Vec::<SocketAddrV4>::new();
-    collect_peers_from_json(&root, "litePeers", network_port, &mut peers);
+    collect_peers_from_json(&root, "litePeers", peer_port, &mut peers);
 
     peers.sort_unstable();
     peers.dedup();
@@ -1312,7 +1311,7 @@ async fn fetch_seed_peers_from_dns(
 fn collect_peers_from_json(
     root: &Value,
     field_name: &str,
-    network_port: u16,
+    peer_port: u16,
     out: &mut Vec<SocketAddrV4>,
 ) {
     let Some(array) = root.get(field_name).and_then(Value::as_array) else {
@@ -1329,7 +1328,7 @@ fn collect_peers_from_json(
         if is_bogon(&ip) {
             continue;
         }
-        out.push(SocketAddrV4::new(ip, network_port));
+        out.push(SocketAddrV4::new(ip, peer_port));
     }
 }
 
@@ -1400,7 +1399,7 @@ async fn query_balance(
 ) -> Result<BalanceResponse, String> {
     let mut peers = {
         let locked = state.lock().await;
-        locked.peer_candidates(config.network_port)
+        locked.peer_candidates(config.peer_port)
     };
     if peers.is_empty() {
         return Err("No known peers available".to_string());
@@ -1507,7 +1506,7 @@ async fn query_tick_transactions(
 ) -> Result<Vec<TickTransaction>, String> {
     let mut peers = {
         let locked = state.lock().await;
-        locked.peer_candidates(config.network_port)
+        locked.peer_candidates(config.peer_port)
     };
     if peers.is_empty() {
         return Err("No known peers available".to_string());
@@ -1864,7 +1863,8 @@ fn read_i64(bytes: &[u8], offset: usize) -> Option<i64> {
 }
 
 fn parse_config() -> Result<Config, String> {
-    let mut port = DEFAULT_PORT;
+    let mut listen_port = DEFAULT_PORT;
+    let mut peer_port = DEFAULT_PORT;
     let mut listen_ip = Ipv4Addr::new(0, 0, 0, 0);
 
     let mut api_timeout_ms = DEFAULT_API_TIMEOUT_MS;
@@ -1896,9 +1896,18 @@ fn parse_config() -> Result<Config, String> {
                 let value = args
                     .get(index)
                     .ok_or_else(|| "Missing value for --port".to_string())?;
-                port = value
+                listen_port = value
                     .parse::<u16>()
                     .map_err(|_| format!("Invalid port: {value}"))?;
+            }
+            "--peer-port" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "Missing value for --peer-port".to_string())?;
+                peer_port = value
+                    .parse::<u16>()
+                    .map_err(|_| format!("Invalid peer port: {value}"))?;
             }
             "--listen-ip" => {
                 index += 1;
@@ -2016,18 +2025,18 @@ fn parse_config() -> Result<Config, String> {
 
     let mut seed_peers = Vec::<SocketAddrV4>::new();
     for value in seed_peer_args {
-        seed_peers.push(parse_peer_arg(&value, port)?);
+        seed_peers.push(parse_peer_arg(&value, peer_port)?);
     }
 
     seed_peers.sort_unstable();
     seed_peers.dedup();
 
     Ok(Config {
-        listen_addr: SocketAddrV4::new(listen_ip, port),
+        listen_addr: SocketAddrV4::new(listen_ip, listen_port),
         api_timeout: Duration::from_millis(api_timeout_ms.max(1_000)),
         grpc_listen_addr: grpc_listen,
         grpc_enabled,
-        network_port: port,
+        peer_port,
         target_outbound,
         max_incoming,
         max_seen,
@@ -2065,8 +2074,11 @@ fn print_usage() {
     println!("  QubicLightNode [options]");
     println!();
     println!("Options:");
-    println!("  --peer <ip[:port]>       Seed peer (repeatable).");
-    println!("  --port <u16>             Network/listen port (default: 21841).");
+    println!("  --peer <ip[:port]>       Seed peer (repeatable, default peer port if omitted).");
+    println!("  --port <u16>             Local listen port (default: 21841).");
+    println!(
+        "  --peer-port <u16>        Remote peer port for discovery and --peer ip (default: 21841)."
+    );
     println!("  --listen-ip <ipv4>       Listen IP (default: 0.0.0.0).");
     println!("  --target-outbound <n>    Target outgoing connections (default: 8).");
     println!("  --max-incoming <n>       Max incoming connections (default: 32).");
@@ -2096,7 +2108,7 @@ mod tests {
             api_timeout: Duration::from_secs(1),
             grpc_listen_addr: SocketAddr::from(([127, 0, 0, 1], DEFAULT_GRPC_PORT)),
             grpc_enabled: true,
-            network_port: DEFAULT_PORT,
+            peer_port: DEFAULT_PORT,
             target_outbound: 8,
             max_incoming: 32,
             max_seen: 1_000,
