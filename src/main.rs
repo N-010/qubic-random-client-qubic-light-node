@@ -218,6 +218,13 @@ impl NodeState {
             .collect()
     }
 
+    fn collect_all_targets(&self) -> Vec<mpsc::Sender<Arc<[u8]>>> {
+        self.sessions
+            .values()
+            .map(|session| session.tx.clone())
+            .collect()
+    }
+
     fn add_discovered_peer(&mut self, peer: SocketAddrV4) -> bool {
         if is_bogon(peer.ip()) {
             return false;
@@ -617,6 +624,34 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
             })),
         }
     }
+
+    async fn broadcast_transaction(
+        &self,
+        request: Request<lightnodepb::BroadcastTransactionRequest>,
+    ) -> Result<Response<lightnodepb::BroadcastTransactionResponse>, Status> {
+        let tx_bytes = request.into_inner().tx_bytes;
+        if tx_bytes.is_empty() {
+            return Ok(Response::new(lightnodepb::BroadcastTransactionResponse {
+                ok: false,
+                tx_id: String::new(),
+                error: "Transaction payload is empty".to_string(),
+            }));
+        }
+
+        let tx_id = tx_id_from_bytes(&tx_bytes);
+        match broadcast_transaction_to_network(Arc::clone(&self.api.node_state), &tx_bytes).await {
+            Ok(_) => Ok(Response::new(lightnodepb::BroadcastTransactionResponse {
+                ok: true,
+                tx_id,
+                error: String::new(),
+            })),
+            Err(err) => Ok(Response::new(lightnodepb::BroadcastTransactionResponse {
+                ok: false,
+                tx_id: String::new(),
+                error: err,
+            })),
+        }
+    }
 }
 
 fn map_tick_status(status: TickStatus) -> lightnodepb::TickStatus {
@@ -657,6 +692,74 @@ fn map_transaction(tx: TickTransaction) -> lightnodepb::Transaction {
         input_hex: tx.input_hex,
         signature_hex: tx.signature_hex,
     }
+}
+
+fn tx_id_from_bytes(tx_bytes: &[u8]) -> String {
+    bytes_to_hex(blake3::hash(tx_bytes).as_bytes())
+}
+
+async fn broadcast_transaction_to_network(
+    state: Arc<Mutex<NodeState>>,
+    tx_bytes: &[u8],
+) -> Result<(), String> {
+    if tx_bytes.is_empty() {
+        return Err("Transaction payload is empty".to_string());
+    }
+
+    let frame = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, tx_bytes)?;
+    let digest = *blake3::hash(&frame).as_bytes();
+
+    let (targets, is_new) = {
+        let mut locked = state.lock().await;
+        let targets = locked.collect_all_targets();
+        if targets.is_empty() {
+            return Err("No connected peers available for broadcast".to_string());
+        }
+        let is_new = locked.mark_seen(digest);
+        (targets, is_new)
+    };
+
+    if !is_new {
+        return Ok(());
+    }
+
+    let frame = Arc::<[u8]>::from(frame);
+    let mut sent_count = 0usize;
+    let mut full_count = 0usize;
+    let mut closed_count = 0usize;
+
+    for tx in targets {
+        match tx.try_send(Arc::clone(&frame)) {
+            Ok(()) => {
+                sent_count += 1;
+            }
+            Err(TrySendError::Full(_)) => {
+                full_count += 1;
+            }
+            Err(TrySendError::Closed(_)) => {
+                closed_count += 1;
+            }
+        }
+    }
+
+    if sent_count == 0 {
+        let peer_count = full_count + closed_count;
+        if full_count == peer_count {
+            return Err(
+                "Failed to broadcast transaction: all peer outbound queues are full".to_string(),
+            );
+        }
+        if closed_count == peer_count {
+            return Err(
+                "Failed to broadcast transaction: all peer sessions are closed".to_string(),
+            );
+        }
+        return Err(
+            "Failed to broadcast transaction: no peer accepted the transaction".to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 async fn accept_loop(
@@ -1979,4 +2082,125 @@ fn print_usage() {
     println!("  --grpc-listen <ip:port>  gRPC bind address (default: 127.0.0.1:50051).");
     println!("  --no-grpc                Disable gRPC API.");
     println!("  -h, --help               Show this help.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lightnodepb::light_node_server::LightNode;
+    use pretty_assertions::assert_eq;
+
+    fn test_config() -> Arc<Config> {
+        Arc::new(Config {
+            listen_addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), DEFAULT_PORT),
+            api_timeout: Duration::from_secs(1),
+            grpc_listen_addr: SocketAddr::from(([127, 0, 0, 1], DEFAULT_GRPC_PORT)),
+            grpc_enabled: true,
+            network_port: DEFAULT_PORT,
+            target_outbound: 8,
+            max_incoming: 32,
+            max_seen: 1_000,
+            max_known_peers: 1_000,
+            reconnect_interval: Duration::from_millis(2_000),
+            relay_all: false,
+            dns_bootstrap: false,
+            dns_lite_peers: 0,
+            dns_timeout: Duration::from_secs(1),
+            traffic_log: false,
+            seed_peers: Vec::new(),
+        })
+    }
+
+    fn test_service(node_state: Arc<Mutex<NodeState>>) -> GrpcService {
+        GrpcService {
+            api: ApiState {
+                node_state,
+                latest_epoch_tick: Arc::new(AtomicU64::new(0)),
+                config: test_config(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_transaction_success() {
+        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
+        let (peer_tx, mut peer_rx) = mpsc::channel::<Arc<[u8]>>(1);
+        {
+            let mut locked = node_state.lock().await;
+            let peer = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DEFAULT_PORT);
+            let registered = locked.register_session(peer, true, peer_tx, DEFAULT_PORT);
+            assert_eq!(registered.is_some(), true);
+        }
+
+        let service = test_service(Arc::clone(&node_state));
+        let request = Request::new(lightnodepb::BroadcastTransactionRequest {
+            tx_bytes: vec![1, 2, 3],
+        });
+
+        let response = LightNode::broadcast_transaction(&service, request)
+            .await
+            .expect("broadcast_transaction should return grpc response")
+            .into_inner();
+
+        assert_eq!(
+            response,
+            lightnodepb::BroadcastTransactionResponse {
+                ok: true,
+                tx_id: tx_id_from_bytes(&[1, 2, 3]),
+                error: String::new(),
+            }
+        );
+
+        let outbound_frame = peer_rx
+            .recv()
+            .await
+            .expect("peer should receive broadcast frame");
+        let expected_frame = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &[1, 2, 3])
+            .expect("broadcast frame should be buildable");
+        assert_eq!(&*outbound_frame, expected_frame.as_slice());
+    }
+
+    #[tokio::test]
+    async fn broadcast_transaction_empty_payload() {
+        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[]))));
+        let request = Request::new(lightnodepb::BroadcastTransactionRequest {
+            tx_bytes: Vec::new(),
+        });
+
+        let response = LightNode::broadcast_transaction(&service, request)
+            .await
+            .expect("broadcast_transaction should return grpc response")
+            .into_inner();
+
+        assert_eq!(
+            response,
+            lightnodepb::BroadcastTransactionResponse {
+                ok: false,
+                tx_id: String::new(),
+                error: "Transaction payload is empty".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_transaction_no_peers_maps_to_error_response() {
+        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[]))));
+        let request = Request::new(lightnodepb::BroadcastTransactionRequest {
+            tx_bytes: vec![7, 8, 9],
+        });
+
+        let response = LightNode::broadcast_transaction(&service, request)
+            .await
+            .expect("broadcast_transaction should return grpc response")
+            .into_inner();
+
+        assert_eq!(
+            response,
+            lightnodepb::BroadcastTransactionResponse {
+                ok: false,
+                tx_id: String::new(),
+                error: "No connected peers available for broadcast".to_string(),
+            }
+        );
+    }
 }

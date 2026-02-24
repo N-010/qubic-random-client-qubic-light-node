@@ -2,7 +2,7 @@
 
 QubicLightNode is a lightweight Qubic relay node with a local gRPC API.
 
-It connects to public Qubic peers over TCP, relays network frames, tracks the latest tick, and exposes read-only methods for status, wallet balance, and tick transactions.
+It connects to public Qubic peers over TCP, relays network frames, tracks the latest tick, and exposes gRPC methods for status, wallet balance, tick transactions, and transaction broadcast.
 
 ## Features
 
@@ -135,6 +135,7 @@ Methods:
 - `GetStatus`
 - `GetBalance`
 - `GetTickTransactions`
+- `BroadcastTransaction`
 
 Protocol definition: `proto/lightnode.proto`
 
@@ -145,6 +146,7 @@ Protocol definition: `proto/lightnode.proto`
   - Qubic identity: 60 uppercase letters (`A-Z`)
   - public key hex: `0x` + 64 hex chars (or 64 hex chars without prefix)
 - API data is fetched from peers with parallel race queries (up to 3 peers in parallel), returning the first successful response.
+- `BroadcastTransaction` accepts raw transaction bytes (`tx_bytes`) and rebroadcasts them to currently connected peers.
 
 ## Network Protocol Notes
 
