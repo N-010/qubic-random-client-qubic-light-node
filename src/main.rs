@@ -3,7 +3,6 @@ use rand::seq::SliceRandom;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::env;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +16,10 @@ use tokio::time::{Instant, sleep, timeout};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
+mod config;
+
+use crate::config::{Config, DEFAULT_GRPC_PORT, DEFAULT_PORT};
+
 pub mod lightnodepb {
     tonic::include_proto!("lightnode");
 }
@@ -24,16 +27,11 @@ pub mod lightnodepb {
 const LIGHTNODE_FILE_DESCRIPTOR_SET: &[u8] =
     tonic::include_file_descriptor_set!("lightnode_descriptor");
 
-const DEFAULT_PORT: u16 = 21841;
-const DEFAULT_GRPC_PORT: u16 = 50051;
 const HEADER_SIZE: usize = 8;
 const MAX_FRAME_SIZE: usize = 0x00FF_FFFF;
 const EXCHANGE_PUBLIC_PEERS_TYPE: u8 = 0;
 const NUMBER_OF_EXCHANGED_PEERS: usize = 4;
 const EXCHANGE_PUBLIC_PEERS_FRAME_SIZE: usize = HEADER_SIZE + NUMBER_OF_EXCHANGED_PEERS * 4;
-const DEFAULT_DNS_TIMEOUT_MS: u64 = 5_000;
-const DEFAULT_API_TIMEOUT_MS: u64 = 6_000;
-const DEFAULT_MAX_KNOWN_PEERS: usize = 500;
 
 const BROADCAST_TICK_TYPE: u8 = 3;
 const BROADCAST_TRANSACTION_TYPE: u8 = 24;
@@ -65,26 +63,6 @@ struct TickStatus {
     tick_duration_ms: u16,
     aligned_votes: u16,
     misaligned_votes: u16,
-}
-
-#[derive(Clone, Debug)]
-struct Config {
-    listen_addr: SocketAddrV4,
-    api_timeout: Duration,
-    grpc_listen_addr: SocketAddr,
-    grpc_enabled: bool,
-    peer_port: u16,
-    target_outbound: usize,
-    max_incoming: usize,
-    max_seen: usize,
-    max_known_peers: usize,
-    reconnect_interval: Duration,
-    relay_all: bool,
-    dns_bootstrap: bool,
-    dns_lite_peers: usize,
-    dns_timeout: Duration,
-    traffic_log: bool,
-    seed_peers: Vec<SocketAddrV4>,
 }
 
 #[derive(Clone, Debug)]
@@ -412,13 +390,9 @@ struct GrpcService {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let mut config = match parse_config() {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            eprintln!("{err}");
-            print_usage();
-            std::process::exit(2);
-        }
+    let mut config = match Config::from_env() {
+        Ok(config) => config,
+        Err(err) => err.exit(),
     };
 
     if config.dns_bootstrap && config.seed_peers.is_empty() {
@@ -1860,240 +1834,6 @@ fn read_i64(bytes: &[u8], offset: usize) -> Option<i64> {
     Some(i64::from_le_bytes([
         chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
     ]))
-}
-
-fn parse_config() -> Result<Config, String> {
-    let mut listen_port = DEFAULT_PORT;
-    let mut peer_port = DEFAULT_PORT;
-    let mut listen_ip = Ipv4Addr::new(0, 0, 0, 0);
-
-    let mut api_timeout_ms = DEFAULT_API_TIMEOUT_MS;
-    let mut grpc_enabled = true;
-    let mut grpc_listen = SocketAddr::from(([127, 0, 0, 1], DEFAULT_GRPC_PORT));
-
-    let mut target_outbound = 8usize;
-    let mut max_incoming = 32usize;
-    let mut max_seen = 65_536usize;
-    let mut max_known_peers = DEFAULT_MAX_KNOWN_PEERS;
-    let mut reconnect_ms = 2_000u64;
-    let mut relay_all = false;
-    let mut dns_bootstrap = true;
-    let mut dns_lite_peers = 0usize;
-    let mut dns_timeout_ms = DEFAULT_DNS_TIMEOUT_MS;
-    let mut traffic_log = false;
-    let mut seed_peer_args = Vec::<String>::new();
-
-    let args: Vec<String> = env::args().collect();
-    let mut index = 1usize;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            "--port" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --port".to_string())?;
-                listen_port = value
-                    .parse::<u16>()
-                    .map_err(|_| format!("Invalid port: {value}"))?;
-            }
-            "--peer-port" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --peer-port".to_string())?;
-                peer_port = value
-                    .parse::<u16>()
-                    .map_err(|_| format!("Invalid peer port: {value}"))?;
-            }
-            "--listen-ip" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --listen-ip".to_string())?;
-                listen_ip = value
-                    .parse::<Ipv4Addr>()
-                    .map_err(|_| format!("Invalid IPv4 address: {value}"))?;
-            }
-            "--api-timeout-ms" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --api-timeout-ms".to_string())?;
-                api_timeout_ms = value
-                    .parse::<u64>()
-                    .map_err(|_| format!("Invalid API timeout value: {value}"))?;
-            }
-            "--grpc-listen" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --grpc-listen".to_string())?;
-                grpc_listen = parse_socket_addr(value)?;
-            }
-            "--no-grpc" => {
-                grpc_enabled = false;
-            }
-            "--peer" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --peer".to_string())?;
-                seed_peer_args.push(value.clone());
-            }
-            "--target-outbound" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --target-outbound".to_string())?;
-                target_outbound = value
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid target outbound value: {value}"))?;
-            }
-            "--max-incoming" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --max-incoming".to_string())?;
-                max_incoming = value
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid max incoming value: {value}"))?;
-            }
-            "--max-seen" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --max-seen".to_string())?;
-                max_seen = value
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid max seen value: {value}"))?;
-            }
-            "--max-known-peers" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --max-known-peers".to_string())?;
-                max_known_peers = value
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid max known peers value: {value}"))?;
-            }
-            "--reconnect-ms" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --reconnect-ms".to_string())?;
-                reconnect_ms = value
-                    .parse::<u64>()
-                    .map_err(|_| format!("Invalid reconnect interval: {value}"))?;
-            }
-            "--relay-all" => {
-                relay_all = true;
-            }
-            "--no-dns-bootstrap" => {
-                dns_bootstrap = false;
-            }
-            "--dns-lite-peers" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --dns-lite-peers".to_string())?;
-                dns_lite_peers = value
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid DNS lite peers value: {value}"))?;
-            }
-            "--dns-timeout-ms" => {
-                index += 1;
-                let value = args
-                    .get(index)
-                    .ok_or_else(|| "Missing value for --dns-timeout-ms".to_string())?;
-                dns_timeout_ms = value
-                    .parse::<u64>()
-                    .map_err(|_| format!("Invalid DNS timeout value: {value}"))?;
-            }
-            "--traffic-log" => {
-                traffic_log = true;
-            }
-            unknown => {
-                return Err(format!("Unknown argument: {unknown}"));
-            }
-        }
-        index += 1;
-    }
-
-    let mut seed_peers = Vec::<SocketAddrV4>::new();
-    for value in seed_peer_args {
-        seed_peers.push(parse_peer_arg(&value, peer_port)?);
-    }
-
-    seed_peers.sort_unstable();
-    seed_peers.dedup();
-
-    Ok(Config {
-        listen_addr: SocketAddrV4::new(listen_ip, listen_port),
-        api_timeout: Duration::from_millis(api_timeout_ms.max(1_000)),
-        grpc_listen_addr: grpc_listen,
-        grpc_enabled,
-        peer_port,
-        target_outbound,
-        max_incoming,
-        max_seen,
-        max_known_peers,
-        reconnect_interval: Duration::from_millis(reconnect_ms.max(200)),
-        relay_all,
-        dns_bootstrap,
-        dns_lite_peers,
-        dns_timeout: Duration::from_millis(dns_timeout_ms.max(500)),
-        traffic_log,
-        seed_peers,
-    })
-}
-
-fn parse_peer_arg(value: &str, default_port: u16) -> Result<SocketAddrV4, String> {
-    if let Ok(addr) = value.parse::<SocketAddrV4>() {
-        return Ok(addr);
-    }
-    if let Ok(ip) = value.parse::<Ipv4Addr>() {
-        return Ok(SocketAddrV4::new(ip, default_port));
-    }
-    Err(format!(
-        "Invalid peer value: {value}. Expected ip or ip:port"
-    ))
-}
-
-fn parse_socket_addr(value: &str) -> Result<SocketAddr, String> {
-    value
-        .parse::<SocketAddr>()
-        .map_err(|_| format!("Invalid socket address: {value}"))
-}
-
-fn print_usage() {
-    println!("Usage:");
-    println!("  QubicLightNode [options]");
-    println!();
-    println!("Options:");
-    println!("  --peer <ip[:port]>       Seed peer (repeatable, default peer port if omitted).");
-    println!("  --port <u16>             Local listen port (default: 21841).");
-    println!(
-        "  --peer-port <u16>        Remote peer port for discovery and --peer ip (default: 21841)."
-    );
-    println!("  --listen-ip <ipv4>       Listen IP (default: 0.0.0.0).");
-    println!("  --target-outbound <n>    Target outgoing connections (default: 8).");
-    println!("  --max-incoming <n>       Max incoming connections (default: 32).");
-    println!("  --max-seen <n>           Dedup window size (default: 65536).");
-    println!("  --max-known-peers <n>    Max discovered peers kept in memory.");
-    println!("  --reconnect-ms <n>       Outgoing reconnect interval in ms (default: 500).");
-    println!("  --relay-all              Relay messages even with non-zero dejavu.");
-    println!("  --no-dns-bootstrap       Disable peer bootstrap from api.qubic.global.");
-    println!("  --dns-lite-peers <n>     Requested lite peers count from DNS API (default: auto).");
-    println!("  --dns-timeout-ms <n>     DNS API request timeout in ms (default: 5000).");
-    println!("  --traffic-log            Log RX/TX/relay events for network frames.");
-    println!("  --api-timeout-ms <n>     API query timeout in ms (default: 6000).");
-    println!("  --grpc-listen <ip:port>  gRPC bind address (default: 127.0.0.1:50051).");
-    println!("  --no-grpc                Disable gRPC API.");
-    println!("  -h, --help               Show this help.");
 }
 
 #[cfg(test)]
