@@ -1,19 +1,13 @@
 use crate::LIGHTNODE_FILE_DESCRIPTOR_SET;
 use crate::codec::{parse_wallet_public_key, tx_id_from_bytes};
-use crate::config::{Config, DEFAULT_GRPC_PORT, DEFAULT_PORT};
 use crate::lightnodepb;
 use crate::network::broadcast_transaction_to_network;
 use crate::peer_api::{query_balance, query_tick_transactions};
-use crate::state::NodeState;
 use crate::types::{
     ApiState, BalanceResponse, TickStatus, TickTransaction, tick_status_from_packed,
 };
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
+use std::sync::atomic::Ordering;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -207,9 +201,16 @@ fn map_transaction(tx: TickTransaction) -> lightnodepb::Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Config, DEFAULT_GRPC_PORT, DEFAULT_PORT};
     use crate::frame::{BROADCAST_TRANSACTION_TYPE, build_request_frame};
     use crate::lightnodepb::light_node_server::LightNode;
+    use crate::state::NodeState;
     use pretty_assertions::assert_eq;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+    use tokio::sync::Mutex;
+    use tokio::sync::mpsc;
 
     fn test_config() -> Arc<Config> {
         Arc::new(Config {
