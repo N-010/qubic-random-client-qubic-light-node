@@ -6,6 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
 pub(crate) const DEFAULT_PORT: u16 = 21841;
+#[cfg(test)]
 pub(crate) const DEFAULT_GRPC_PORT: u16 = 50051;
 
 const DEFAULT_API_TIMEOUT_MS: u64 = 6_000;
