@@ -1,27 +1,84 @@
 use crate::config::Config;
 use crate::frame::{
-    BROADCAST_TRANSACTION_TYPE, EXCHANGE_PUBLIC_PEERS_TYPE, HEADER_SIZE, MAX_FRAME_SIZE, NUMBER_OF_TRANSACTIONS_PER_TICK,
-    build_exchange_public_peers_frame, build_request_frame, decode_frame_size, frame_meta,
-    message_type_name, parse_exchange_public_peers, parse_tick_status_from_frame,
+    BROADCAST_TRANSACTION_TYPE, EXCHANGE_PUBLIC_PEERS_TYPE, HEADER_SIZE, MAX_FRAME_SIZE,
+    NUMBER_OF_TRANSACTIONS_PER_TICK, build_exchange_public_peers_frame, build_request_frame,
+    decode_frame_size, frame_meta, message_type_name, parse_exchange_public_peers,
+    parse_tick_status_from_frame,
 };
-use crate::state::NodeState;
+use crate::state::{NodeState, RelayTarget};
 use crate::types::{TickStatus, format_epoch_tick, format_epoch_tick_packed, pack_epoch_tick};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::sleep;
 
 const OUTBOUND_QUEUE_CAPACITY: usize = NUMBER_OF_TRANSACTIONS_PER_TICK * 2;
+const DISSEMINATION_MULTIPLIER: usize = 6;
 const READ_BUFFER_SIZE: usize = 128 * 1024;
 const ACCUMULATED_INITIAL_CAPACITY: usize = 256 * 1024;
 const ACCUMULATED_RETAIN_CAPACITY: usize = 512 * 1024;
 const ACCUMULATED_SHRINK_THRESHOLD: usize = 2 * 1024 * 1024;
 const MAX_ACCUMULATED_BUFFER: usize = MAX_FRAME_SIZE * 2;
+
+#[derive(Debug, Default)]
+struct DispatchResult {
+    sent_count: usize,
+    full_peer_ids: Vec<u64>,
+    closed_peer_ids: Vec<u64>,
+}
+
+struct ConnectionContext {
+    peer_id: u64,
+    remote: SocketAddrV4,
+    state: Arc<Mutex<NodeState>>,
+    latest_epoch_tick: Arc<AtomicU64>,
+    config: Arc<Config>,
+}
+
+fn dispatch_frame(targets: Vec<RelayTarget>, frame: &Arc<[u8]>) -> DispatchResult {
+    let mut result = DispatchResult::default();
+
+    for target in targets {
+        if result.sent_count == DISSEMINATION_MULTIPLIER {
+            break;
+        }
+        match target.tx.try_send(Arc::clone(frame)) {
+            Ok(()) => {
+                result.sent_count += 1;
+            }
+            Err(TrySendError::Full(_)) => {
+                result.full_peer_ids.push(target.peer_id);
+            }
+            Err(TrySendError::Closed(_)) => {
+                result.closed_peer_ids.push(target.peer_id);
+            }
+        }
+    }
+
+    result
+}
+
+async fn disconnect_failed_targets(state: &Arc<Mutex<NodeState>>, result: &DispatchResult) {
+    if result.full_peer_ids.is_empty() && result.closed_peer_ids.is_empty() {
+        return;
+    }
+
+    let mut locked = state.lock().await;
+    for peer_id in &result.full_peer_ids {
+        if let Some(remote) = locked.disconnect_session(*peer_id) {
+            eprintln!("Disconnecting {remote}: outbound queue is full");
+        }
+    }
+    for peer_id in &result.closed_peer_ids {
+        let _ = locked.disconnect_session(*peer_id);
+    }
+}
 
 pub(crate) async fn broadcast_transaction_to_network(
     state: Arc<Mutex<NodeState>>,
@@ -34,40 +91,25 @@ pub(crate) async fn broadcast_transaction_to_network(
     let frame = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, tx_bytes)?;
     let digest = *blake3::hash(&frame).as_bytes();
 
-    let (targets, is_new) = {
-        let mut locked = state.lock().await;
+    let targets = {
+        let locked = state.lock().await;
         let targets = locked.collect_all_targets();
         if targets.is_empty() {
             return Err("No connected peers available for broadcast".to_string());
         }
-        let is_new = locked.mark_seen(digest);
-        (targets, is_new)
+        if locked.is_seen(&digest) {
+            return Ok(());
+        }
+        targets
     };
 
-    if !is_new {
-        return Ok(());
-    }
-
     let frame = Arc::<[u8]>::from(frame);
-    let mut sent_count = 0usize;
-    let mut full_count = 0usize;
-    let mut closed_count = 0usize;
+    let result = dispatch_frame(targets, &frame);
+    disconnect_failed_targets(&state, &result).await;
 
-    for tx in targets {
-        match tx.try_send(Arc::clone(&frame)) {
-            Ok(()) => {
-                sent_count += 1;
-            }
-            Err(TrySendError::Full(_)) => {
-                full_count += 1;
-            }
-            Err(TrySendError::Closed(_)) => {
-                closed_count += 1;
-            }
-        }
-    }
-
-    if sent_count == 0 {
+    if result.sent_count == 0 {
+        let full_count = result.full_peer_ids.len();
+        let closed_count = result.closed_peer_ids.len();
         let peer_count = full_count + closed_count;
         if full_count == peer_count {
             return Err(
@@ -83,6 +125,9 @@ pub(crate) async fn broadcast_transaction_to_network(
             "Failed to broadcast transaction: no peer accepted the transaction".to_string(),
         );
     }
+
+    let mut locked = state.lock().await;
+    let _ = locked.mark_seen(digest);
 
     Ok(())
 }
@@ -191,6 +236,7 @@ async fn establish_connection(
     config: Arc<Config>,
 ) {
     let (tx, rx) = mpsc::channel::<Arc<[u8]>>(OUTBOUND_QUEUE_CAPACITY);
+    let (disconnect_tx, disconnect_rx) = watch::channel(false);
     let (peer_id, handshake_payload, incoming_count, outgoing_count, latest_tick) = {
         let mut locked = state.lock().await;
 
@@ -201,8 +247,13 @@ async fn establish_connection(
             return;
         }
 
-        let Some(peer_id) = locked.register_session(remote, outbound, tx.clone(), config.peer_port)
-        else {
+        let Some(peer_id) = locked.register_session(
+            remote,
+            outbound,
+            tx.clone(),
+            disconnect_tx,
+            config.peer_port,
+        ) else {
             locked.clear_pending_dial(remote);
             locked.clear_pending_dial(SocketAddrV4::new(*remote.ip(), config.peer_port));
             return;
@@ -232,29 +283,36 @@ async fn establish_connection(
 
     tokio::spawn(connection_worker(
         stream,
-        peer_id,
-        remote,
         rx,
-        state,
-        latest_epoch_tick,
-        config,
+        disconnect_rx,
+        ConnectionContext {
+            peer_id,
+            remote,
+            state,
+            latest_epoch_tick,
+            config,
+        },
     ));
 }
 
 async fn connection_worker(
     stream: TcpStream,
-    peer_id: u64,
-    remote: SocketAddrV4,
     mut rx: mpsc::Receiver<Arc<[u8]>>,
-    state: Arc<Mutex<NodeState>>,
-    latest_epoch_tick: Arc<AtomicU64>,
-    config: Arc<Config>,
+    mut disconnect_rx: watch::Receiver<bool>,
+    context: ConnectionContext,
 ) {
-    let (mut reader, mut writer) = stream.into_split();
+    let ConnectionContext {
+        peer_id,
+        remote,
+        state,
+        latest_epoch_tick,
+        config,
+    } = context;
+    let (reader, mut writer) = stream.into_split();
     let traffic_log = config.traffic_log;
     let writer_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
 
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if traffic_log {
                 let (size, message_type, dejavu) = frame_meta(&frame);
@@ -269,13 +327,63 @@ async fn connection_worker(
                     format_epoch_tick_packed(packed)
                 );
             }
-            if writer.write_all(&frame).await.is_err() {
-                break;
+            if let Err(err) = writer.write_all(&frame).await {
+                eprintln!("Write failed to {remote}: {err}");
+                return;
             }
         }
         let _ = writer.shutdown().await;
     });
 
+    let read_future = read_peer_frames(
+        reader,
+        peer_id,
+        remote,
+        Arc::clone(&state),
+        latest_epoch_tick,
+        config,
+    );
+    tokio::pin!(read_future);
+
+    let writer_finished = tokio::select! {
+        result = &mut writer_task => {
+            if let Err(err) = result {
+                eprintln!("Writer task failed for {remote}: {err}");
+            }
+            true
+        }
+        _ = &mut read_future => false,
+        _ = disconnect_rx.changed() => false,
+    };
+
+    if !writer_finished {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
+
+    let (in_count, out_count, latest_tick) = {
+        let mut locked = state.lock().await;
+        let _ = locked.unregister_session(peer_id);
+        (
+            locked.incoming_count(),
+            locked.outgoing_count(),
+            locked.latest_tick(),
+        )
+    };
+    println!(
+        "Disconnected {remote} | in={in_count} out={out_count} | {}",
+        format_epoch_tick(latest_tick)
+    );
+}
+
+async fn read_peer_frames(
+    mut reader: OwnedReadHalf,
+    peer_id: u64,
+    remote: SocketAddrV4,
+    state: Arc<Mutex<NodeState>>,
+    latest_epoch_tick: Arc<AtomicU64>,
+    config: Arc<Config>,
+) {
     let mut read_buffer = vec![0u8; READ_BUFFER_SIZE];
     let mut accumulated = Vec::<u8>::with_capacity(ACCUMULATED_INITIAL_CAPACITY);
 
@@ -348,23 +456,6 @@ async fn connection_worker(
             }
         }
     }
-
-    writer_task.abort();
-    let _ = writer_task.await;
-
-    let (in_count, out_count, latest_tick) = {
-        let mut locked = state.lock().await;
-        let _ = locked.unregister_session(peer_id);
-        (
-            locked.incoming_count(),
-            locked.outgoing_count(),
-            locked.latest_tick(),
-        )
-    };
-    println!(
-        "Disconnected {remote} | in={in_count} out={out_count} | {}",
-        format_epoch_tick(latest_tick)
-    );
 }
 
 async fn process_incoming_frame(
@@ -422,43 +513,33 @@ async fn process_incoming_frame(
         (locked.collect_targets(source_peer_id), locked.latest_tick())
     };
 
+    let frame = Arc::<[u8]>::from(frame);
+    let result = dispatch_frame(targets, &frame);
+    disconnect_failed_targets(&state, &result).await;
+
     if config.traffic_log {
         let (size, message_type, dejavu) = frame_meta(&frame);
         println!(
             "RELAY peer_id={} -> {} peers | size={} type={}({}) dejavu={} | {}",
             source_peer_id,
-            targets.len(),
+            result.sent_count,
             size,
             message_type_name(message_type),
             message_type,
             dejavu,
             format_epoch_tick(latest_tick)
         );
-    }
-
-    let frame = Arc::<[u8]>::from(frame);
-    let mut dropped_due_to_full = 0usize;
-    for tx in targets {
-        match tx.try_send(Arc::clone(&frame)) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                dropped_due_to_full += 1;
-            }
-            Err(TrySendError::Closed(_)) => {}
+        if !result.full_peer_ids.is_empty() {
+            println!(
+                "DROP_BACKPRESSURE peer_id={} dropped={} size={} type={}({}) dejavu={}",
+                source_peer_id,
+                result.full_peer_ids.len(),
+                size,
+                message_type_name(message_type),
+                message_type,
+                dejavu
+            );
         }
-    }
-
-    if config.traffic_log && dropped_due_to_full > 0 {
-        let (size, message_type, dejavu) = frame_meta(&frame);
-        println!(
-            "DROP_BACKPRESSURE peer_id={} dropped={} size={} type={}({}) dejavu={}",
-            source_peer_id,
-            dropped_due_to_full,
-            size,
-            message_type_name(message_type),
-            message_type,
-            dejavu
-        );
     }
 }
 

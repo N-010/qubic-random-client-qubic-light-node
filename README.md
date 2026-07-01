@@ -85,7 +85,9 @@ Important notes:
 
 - right after start, `GetStatus` can return no local tick data yet; this is normal until the node receives network frames
 - the process can still start even if DNS bootstrap fails; in that case you can wait for incoming peers or pass `--peer` manually
-- by default, relay fanout is limited to frames with `dejavu == 0`; use `--relay-all` to also relay frames with non-zero `dejavu`
+- by default, relay is limited to frames with `dejavu == 0`; use `--relay-all` to also relay frames with non-zero `dejavu`
+- each relayed frame is queued to at most six randomly selected peers, matching the Qubic Core dissemination multiplier
+- a peer is disconnected when its bounded outbound queue is full, allowing the reconnect loop to replace a slow session
 
 ## CLI Options
 
@@ -184,7 +186,7 @@ The gRPC server also enables reflection, so tools like `grpcurl` can inspect the
 - Balance or tick transaction requests fail:
   the node may not have enough working peers yet, or the peer-backed API query timed out. Wait a bit, add manual peers, or increase `--api-timeout-ms`.
 - Broadcasting a transaction fails:
-  there may be no connected peers, or all peer outbound queues may currently be full or closed.
+  there may be no connected peers, or every available peer queue may currently be full or closed. Full peer queues are disconnected automatically, so an outbound replacement can be established before the client retries.
 - You want less console noise:
   do not use `--traffic-log`.
 - You want the API reachable from another machine:
@@ -196,4 +198,6 @@ The gRPC server also enables reflection, so tools like `grpcurl` can inspect the
 - The peer listener is IPv4-based.
 - The node exchanges peer lists through the Qubic handshake and keeps a bounded in-memory peer cache.
 - Duplicate frames are filtered in memory with a rolling deduplication window.
+- Locally submitted transactions enter the deduplication window only after at least one peer accepts the frame, so a failed submission can be retried.
+- Relay and locally submitted transactions share the same FIFO peer queues; neither traffic class has priority.
 - Peer-backed API requests race several peers in parallel and return the first successful answer.
