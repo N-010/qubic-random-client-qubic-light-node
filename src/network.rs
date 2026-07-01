@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::frame::{
-    BROADCAST_TRANSACTION_TYPE, EXCHANGE_PUBLIC_PEERS_TYPE, HEADER_SIZE, MAX_FRAME_SIZE,
+    BROADCAST_TRANSACTION_TYPE, EXCHANGE_PUBLIC_PEERS_TYPE, HEADER_SIZE, MAX_FRAME_SIZE, NUMBER_OF_TRANSACTIONS_PER_TICK,
     build_exchange_public_peers_frame, build_request_frame, decode_frame_size, frame_meta,
     message_type_name, parse_exchange_public_peers, parse_tick_status_from_frame,
 };
@@ -16,7 +16,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::sleep;
 
-const OUTBOUND_QUEUE_CAPACITY: usize = 1_024;
+const OUTBOUND_QUEUE_CAPACITY: usize = NUMBER_OF_TRANSACTIONS_PER_TICK * 2;
 const READ_BUFFER_SIZE: usize = 128 * 1024;
 const ACCUMULATED_INITIAL_CAPACITY: usize = 256 * 1024;
 const ACCUMULATED_RETAIN_CAPACITY: usize = 512 * 1024;
