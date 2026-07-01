@@ -4,13 +4,20 @@ use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
+
+#[derive(Clone, Debug)]
+pub(crate) struct RelayTarget {
+    pub(crate) peer_id: u64,
+    pub(crate) tx: mpsc::Sender<Arc<[u8]>>,
+}
 
 #[derive(Clone, Debug)]
 struct Session {
     remote: SocketAddrV4,
     outbound: bool,
     tx: mpsc::Sender<Arc<[u8]>>,
+    disconnect_tx: watch::Sender<bool>,
 }
 
 #[derive(Debug)]
@@ -70,6 +77,7 @@ impl NodeState {
         remote: SocketAddrV4,
         outbound: bool,
         tx: mpsc::Sender<Arc<[u8]>>,
+        disconnect_tx: watch::Sender<bool>,
         peer_port: u16,
     ) -> Option<u64> {
         let remote_ip = *remote.ip();
@@ -86,6 +94,7 @@ impl NodeState {
                 remote,
                 outbound,
                 tx,
+                disconnect_tx,
             },
         );
         *self.connected_ip_refcount.entry(remote_ip).or_insert(0) += 1;
@@ -113,6 +122,17 @@ impl NodeState {
         Some(session.remote)
     }
 
+    pub(crate) fn disconnect_session(&mut self, peer_id: u64) -> Option<SocketAddrV4> {
+        let disconnect_tx = self.sessions.get(&peer_id)?.disconnect_tx.clone();
+        let remote = self.unregister_session(peer_id)?;
+        let _ = disconnect_tx.send(true);
+        Some(remote)
+    }
+
+    pub(crate) fn is_seen(&self, digest: &[u8; 32]) -> bool {
+        self.seen_set.contains(digest)
+    }
+
     pub(crate) fn mark_seen(&mut self, digest: [u8; 32]) -> bool {
         if self.seen_set.contains(&digest) {
             return false;
@@ -128,24 +148,36 @@ impl NodeState {
         true
     }
 
-    pub(crate) fn collect_targets(&self, source_peer_id: u64) -> Vec<mpsc::Sender<Arc<[u8]>>> {
-        self.sessions
+    pub(crate) fn collect_targets(&self, source_peer_id: u64) -> Vec<RelayTarget> {
+        let mut targets = self
+            .sessions
             .iter()
             .filter_map(|(peer_id, session)| {
                 if *peer_id == source_peer_id {
                     None
                 } else {
-                    Some(session.tx.clone())
+                    Some(RelayTarget {
+                        peer_id: *peer_id,
+                        tx: session.tx.clone(),
+                    })
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        targets.shuffle(&mut rand::rng());
+        targets
     }
 
-    pub(crate) fn collect_all_targets(&self) -> Vec<mpsc::Sender<Arc<[u8]>>> {
-        self.sessions
-            .values()
-            .map(|session| session.tx.clone())
-            .collect()
+    pub(crate) fn collect_all_targets(&self) -> Vec<RelayTarget> {
+        let mut targets = self
+            .sessions
+            .iter()
+            .map(|(peer_id, session)| RelayTarget {
+                peer_id: *peer_id,
+                tx: session.tx.clone(),
+            })
+            .collect::<Vec<_>>();
+        targets.shuffle(&mut rand::rng());
+        targets
     }
 
     pub(crate) fn add_discovered_peer(&mut self, peer: SocketAddrV4) -> bool {
@@ -260,5 +292,39 @@ impl NodeState {
         }
 
         peers.into_iter().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DEFAULT_PORT;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn relay_targets_exclude_source_peer() {
+        let mut state = NodeState::new(1_000, 1_000, &[]);
+        let mut peer_ids = Vec::new();
+
+        for last_octet in 1..=3 {
+            let (tx, _rx) = mpsc::channel(1);
+            let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+            let remote = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, last_octet), DEFAULT_PORT);
+            let peer_id = state
+                .register_session(remote, true, tx, disconnect_tx, DEFAULT_PORT)
+                .expect("test peer should be registered");
+            peer_ids.push(peer_id);
+        }
+
+        let source_peer_id = peer_ids[1];
+        let mut target_peer_ids = state
+            .collect_targets(source_peer_id)
+            .into_iter()
+            .map(|target| target.peer_id)
+            .collect::<Vec<_>>();
+        target_peer_ids.sort_unstable();
+        peer_ids.remove(1);
+
+        assert_eq!(target_peer_ids, peer_ids);
     }
 }

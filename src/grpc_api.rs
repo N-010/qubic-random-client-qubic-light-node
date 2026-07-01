@@ -209,8 +209,7 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
-    use tokio::sync::Mutex;
-    use tokio::sync::mpsc;
+    use tokio::sync::{Mutex, mpsc, watch};
 
     fn test_config() -> Arc<Config> {
         Arc::new(Config {
@@ -250,7 +249,9 @@ mod tests {
         {
             let mut locked = node_state.lock().await;
             let peer = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DEFAULT_PORT);
-            let registered = locked.register_session(peer, true, peer_tx, DEFAULT_PORT);
+            let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+            let registered =
+                locked.register_session(peer, true, peer_tx, disconnect_tx, DEFAULT_PORT);
             assert_eq!(registered.is_some(), true);
         }
 
@@ -324,5 +325,119 @@ mod tests {
                 error: "No connected peers available for broadcast".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn broadcast_transaction_sends_to_at_most_six_peers() {
+        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
+        let mut peer_receivers = Vec::new();
+        {
+            let mut locked = node_state.lock().await;
+            for last_octet in 1..=8 {
+                let (peer_tx, peer_rx) = mpsc::channel::<Arc<[u8]>>(1);
+                let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+                let peer = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, last_octet), DEFAULT_PORT);
+                let registered =
+                    locked.register_session(peer, true, peer_tx, disconnect_tx, DEFAULT_PORT);
+                assert_eq!(registered.is_some(), true);
+                peer_receivers.push(peer_rx);
+            }
+        }
+
+        let service = test_service(node_state);
+        let request = Request::new(lightnodepb::BroadcastTransactionRequest {
+            tx_bytes: vec![4, 5, 6],
+        });
+        let response = LightNode::broadcast_transaction(&service, request)
+            .await
+            .expect("broadcast_transaction should return grpc response")
+            .into_inner();
+
+        assert_eq!(response.ok, true);
+        let received_count = peer_receivers
+            .iter_mut()
+            .map(|peer_rx| peer_rx.try_recv().is_ok())
+            .filter(|received| *received)
+            .count();
+        assert_eq!(received_count, 6);
+    }
+
+    #[tokio::test]
+    async fn failed_broadcast_can_be_retried_after_full_peer_is_disconnected() {
+        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
+        let (full_peer_tx, _full_peer_rx) = mpsc::channel::<Arc<[u8]>>(1);
+        full_peer_tx
+            .try_send(Arc::<[u8]>::from([0]))
+            .expect("test peer queue should accept its first frame");
+        let (disconnect_tx, mut disconnect_rx) = watch::channel(false);
+        {
+            let mut locked = node_state.lock().await;
+            let peer = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DEFAULT_PORT);
+            let registered =
+                locked.register_session(peer, true, full_peer_tx, disconnect_tx, DEFAULT_PORT);
+            assert_eq!(registered.is_some(), true);
+        }
+
+        let service = test_service(Arc::clone(&node_state));
+        let tx_bytes = vec![7, 7, 7];
+        let first_response = LightNode::broadcast_transaction(
+            &service,
+            Request::new(lightnodepb::BroadcastTransactionRequest {
+                tx_bytes: tx_bytes.clone(),
+            }),
+        )
+        .await
+        .expect("broadcast_transaction should return grpc response")
+        .into_inner();
+
+        assert_eq!(
+            first_response,
+            lightnodepb::BroadcastTransactionResponse {
+                ok: false,
+                tx_id: String::new(),
+                error: "Failed to broadcast transaction: all peer outbound queues are full"
+                    .to_string(),
+            }
+        );
+        disconnect_rx
+            .changed()
+            .await
+            .expect("full peer should receive a disconnect signal");
+        assert_eq!(*disconnect_rx.borrow(), true);
+        assert_eq!(node_state.lock().await.outgoing_count(), 0);
+
+        let (replacement_tx, mut replacement_rx) = mpsc::channel::<Arc<[u8]>>(1);
+        let (replacement_disconnect_tx, _replacement_disconnect_rx) = watch::channel(false);
+        {
+            let mut locked = node_state.lock().await;
+            let peer = SocketAddrV4::new(Ipv4Addr::new(2, 2, 2, 2), DEFAULT_PORT);
+            let registered = locked.register_session(
+                peer,
+                true,
+                replacement_tx,
+                replacement_disconnect_tx,
+                DEFAULT_PORT,
+            );
+            assert_eq!(registered.is_some(), true);
+        }
+
+        let retry_response = LightNode::broadcast_transaction(
+            &service,
+            Request::new(lightnodepb::BroadcastTransactionRequest {
+                tx_bytes: tx_bytes.clone(),
+            }),
+        )
+        .await
+        .expect("broadcast_transaction retry should return grpc response")
+        .into_inner();
+
+        assert_eq!(retry_response.ok, true);
+        let retried_frame = replacement_rx
+            .recv()
+            .await
+            .expect("replacement peer should receive the retried transaction");
+        let expected_frame = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &tx_bytes)
+            .expect("broadcast frame should be buildable");
+        assert_eq!(&*retried_frame, expected_frame.as_slice());
     }
 }
