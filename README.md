@@ -2,6 +2,8 @@
 
 `QubicLightNode` is a small Qubic relay node with a local `gRPC` API.
 
+The wire protocol is compatible with current Qubic Core builds configured for 4096 transactions per tick.
+
 It currently does four things:
 
 - connects to the public Qubic network over TCP

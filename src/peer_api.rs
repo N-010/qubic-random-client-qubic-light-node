@@ -2,9 +2,9 @@ use crate::codec::{bytes_to_hex, read_i32, read_i64, read_u16, read_u32};
 use crate::config::Config;
 use crate::frame::{
     BROADCAST_TRANSACTION_TYPE, END_RESPONSE_TYPE, HEADER_SIZE, MAX_FRAME_SIZE,
-    REQUEST_ENTITY_TYPE, REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE, REQUEST_TICK_TRANSACTIONS_TYPE,
-    RESPOND_ENTITY_TYPE, build_exchange_public_peers_frame, build_request_frame, decode_frame_size,
-    frame_dejavu, frame_payload, random_non_zero_u32,
+    REQUEST_ENTITY_TYPE, RESPOND_ENTITY_TYPE, build_exchange_public_peers_frame,
+    build_request_frame, build_request_tick_transactions_frame, decode_frame_size, frame_dejavu,
+    frame_payload, random_non_zero_u32,
 };
 use crate::state::NodeState;
 use crate::types::{BalanceResponse, TickTransaction};
@@ -205,10 +205,7 @@ async fn query_tick_transactions_from_peer(
     send_handshake_frame(&mut stream, timeout_duration).await?;
 
     let dejavu = random_non_zero_u32();
-    let mut payload = vec![0u8; REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE];
-    payload[0..4].copy_from_slice(&tick.to_le_bytes());
-
-    let request = build_request_frame(REQUEST_TICK_TRANSACTIONS_TYPE, dejavu, &payload)?;
+    let request = build_request_tick_transactions_frame(dejavu, tick)?;
     write_frame(&mut stream, &request, timeout_duration).await?;
 
     let deadline = Instant::now() + timeout_duration;

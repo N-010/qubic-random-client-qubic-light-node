@@ -18,7 +18,8 @@ pub(crate) const REQUEST_ENTITY_TYPE: u8 = 31;
 pub(crate) const RESPOND_ENTITY_TYPE: u8 = 32;
 pub(crate) const END_RESPONSE_TYPE: u8 = 35;
 
-pub(crate) const REQUEST_TICK_TRANSACTION_FLAGS_SIZE: usize = 1024 / 8;
+pub(crate) const NUMBER_OF_TRANSACTIONS_PER_TICK: usize = 4096;
+pub(crate) const REQUEST_TICK_TRANSACTION_FLAGS_SIZE: usize = NUMBER_OF_TRANSACTIONS_PER_TICK / 8;
 pub(crate) const REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE: usize =
     4 + REQUEST_TICK_TRANSACTION_FLAGS_SIZE;
 pub(crate) const RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE: usize = 16;
@@ -76,12 +77,14 @@ pub(crate) fn message_type_name(message_type: u8) -> &'static str {
         57 => "RESPOND_PRUNING_LOG",
         58 => "REQUEST_LOG_STATE_DIGEST",
         59 => "RESPOND_LOG_STATE_DIGEST",
-        60 => "REQUEST_CUSTOM_MINING_DATA",
-        61 => "RESPOND_CUSTOM_MINING_DATA",
-        62 => "REQUEST_CUSTOM_MINING_SOLUTION_VERIFICATION",
-        63 => "RESPOND_CUSTOM_MINING_SOLUTION_VERIFICATION",
         64 => "REQUEST_ACTIVE_IPOS",
         65 => "RESPOND_ACTIVE_IPO",
+        66 => "REQUEST_ORACLE_DATA",
+        67 => "RESPOND_ORACLE_DATA",
+        68 => "BROADCAST_CUSTOM_MINING_TASK",
+        69 => "BROADCAST_CUSTOM_MINING_SOLUTION",
+        190 => "ORACLE_MACHINE_QUERY",
+        191 => "ORACLE_MACHINE_REPLY",
         201 => "REQUEST_TX_STATUS",
         202 => "RESPOND_TX_STATUS",
         255 => "SPECIAL_COMMAND",
@@ -143,6 +146,15 @@ pub(crate) fn build_request_frame(
     frame.extend_from_slice(&dejavu.to_le_bytes());
     frame.extend_from_slice(payload);
     Ok(frame)
+}
+
+pub(crate) fn build_request_tick_transactions_frame(
+    dejavu: u32,
+    tick: u32,
+) -> Result<Vec<u8>, String> {
+    let mut payload = [0u8; REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE];
+    payload[..4].copy_from_slice(&tick.to_le_bytes());
+    build_request_frame(REQUEST_TICK_TRANSACTIONS_TYPE, dejavu, &payload)
 }
 
 pub(crate) fn frame_payload(frame: &[u8]) -> Result<&[u8], String> {
@@ -236,4 +248,58 @@ fn parse_current_tick_info_payload(payload: &[u8]) -> Result<TickStatus, String>
             .ok_or_else(|| "misaligned votes missing".to_string())?,
         initial_tick: read_u32(payload, 12).ok_or_else(|| "initial tick missing".to_string())?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn builds_request_tick_transactions_frame_for_current_core_layout() {
+        let dejavu = 0x90AB_CDEF;
+        let tick = 0x1234_5678;
+
+        let frame = build_request_tick_transactions_frame(dejavu, tick).unwrap();
+        let mut expected = vec![0u8; 524];
+        expected[..3].copy_from_slice(&[0x0C, 0x02, 0x00]);
+        expected[3] = REQUEST_TICK_TRANSACTIONS_TYPE;
+        expected[4..8].copy_from_slice(&dejavu.to_le_bytes());
+        expected[8..12].copy_from_slice(&tick.to_le_bytes());
+
+        assert_eq!(REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE, 516);
+        assert_eq!(frame, expected);
+    }
+
+    #[test]
+    fn maps_current_core_message_types() {
+        let actual = [
+            message_type_name(60),
+            message_type_name(61),
+            message_type_name(62),
+            message_type_name(63),
+            message_type_name(66),
+            message_type_name(67),
+            message_type_name(68),
+            message_type_name(69),
+            message_type_name(190),
+            message_type_name(191),
+        ];
+
+        assert_eq!(
+            actual,
+            [
+                "UNKNOWN",
+                "UNKNOWN",
+                "UNKNOWN",
+                "UNKNOWN",
+                "REQUEST_ORACLE_DATA",
+                "RESPOND_ORACLE_DATA",
+                "BROADCAST_CUSTOM_MINING_TASK",
+                "BROADCAST_CUSTOM_MINING_SOLUTION",
+                "ORACLE_MACHINE_QUERY",
+                "ORACLE_MACHINE_REPLY",
+            ]
+        );
+    }
 }
