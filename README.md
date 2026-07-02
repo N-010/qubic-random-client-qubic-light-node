@@ -88,6 +88,10 @@ Important notes:
 - by default, relay is limited to frames with `dejavu == 0`; use `--relay-all` to also relay frames with non-zero `dejavu`
 - each relayed frame is queued to at most six randomly selected peers, matching the Qubic Core dissemination multiplier
 - a peer is disconnected when its bounded outbound queue is full, allowing the reconnect loop to replace a slow session
+- failed dial and peer-backed API attempts put that address into an exponential cooldown, starting at `--reconnect-ms` and capped at five minutes; a successful connection or API response clears its failure history
+- configured `--peer` addresses are retained even when the discovered-peer cache is full; active and pending connection addresses are protected from eviction as well
+- emergency DNS recovery is based only on the outbound connection count, so incoming connections cannot hide a depleted outbound pool
+- peer-pool changes are logged as `known`, `dialable`, `cooldown`, `pending`, `incoming`, `outgoing`, and `target` counts
 
 ## CLI Options
 
@@ -106,7 +110,7 @@ Important notes:
 - `--max-incoming <n>`
   Maximum number of incoming peer sessions. Default: `32`.
 - `--max-known-peers <n>`
-  Maximum number of discovered peers kept in memory. Default: `500`. Values below `1000` are currently clamped to `1000` internally.
+  Maximum number of discovered peers kept in memory. Default: `500`. Evictable addresses use LRU order; configured seeds, active peers, and pending dials are never evicted, so protected entries can temporarily keep the pool above the limit.
 - `--reconnect-ms <ms>`
   Delay between outbound reconnect attempts. Default: `2000`. Values below `200` are currently clamped to `200` internally.
 
@@ -129,6 +133,8 @@ Important notes:
   Timeout for the DNS bootstrap HTTP request. Default: `5000`. Values below `500` are currently clamped to `500` internally.
 
 Auto mode for `--dns-lite-peers` currently requests `max(target_outbound * 3, 8)`.
+
+Emergency DNS bootstrap runs when outbound connections fall below `--critical-peer-threshold`. The automatic threshold is half of `--target-outbound`, with a minimum of `1` whenever the target is positive. Empty responses and responses containing only already-known addresses count as failures and increase the DNS retry backoff. A successful refresh resets the backoff, while still enforcing the configured initial interval before another DNS request.
 
 ### API
 
@@ -181,6 +187,8 @@ The gRPC server also enables reflection, so tools like `grpcurl` can inspect the
   add one or more `--peer` values, or keep DNS bootstrap enabled.
 - DNS bootstrap fails:
   the node can still run, but it may not find peers until you add `--peer` values or receive inbound connections.
+- The pool reports many peers but makes no immediate dial attempts:
+  inspect the `Peer pool` log. `cooldown` addresses are temporarily suppressed after failures, while `dialable` shows addresses eligible for a new outbound attempt now.
 - `GetStatus` says there is no tick data yet:
   wait until the node receives traffic from the network.
 - Balance or tick transaction requests fail:

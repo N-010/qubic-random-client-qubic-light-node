@@ -172,14 +172,14 @@ struct Cli {
         long = "critical-peer-threshold",
         value_name = "N",
         default_value_t = 0,
-        help = "Trigger emergency DNS when total peers drop below this; 0 uses half of target-outbound",
+        help = "Trigger emergency DNS when outbound peers drop below this; 0 uses half of target-outbound (minimum 1)",
         help_heading = "Bootstrap"
     )]
     critical_peer_threshold: usize,
 
     #[arg(
         long = "no-emergency-dns",
-        help = "Disable emergency DNS bootstrap when peer count is critically low",
+        help = "Disable emergency DNS bootstrap when outbound peer count is critically low",
         help_heading = "Bootstrap"
     )]
     no_emergency_dns: bool,
@@ -268,8 +268,9 @@ impl Config {
             dns_timeout: Duration::from_millis(cli.dns_timeout_ms.max(MIN_DNS_TIMEOUT_MS)),
             traffic_log: cli.traffic_log,
             seed_peers,
-            critical_peer_threshold: if cli.critical_peer_threshold == 0 {
-                cli.target_outbound / 2
+            critical_peer_threshold: if cli.critical_peer_threshold == 0 && cli.target_outbound > 0
+            {
+                (cli.target_outbound / 2).max(1)
             } else {
                 cli.critical_peer_threshold
             },
@@ -386,6 +387,18 @@ mod tests {
         assert_eq!(config.api_timeout, Duration::from_millis(1_000));
         assert_eq!(config.reconnect_interval, Duration::from_millis(200));
         assert_eq!(config.dns_timeout, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn automatic_critical_threshold_is_one_for_positive_small_target() {
+        assert_eq!(
+            parse_config(&["--target-outbound", "1"]).critical_peer_threshold,
+            1
+        );
+        assert_eq!(
+            parse_config(&["--target-outbound", "0"]).critical_peer_threshold,
+            0
+        );
     }
 
     #[test]

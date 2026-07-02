@@ -4,7 +4,26 @@ use rand::seq::SliceRandom;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
+
+const MAX_PEER_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Copy, Debug)]
+struct PeerHealth {
+    consecutive_failures: u32,
+    retry_after: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeerPoolStats {
+    pub(crate) known: usize,
+    pub(crate) dialable: usize,
+    pub(crate) cooldown: usize,
+    pub(crate) pending: usize,
+    pub(crate) incoming: usize,
+    pub(crate) outgoing: usize,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RelayTarget {
@@ -26,6 +45,8 @@ pub(crate) struct NodeState {
     connected_ip_refcount: HashMap<Ipv4Addr, usize>,
     known_peers: HashSet<SocketAddrV4>,
     known_peers_order: VecDeque<SocketAddrV4>,
+    seed_peers: HashSet<SocketAddrV4>,
+    peer_health: HashMap<SocketAddrV4, PeerHealth>,
     pending_dials: HashSet<SocketAddrV4>,
     seen_order: VecDeque<[u8; 32]>,
     seen_set: HashSet<[u8; 32]>,
@@ -46,12 +67,14 @@ impl NodeState {
             connected_ip_refcount: HashMap::new(),
             known_peers: HashSet::new(),
             known_peers_order: VecDeque::new(),
+            seed_peers: seed_peers.iter().copied().collect(),
+            peer_health: HashMap::new(),
             pending_dials: HashSet::new(),
             seen_order: VecDeque::new(),
             seen_set: HashSet::new(),
             latest_tick: None,
             max_seen: max_seen.max(1_000),
-            max_known_peers: max_known_peers.max(1_000),
+            max_known_peers,
             next_peer_id: 1,
         };
         for peer in seed_peers {
@@ -66,10 +89,6 @@ impl NodeState {
 
     pub(crate) fn incoming_count(&self) -> usize {
         self.sessions.values().filter(|s| !s.outbound).count()
-    }
-
-    pub(crate) fn total_peer_count(&self) -> usize {
-        self.sessions.len()
     }
 
     fn is_ip_connected(&self, ip: Ipv4Addr) -> bool {
@@ -106,6 +125,8 @@ impl NodeState {
         self.pending_dials.remove(&remote);
         self.pending_dials
             .remove(&SocketAddrV4::new(remote_ip, peer_port));
+        self.record_peer_success(remote);
+        self.record_peer_success(SocketAddrV4::new(remote_ip, peer_port));
 
         Some(peer_id)
     }
@@ -189,19 +210,79 @@ impl NodeState {
             return false;
         }
         if !self.known_peers.insert(peer) {
+            self.touch_peer(peer);
             return false;
         }
         self.known_peers_order.push_back(peer);
-
-        while self.known_peers.len() > self.max_known_peers {
-            if let Some(oldest_peer) = self.known_peers_order.pop_front() {
-                self.known_peers.remove(&oldest_peer);
-            }
-        }
+        self.enforce_known_peer_limit();
         true
     }
 
-    pub(crate) fn choose_dial_targets(&mut self, needed: usize) -> Vec<SocketAddrV4> {
+    fn touch_peer(&mut self, peer: SocketAddrV4) {
+        self.known_peers_order
+            .retain(|candidate| *candidate != peer);
+        self.known_peers_order.push_back(peer);
+    }
+
+    fn is_protected_peer(&self, peer: SocketAddrV4) -> bool {
+        self.seed_peers.contains(&peer)
+            || self.pending_dials.contains(&peer)
+            || self.is_ip_connected(*peer.ip())
+    }
+
+    fn enforce_known_peer_limit(&mut self) {
+        while self.known_peers.len() > self.max_known_peers {
+            let Some(index) = self
+                .known_peers_order
+                .iter()
+                .position(|peer| !self.is_protected_peer(*peer))
+            else {
+                break;
+            };
+            let peer = self
+                .known_peers_order
+                .remove(index)
+                .expect("peer index should exist");
+            self.known_peers.remove(&peer);
+            self.peer_health.remove(&peer);
+        }
+    }
+
+    fn is_cooling_down(&self, peer: SocketAddrV4, now: Instant) -> bool {
+        self.peer_health
+            .get(&peer)
+            .is_some_and(|health| health.retry_after > now)
+    }
+
+    pub(crate) fn record_peer_failure(
+        &mut self,
+        peer: SocketAddrV4,
+        reconnect_interval: Duration,
+        now: Instant,
+    ) {
+        let health = self.peer_health.entry(peer).or_insert(PeerHealth {
+            consecutive_failures: 0,
+            retry_after: now,
+        });
+        health.consecutive_failures = health.consecutive_failures.saturating_add(1);
+        let exponent = health.consecutive_failures.saturating_sub(1).min(31);
+        let cooldown = reconnect_interval
+            .saturating_mul(2u32.saturating_pow(exponent))
+            .min(MAX_PEER_COOLDOWN);
+        health.retry_after = now + cooldown;
+        self.pending_dials.remove(&peer);
+        self.enforce_known_peer_limit();
+    }
+
+    pub(crate) fn record_peer_success(&mut self, peer: SocketAddrV4) {
+        self.peer_health.remove(&peer);
+    }
+
+    pub(crate) fn choose_dial_targets_at(
+        &mut self,
+        needed: usize,
+        now: Instant,
+    ) -> Vec<SocketAddrV4> {
         let mut candidates: Vec<SocketAddrV4> = self
             .known_peers
             .iter()
@@ -209,6 +290,7 @@ impl NodeState {
             .filter(|peer| {
                 !self.pending_dials.contains(peer)
                     && !self.is_ip_connected(*peer.ip())
+                    && !self.is_cooling_down(*peer, now)
                     && peer.ip().octets() != [0, 0, 0, 0]
             })
             .collect();
@@ -222,8 +304,13 @@ impl NodeState {
         candidates
     }
 
+    pub(crate) fn choose_dial_targets(&mut self, needed: usize) -> Vec<SocketAddrV4> {
+        self.choose_dial_targets_at(needed, Instant::now())
+    }
+
     pub(crate) fn clear_pending_dial(&mut self, peer: SocketAddrV4) {
         self.pending_dials.remove(&peer);
+        self.enforce_known_peer_limit();
     }
 
     pub(crate) fn choose_handshake_peers(
@@ -275,6 +362,7 @@ impl NodeState {
     }
 
     pub(crate) fn peer_candidates(&self, peer_port: u16) -> Vec<SocketAddrV4> {
+        let now = Instant::now();
         let mut peers = HashSet::<SocketAddrV4>::new();
 
         for session in self.sessions.values() {
@@ -292,10 +380,38 @@ impl NodeState {
             if is_bogon(peer.ip()) {
                 continue;
             }
-            peers.insert(*peer);
+            if !self.is_cooling_down(*peer, now) {
+                peers.insert(*peer);
+            }
         }
 
-        peers.into_iter().collect()
+        peers
+            .into_iter()
+            .filter(|peer| !self.is_cooling_down(*peer, now))
+            .collect()
+    }
+
+    pub(crate) fn pool_stats(&self, now: Instant) -> PeerPoolStats {
+        PeerPoolStats {
+            known: self.known_peers.len(),
+            dialable: self
+                .known_peers
+                .iter()
+                .filter(|peer| {
+                    !self.pending_dials.contains(peer)
+                        && !self.is_ip_connected(*peer.ip())
+                        && !self.is_cooling_down(**peer, now)
+                })
+                .count(),
+            cooldown: self
+                .known_peers
+                .iter()
+                .filter(|peer| self.is_cooling_down(**peer, now))
+                .count(),
+            pending: self.pending_dials.len(),
+            incoming: self.incoming_count(),
+            outgoing: self.outgoing_count(),
+        }
     }
 }
 
@@ -304,6 +420,10 @@ mod tests {
     use super::*;
     use crate::config::DEFAULT_PORT;
     use pretty_assertions::assert_eq;
+
+    fn peer(a: u8, b: u8, c: u8, d: u8) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), DEFAULT_PORT)
+    }
 
     #[test]
     fn relay_targets_exclude_source_peer() {
@@ -330,5 +450,80 @@ mod tests {
         peer_ids.remove(1);
 
         assert_eq!(target_peer_ids, peer_ids);
+    }
+
+    #[test]
+    fn failed_peer_is_unavailable_until_cooldown_expires() {
+        let target = peer(1, 1, 1, 1);
+        let mut state = NodeState::new(1_000, 10, &[target]);
+        let now = Instant::now();
+
+        state.record_peer_failure(target, Duration::from_secs(2), now);
+
+        assert_eq!(
+            state.choose_dial_targets_at(1, now + Duration::from_secs(1)),
+            vec![]
+        );
+        assert_eq!(
+            state.choose_dial_targets_at(1, now + Duration::from_secs(2)),
+            vec![target]
+        );
+    }
+
+    #[test]
+    fn peer_cooldown_grows_to_maximum_and_success_resets_it() {
+        let target = peer(1, 1, 1, 2);
+        let mut state = NodeState::new(1_000, 10, &[target]);
+        let now = Instant::now();
+
+        state.record_peer_failure(target, Duration::from_secs(200), now);
+        state.record_peer_failure(
+            target,
+            Duration::from_secs(200),
+            now + Duration::from_secs(200),
+        );
+        assert_eq!(state.pool_stats(now + Duration::from_secs(499)).dialable, 0);
+        assert_eq!(state.pool_stats(now + Duration::from_secs(500)).dialable, 1);
+
+        state.record_peer_failure(target, Duration::from_secs(2), now);
+        state.record_peer_success(target);
+        assert_eq!(state.pool_stats(now).dialable, 1);
+    }
+
+    #[test]
+    fn eviction_preserves_seed_active_and_pending_peers() {
+        let seed = peer(1, 1, 1, 3);
+        let active = peer(1, 1, 1, 4);
+        let pending = peer(1, 1, 1, 5);
+        let evictable = peer(1, 1, 1, 6);
+        let replacement = peer(1, 1, 1, 7);
+        let mut state = NodeState::new(1_000, 4, &[seed]);
+        let (tx, _rx) = mpsc::channel(1);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+        state.add_discovered_peer(active);
+        state
+            .register_session(active, true, tx, disconnect_tx, DEFAULT_PORT)
+            .expect("active peer should connect");
+        state.add_discovered_peer(pending);
+        state.pending_dials.insert(pending);
+        state.add_discovered_peer(evictable);
+
+        state.add_discovered_peer(replacement);
+
+        assert!(state.known_peers.contains(&seed));
+        assert!(state.known_peers.contains(&active));
+        assert!(state.known_peers.contains(&pending));
+        assert!(!state.known_peers.contains(&evictable));
+        assert!(state.known_peers.contains(&replacement));
+    }
+
+    #[test]
+    fn configured_known_peer_limit_is_enforced() {
+        let mut state = NodeState::new(1_000, 500, &[]);
+        for index in 0..600u16 {
+            state.add_discovered_peer(peer(11, (index / 256) as u8, (index % 256) as u8, 1));
+        }
+
+        assert_eq!(state.known_peers.len(), 500);
     }
 }
