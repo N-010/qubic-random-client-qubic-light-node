@@ -16,6 +16,8 @@ const DEFAULT_MAX_SEEN: usize = 65_536;
 const DEFAULT_MAX_KNOWN_PEERS: usize = 500;
 const DEFAULT_RECONNECT_MS: u64 = 2_000;
 const DEFAULT_DNS_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_EMERGENCY_DNS_BACKOFF_INITIAL_MS: u64 = 10_000;  // 10с
+const DEFAULT_EMERGENCY_DNS_BACKOFF_MAX_MS: u64 = 300_000;     // 5мин
 const MIN_API_TIMEOUT_MS: u64 = 1_000;
 const MIN_RECONNECT_MS: u64 = 200;
 const MIN_DNS_TIMEOUT_MS: u64 = 500;
@@ -38,6 +40,10 @@ pub(crate) struct Config {
     pub(crate) dns_timeout: Duration,
     pub(crate) traffic_log: bool,
     pub(crate) seed_peers: Vec<SocketAddrV4>,
+    pub(crate) critical_peer_threshold: usize,
+    pub(crate) emergency_dns_bootstrap: bool,
+    pub(crate) emergency_dns_backoff_initial_ms: u64,
+    pub(crate) emergency_dns_backoff_max_ms: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -163,6 +169,40 @@ struct Cli {
     dns_timeout_ms: u64,
 
     #[arg(
+        long = "critical-peer-threshold",
+        value_name = "N",
+        default_value_t = 0,
+        help = "Trigger emergency DNS when total peers drop below this; 0 uses half of target-outbound",
+        help_heading = "Bootstrap"
+    )]
+    critical_peer_threshold: usize,
+
+    #[arg(
+        long = "no-emergency-dns",
+        help = "Disable emergency DNS bootstrap when peer count is critically low",
+        help_heading = "Bootstrap"
+    )]
+    no_emergency_dns: bool,
+
+    #[arg(
+        long = "emergency-dns-backoff-initial-ms",
+        value_name = "MS",
+        default_value_t = DEFAULT_EMERGENCY_DNS_BACKOFF_INITIAL_MS,
+        help = "Initial backoff for emergency DNS retries in milliseconds",
+        help_heading = "Bootstrap"
+    )]
+    emergency_dns_backoff_initial_ms: u64,
+
+    #[arg(
+        long = "emergency-dns-backoff-max-ms",
+        value_name = "MS",
+        default_value_t = DEFAULT_EMERGENCY_DNS_BACKOFF_MAX_MS,
+        help = "Maximum backoff for emergency DNS retries in milliseconds",
+        help_heading = "Bootstrap"
+    )]
+    emergency_dns_backoff_max_ms: u64,
+
+    #[arg(
         long = "api-timeout-ms",
         value_name = "MS",
         default_value_t = DEFAULT_API_TIMEOUT_MS,
@@ -228,6 +268,16 @@ impl Config {
             dns_timeout: Duration::from_millis(cli.dns_timeout_ms.max(MIN_DNS_TIMEOUT_MS)),
             traffic_log: cli.traffic_log,
             seed_peers,
+            critical_peer_threshold: if cli.critical_peer_threshold == 0 {
+                cli.target_outbound / 2
+            } else {
+                cli.critical_peer_threshold
+            },
+            emergency_dns_bootstrap: !cli.no_emergency_dns,
+            emergency_dns_backoff_initial_ms: cli.emergency_dns_backoff_initial_ms
+                .max(MIN_DNS_TIMEOUT_MS),
+            emergency_dns_backoff_max_ms: cli.emergency_dns_backoff_max_ms
+                .max(cli.emergency_dns_backoff_initial_ms),
         })
     }
 }
@@ -296,6 +346,10 @@ mod tests {
                 dns_timeout: Duration::from_millis(5_000),
                 traffic_log: false,
                 seed_peers: Vec::new(),
+                critical_peer_threshold: 4,
+                emergency_dns_bootstrap: true,
+                emergency_dns_backoff_initial_ms: 10_000,
+                emergency_dns_backoff_max_ms: 300_000,
             }
         );
     }

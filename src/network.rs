@@ -17,6 +17,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::sleep;
+use socket2;
 
 const OUTBOUND_QUEUE_CAPACITY: usize = NUMBER_OF_TRANSACTIONS_PER_TICK * 2;
 const DISSEMINATION_MULTIPLIER: usize = 6;
@@ -25,6 +26,42 @@ const ACCUMULATED_INITIAL_CAPACITY: usize = 256 * 1024;
 const ACCUMULATED_RETAIN_CAPACITY: usize = 512 * 1024;
 const ACCUMULATED_SHRINK_THRESHOLD: usize = 2 * 1024 * 1024;
 const MAX_ACCUMULATED_BUFFER: usize = MAX_FRAME_SIZE * 2;
+
+#[cfg(unix)]
+fn configure_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))      // Начать проверку через 60с простоя
+        .with_interval(Duration::from_secs(10))   // Проверять каждые 10с
+        .with_retries(3);                         // 3 неудачи = мёртвое соединение
+    sock_ref.set_tcp_keepalive(&keepalive)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn configure_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(60))
+        .with_interval(Duration::from_secs(10));
+    sock_ref.set_tcp_keepalive(&keepalive)?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_tcp_keepalive(_stream: &TcpStream) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn calculate_backoff(attempt: u32, initial_ms: u64, max_ms: u64) -> Duration {
+    if attempt == 0 {
+        return Duration::from_millis(0);
+    }
+    let backoff_ms = initial_ms
+        .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)))
+        .min(max_ms);
+    Duration::from_millis(backoff_ms)
+}
 
 #[derive(Debug, Default)]
 struct DispatchResult {
@@ -151,6 +188,9 @@ pub(crate) async fn accept_loop(
                 if let Err(err) = stream.set_nodelay(true) {
                     eprintln!("Failed to set TCP_NODELAY for {remote_v4}: {err}");
                 }
+                if let Err(err) = configure_tcp_keepalive(&stream) {
+                    eprintln!("Failed to set TCP keepalive for {remote_v4}: {err}");
+                }
 
                 let connection_state = Arc::clone(&state);
                 let connection_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
@@ -180,7 +220,88 @@ pub(crate) async fn dial_loop(
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
+    let mut emergency_dns_attempt = 0u32;
+    let mut last_emergency_dns = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(3600))
+        .unwrap_or_else(std::time::Instant::now);
+
     loop {
+        // Проверить здоровье пиров и запустить аварийный DNS при необходимости
+        let total_peers = {
+            let locked = state.lock().await;
+            locked.total_peer_count()
+        };
+
+        // Логика аварийного DNS bootstrap
+        if config.emergency_dns_bootstrap
+            && config.dns_bootstrap
+            && total_peers < config.critical_peer_threshold
+        {
+            let backoff_duration = calculate_backoff(
+                emergency_dns_attempt,
+                config.emergency_dns_backoff_initial_ms,
+                config.emergency_dns_backoff_max_ms,
+            );
+
+            if last_emergency_dns.elapsed() >= backoff_duration {
+                eprintln!(
+                    "CRITICAL: Only {total_peers} peers connected (threshold: {}). Attempting emergency DNS bootstrap...",
+                    config.critical_peer_threshold
+                );
+
+                let dns_lite_peers = if config.dns_lite_peers == 0 {
+                    (config.target_outbound * 3).max(8)
+                } else {
+                    config.dns_lite_peers
+                };
+
+                match crate::dns::fetch_seed_peers_from_dns(
+                    config.peer_port,
+                    dns_lite_peers,
+                    config.dns_timeout
+                ).await {
+                    Ok(mut peers) => {
+                        if peers.is_empty() {
+                            eprintln!("Emergency DNS bootstrap returned no peers.");
+                            emergency_dns_attempt += 1;
+                        } else {
+                            peers.sort_unstable();
+                            peers.dedup();
+
+                            let mut locked = state.lock().await;
+                            let mut added_count = 0;
+                            for peer in peers {
+                                if locked.add_discovered_peer(peer) {
+                                    added_count += 1;
+                                }
+                            }
+
+                            println!(
+                                "Emergency DNS bootstrap: discovered {} new peers.",
+                                added_count
+                            );
+
+                            // Сбросить backoff при успехе
+                            emergency_dns_attempt = 0;
+                        }
+                        last_emergency_dns = std::time::Instant::now();
+                    }
+                    Err(err) => {
+                        eprintln!("Emergency DNS bootstrap failed: {err}");
+                        emergency_dns_attempt += 1;
+                        last_emergency_dns = std::time::Instant::now();
+                    }
+                }
+            }
+        } else if total_peers >= config.critical_peer_threshold {
+            // Сбросить состояние аварии когда восстановились
+            if emergency_dns_attempt > 0 {
+                println!("Peer count recovered to {total_peers}. Resetting emergency DNS backoff.");
+                emergency_dns_attempt = 0;
+            }
+        }
+
+        // Обычная логика подключения
         let targets = {
             let mut locked = state.lock().await;
             let current_outbound = locked.outgoing_count();
@@ -201,6 +322,9 @@ pub(crate) async fn dial_loop(
                     Ok(stream) => {
                         if let Err(err) = stream.set_nodelay(true) {
                             eprintln!("Failed to set TCP_NODELAY for {target}: {err}");
+                        }
+                        if let Err(err) = configure_tcp_keepalive(&stream) {
+                            eprintln!("Failed to set TCP keepalive for {target}: {err}");
                         }
                         establish_connection(
                             stream,

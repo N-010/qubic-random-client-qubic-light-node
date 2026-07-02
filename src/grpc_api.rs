@@ -229,6 +229,10 @@ mod tests {
             dns_timeout: Duration::from_secs(1),
             traffic_log: false,
             seed_peers: Vec::new(),
+            critical_peer_threshold: 4,
+            emergency_dns_bootstrap: false,
+            emergency_dns_backoff_initial_ms: 10_000,
+            emergency_dns_backoff_max_ms: 300_000,
         })
     }
 
