@@ -68,6 +68,10 @@ impl NodeState {
         self.sessions.values().filter(|s| !s.outbound).count()
     }
 
+    pub(crate) fn total_peer_count(&self) -> usize {
+        self.sessions.len()
+    }
+
     fn is_ip_connected(&self, ip: Ipv4Addr) -> bool {
         self.connected_ip_refcount.contains_key(&ip)
     }

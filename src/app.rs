@@ -51,7 +51,7 @@ pub(crate) async fn run() -> std::io::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
 
     println!(
-        "Qubic light relay started at {} | peer_port={} | target_outbound={} | max_incoming={} | max_known_peers={} | seed_peers={} | traffic_log={} | grpc={}({})",
+        "Qubic light relay started at {} | peer_port={} | target_outbound={} | max_incoming={} | max_known_peers={} | seed_peers={} | traffic_log={} | grpc={}({}) | critical_threshold={} | emergency_dns={}",
         config.listen_addr,
         config.peer_port,
         config.target_outbound,
@@ -60,7 +60,9 @@ pub(crate) async fn run() -> std::io::Result<()> {
         config.seed_peers.len(),
         config.traffic_log,
         config.grpc_enabled,
-        config.grpc_listen_addr
+        config.grpc_listen_addr,
+        config.critical_peer_threshold,
+        config.emergency_dns_bootstrap,
     );
     if config.seed_peers.is_empty() {
         println!("No seed peers configured. Use --peer <ip[:port]> to join the public network.");
