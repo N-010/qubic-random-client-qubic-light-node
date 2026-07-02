@@ -63,11 +63,17 @@ pub(crate) async fn query_balance(
     let mut last_err = String::new();
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok((_, Ok(balance))) => {
+            Ok((peer, Ok(balance))) => {
+                state.lock().await.record_peer_success(peer);
                 join_set.abort_all();
                 return Ok(balance);
             }
             Ok((peer, Err(err))) => {
+                state.lock().await.record_peer_failure(
+                    peer,
+                    config.reconnect_interval,
+                    std::time::Instant::now(),
+                );
                 last_err = format!("{peer}: {err}");
                 if let Some(next_peer) = peer_iter.next() {
                     let timeout_duration = config.api_timeout;
@@ -134,11 +140,17 @@ pub(crate) async fn query_tick_transactions(
     let mut last_err = String::new();
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok((_, Ok(transactions))) => {
+            Ok((peer, Ok(transactions))) => {
+                state.lock().await.record_peer_success(peer);
                 join_set.abort_all();
                 return Ok(transactions);
             }
             Ok((peer, Err(err))) => {
+                state.lock().await.record_peer_failure(
+                    peer,
+                    config.reconnect_interval,
+                    std::time::Instant::now(),
+                );
                 last_err = format!("{peer}: {err}");
                 if let Some(next_peer) = peer_iter.next() {
                     let timeout_duration = config.api_timeout;

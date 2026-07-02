@@ -14,6 +14,7 @@ pub(crate) async fn run() -> std::io::Result<()> {
         Ok(config) => config,
         Err(err) => err.exit(),
     };
+    let configured_seed_peers = config.seed_peers.clone();
 
     if config.dns_bootstrap && config.seed_peers.is_empty() {
         let dns_lite_peers = if config.dns_lite_peers == 0 {
@@ -45,8 +46,14 @@ pub(crate) async fn run() -> std::io::Result<()> {
     let state = Arc::new(Mutex::new(NodeState::new(
         config.max_seen,
         config.max_known_peers,
-        &config.seed_peers,
+        &configured_seed_peers,
     )));
+    {
+        let mut locked = state.lock().await;
+        for peer in &config.seed_peers {
+            let _ = locked.add_discovered_peer(*peer);
+        }
+    }
     let latest_epoch_tick = Arc::new(AtomicU64::new(0));
     let listener = TcpListener::bind(config.listen_addr).await?;
 

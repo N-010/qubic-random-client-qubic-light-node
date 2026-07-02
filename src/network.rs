@@ -5,12 +5,12 @@ use crate::frame::{
     decode_frame_size, frame_meta, message_type_name, parse_exchange_public_peers,
     parse_tick_status_from_frame,
 };
-use crate::state::{NodeState, RelayTarget};
+use crate::state::{NodeState, PeerPoolStats, RelayTarget};
 use crate::types::{TickStatus, format_epoch_tick, format_epoch_tick_packed, pack_epoch_tick};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
@@ -53,13 +53,45 @@ fn configure_tcp_keepalive(_stream: &TcpStream) -> std::io::Result<()> {
 }
 
 fn calculate_backoff(attempt: u32, initial_ms: u64, max_ms: u64) -> Duration {
-    if attempt == 0 {
-        return Duration::from_millis(0);
-    }
     let backoff_ms = initial_ms
         .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)))
         .min(max_ms);
     Duration::from_millis(backoff_ms)
+}
+
+fn emergency_dns_needed(
+    outgoing: usize,
+    critical_threshold: usize,
+    emergency_dns_bootstrap: bool,
+    dns_bootstrap: bool,
+) -> bool {
+    emergency_dns_bootstrap && dns_bootstrap && outgoing < critical_threshold
+}
+
+fn log_pool_stats(stats: PeerPoolStats, target: usize) {
+    println!(
+        "Peer pool | known={} dialable={} cooldown={} pending={} incoming={} outgoing={} target={target}",
+        stats.known, stats.dialable, stats.cooldown, stats.pending, stats.incoming, stats.outgoing,
+    );
+}
+
+fn apply_emergency_dns_result(
+    state: &mut NodeState,
+    mut peers: Vec<SocketAddrV4>,
+    attempt: &mut u32,
+) -> usize {
+    peers.sort_unstable();
+    peers.dedup();
+    let added_count = peers
+        .into_iter()
+        .filter(|peer| state.add_discovered_peer(*peer))
+        .count();
+    if added_count == 0 {
+        *attempt = attempt.saturating_add(1);
+    } else {
+        *attempt = 0;
+    }
+    added_count
 }
 
 #[derive(Debug, Default)]
@@ -220,22 +252,25 @@ pub(crate) async fn dial_loop(
     config: Arc<Config>,
 ) {
     let mut emergency_dns_attempt = 0u32;
-    let mut last_emergency_dns = std::time::Instant::now()
+    let mut last_emergency_dns = Instant::now()
         .checked_sub(Duration::from_secs(3600))
-        .unwrap_or_else(std::time::Instant::now);
+        .unwrap_or_else(Instant::now);
+    let mut last_pool_stats = None;
 
     loop {
         // Проверить здоровье пиров и запустить аварийный DNS при необходимости
-        let total_peers = {
+        let current_outbound = {
             let locked = state.lock().await;
-            locked.total_peer_count()
+            locked.outgoing_count()
         };
 
         // Логика аварийного DNS bootstrap
-        if config.emergency_dns_bootstrap
-            && config.dns_bootstrap
-            && total_peers < config.critical_peer_threshold
-        {
+        if emergency_dns_needed(
+            current_outbound,
+            config.critical_peer_threshold,
+            config.emergency_dns_bootstrap,
+            config.dns_bootstrap,
+        ) {
             let backoff_duration = calculate_backoff(
                 emergency_dns_attempt,
                 config.emergency_dns_backoff_initial_ms,
@@ -244,7 +279,7 @@ pub(crate) async fn dial_loop(
 
             if last_emergency_dns.elapsed() >= backoff_duration {
                 eprintln!(
-                    "CRITICAL: Only {total_peers} peers connected (threshold: {}). Attempting emergency DNS bootstrap...",
+                    "CRITICAL: Only {current_outbound} outbound peers connected (threshold: {}). Attempting emergency DNS bootstrap...",
                     config.critical_peer_threshold
                 );
 
@@ -261,43 +296,39 @@ pub(crate) async fn dial_loop(
                 )
                 .await
                 {
-                    Ok(mut peers) => {
-                        if peers.is_empty() {
-                            eprintln!("Emergency DNS bootstrap returned no peers.");
-                            emergency_dns_attempt += 1;
+                    Ok(peers) => {
+                        let mut locked = state.lock().await;
+                        let added_count = apply_emergency_dns_result(
+                            &mut locked,
+                            peers,
+                            &mut emergency_dns_attempt,
+                        );
+                        drop(locked);
+
+                        if added_count == 0 {
+                            eprintln!("Emergency DNS bootstrap returned no new peers.");
                         } else {
-                            peers.sort_unstable();
-                            peers.dedup();
-
-                            let mut locked = state.lock().await;
-                            let mut added_count = 0;
-                            for peer in peers {
-                                if locked.add_discovered_peer(peer) {
-                                    added_count += 1;
-                                }
-                            }
-
                             println!(
-                                "Emergency DNS bootstrap: discovered {} new peers.",
-                                added_count
+                                "Emergency DNS bootstrap: discovered {added_count} new peers."
                             );
 
                             // Сбросить backoff при успехе
-                            emergency_dns_attempt = 0;
                         }
-                        last_emergency_dns = std::time::Instant::now();
+                        last_emergency_dns = Instant::now();
                     }
                     Err(err) => {
                         eprintln!("Emergency DNS bootstrap failed: {err}");
-                        emergency_dns_attempt += 1;
-                        last_emergency_dns = std::time::Instant::now();
+                        emergency_dns_attempt = emergency_dns_attempt.saturating_add(1);
+                        last_emergency_dns = Instant::now();
                     }
                 }
             }
-        } else if total_peers >= config.critical_peer_threshold {
+        } else if current_outbound >= config.critical_peer_threshold {
             // Сбросить состояние аварии когда восстановились
             if emergency_dns_attempt > 0 {
-                println!("Peer count recovered to {total_peers}. Resetting emergency DNS backoff.");
+                println!(
+                    "Outbound peer count recovered to {current_outbound}. Resetting emergency DNS backoff."
+                );
                 emergency_dns_attempt = 0;
             }
         }
@@ -313,6 +344,12 @@ pub(crate) async fn dial_loop(
                 locked.choose_dial_targets(needed)
             }
         };
+
+        let pool_stats = state.lock().await.pool_stats(Instant::now());
+        if last_pool_stats != Some(pool_stats) {
+            log_pool_stats(pool_stats, config.target_outbound);
+            last_pool_stats = Some(pool_stats);
+        }
 
         for target in targets {
             let state_for_task = Arc::clone(&state);
@@ -340,7 +377,11 @@ pub(crate) async fn dial_loop(
                     Err(err) => {
                         {
                             let mut locked = state_for_task.lock().await;
-                            locked.clear_pending_dial(target);
+                            locked.record_peer_failure(
+                                target,
+                                config_for_task.reconnect_interval,
+                                Instant::now(),
+                            );
                         }
                         eprintln!("Dial failed {target}: {err}");
                     }
@@ -678,5 +719,69 @@ fn update_state_without_relay(
     }
     for peer in discovered {
         let _ = locked.add_discovered_peer(peer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DEFAULT_PORT;
+    use pretty_assertions::assert_eq;
+    use std::net::Ipv4Addr;
+
+    fn peer(last_octet: u8) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, last_octet), DEFAULT_PORT)
+    }
+
+    #[test]
+    fn incoming_connections_do_not_suppress_emergency_dns() {
+        let mut state = NodeState::new(1_000, 10, &[]);
+        let (tx, _rx) = mpsc::channel(1);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+        state
+            .register_session(peer(1), false, tx, disconnect_tx, DEFAULT_PORT)
+            .expect("incoming peer should connect");
+
+        assert_eq!(state.incoming_count(), 1);
+        assert_eq!(state.outgoing_count(), 0);
+        assert!(emergency_dns_needed(state.outgoing_count(), 1, true, true));
+    }
+
+    #[test]
+    fn empty_and_duplicate_dns_results_back_off_but_new_peer_recovers() {
+        let existing = peer(2);
+        let discovered = peer(3);
+        let mut state = NodeState::new(1_000, 10, &[existing]);
+        let mut attempt = 0;
+
+        assert_eq!(
+            apply_emergency_dns_result(&mut state, Vec::new(), &mut attempt),
+            0
+        );
+        assert_eq!(attempt, 1);
+        assert_eq!(
+            calculate_backoff(attempt, 1_000, 10_000),
+            Duration::from_secs(1)
+        );
+
+        assert_eq!(
+            apply_emergency_dns_result(&mut state, vec![existing], &mut attempt),
+            0
+        );
+        assert_eq!(attempt, 2);
+        assert_eq!(
+            calculate_backoff(attempt, 1_000, 10_000),
+            Duration::from_secs(2)
+        );
+
+        assert_eq!(
+            apply_emergency_dns_result(&mut state, vec![discovered], &mut attempt),
+            1
+        );
+        assert_eq!(attempt, 0);
+        assert_eq!(
+            calculate_backoff(attempt, 1_000, 10_000),
+            Duration::from_secs(1)
+        );
     }
 }
