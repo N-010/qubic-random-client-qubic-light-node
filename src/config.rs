@@ -16,8 +16,8 @@ const DEFAULT_MAX_SEEN: usize = 65_536;
 const DEFAULT_MAX_KNOWN_PEERS: usize = 500;
 const DEFAULT_RECONNECT_MS: u64 = 2_000;
 const DEFAULT_DNS_TIMEOUT_MS: u64 = 5_000;
-const DEFAULT_EMERGENCY_DNS_BACKOFF_INITIAL_MS: u64 = 10_000;  // 10с
-const DEFAULT_EMERGENCY_DNS_BACKOFF_MAX_MS: u64 = 300_000;     // 5мин
+const DEFAULT_EMERGENCY_DNS_BACKOFF_INITIAL_MS: u64 = 10_000; // 10с
+const DEFAULT_EMERGENCY_DNS_BACKOFF_MAX_MS: u64 = 300_000; // 5мин
 const MIN_API_TIMEOUT_MS: u64 = 1_000;
 const MIN_RECONNECT_MS: u64 = 200;
 const MIN_DNS_TIMEOUT_MS: u64 = 500;
@@ -274,9 +274,11 @@ impl Config {
                 cli.critical_peer_threshold
             },
             emergency_dns_bootstrap: !cli.no_emergency_dns,
-            emergency_dns_backoff_initial_ms: cli.emergency_dns_backoff_initial_ms
+            emergency_dns_backoff_initial_ms: cli
+                .emergency_dns_backoff_initial_ms
                 .max(MIN_DNS_TIMEOUT_MS),
-            emergency_dns_backoff_max_ms: cli.emergency_dns_backoff_max_ms
+            emergency_dns_backoff_max_ms: cli
+                .emergency_dns_backoff_max_ms
                 .max(cli.emergency_dns_backoff_initial_ms),
         })
     }
