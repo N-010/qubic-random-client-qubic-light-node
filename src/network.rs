@@ -7,7 +7,6 @@ use crate::frame::{
 };
 use crate::state::{NodeState, RelayTarget};
 use crate::types::{TickStatus, format_epoch_tick, format_epoch_tick_packed, pack_epoch_tick};
-use socket2;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
