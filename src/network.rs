@@ -7,6 +7,7 @@ use crate::frame::{
 };
 use crate::state::{NodeState, RelayTarget};
 use crate::types::{TickStatus, format_epoch_tick, format_epoch_tick_packed, pack_epoch_tick};
+use socket2;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,7 +18,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::sleep;
-use socket2;
 
 const OUTBOUND_QUEUE_CAPACITY: usize = NUMBER_OF_TRANSACTIONS_PER_TICK * 2;
 const DISSEMINATION_MULTIPLIER: usize = 6;
@@ -31,9 +31,9 @@ const MAX_ACCUMULATED_BUFFER: usize = MAX_FRAME_SIZE * 2;
 fn configure_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
     let sock_ref = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(60))      // Начать проверку через 60с простоя
-        .with_interval(Duration::from_secs(10))   // Проверять каждые 10с
-        .with_retries(3);                         // 3 неудачи = мёртвое соединение
+        .with_time(Duration::from_secs(60)) // Начать проверку через 60с простоя
+        .with_interval(Duration::from_secs(10)) // Проверять каждые 10с
+        .with_retries(3); // 3 неудачи = мёртвое соединение
     sock_ref.set_tcp_keepalive(&keepalive)?;
     Ok(())
 }
@@ -258,8 +258,10 @@ pub(crate) async fn dial_loop(
                 match crate::dns::fetch_seed_peers_from_dns(
                     config.peer_port,
                     dns_lite_peers,
-                    config.dns_timeout
-                ).await {
+                    config.dns_timeout,
+                )
+                .await
+                {
                     Ok(mut peers) => {
                         if peers.is_empty() {
                             eprintln!("Emergency DNS bootstrap returned no peers.");
