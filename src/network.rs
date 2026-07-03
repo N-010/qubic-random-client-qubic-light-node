@@ -494,11 +494,14 @@ async fn connection_worker(
                 );
             }
             if let Err(err) = writer.write_all(&frame).await {
-                eprintln!("Write failed to {remote}: {err}");
-                return;
+                return Err(format!("write failed: {err}"));
             }
         }
-        let _ = writer.shutdown().await;
+        writer
+            .shutdown()
+            .await
+            .map_err(|err| format!("writer shutdown failed: {err}"))?;
+        Ok::<(), String>(())
     });
 
     let read_future = read_peer_frames(
@@ -511,16 +514,32 @@ async fn connection_worker(
     );
     tokio::pin!(read_future);
 
-    let writer_finished = tokio::select! {
+    let (writer_finished, disconnect_reason) = tokio::select! {
         result = &mut writer_task => {
-            if let Err(err) = result {
-                eprintln!("Writer task failed for {remote}: {err}");
-            }
-            true
+            let reason = match result {
+                Ok(Ok(())) => "outbound queue closed".to_string(),
+                Ok(Err(err)) => err,
+                Err(err) => format!("writer task failed: {err}"),
+            };
+            (true, reason)
         }
-        _ = &mut read_future => false,
-        _ = disconnect_rx.changed() => false,
+        result = &mut read_future => {
+            let reason = match result {
+                Ok(()) => "reader stopped".to_string(),
+                Err(err) => err,
+            };
+            (false, reason)
+        },
+        result = disconnect_rx.changed() => {
+            let reason = match result {
+                Ok(()) => "disconnect requested".to_string(),
+                Err(err) => format!("disconnect channel closed: {err}"),
+            };
+            (false, reason)
+        },
     };
+
+    eprintln!("Disconnecting {remote}: {disconnect_reason}");
 
     if !writer_finished {
         writer_task.abort();
@@ -549,30 +568,27 @@ async fn read_peer_frames(
     state: Arc<Mutex<NodeState>>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
-) {
+) -> Result<(), String> {
     let mut read_buffer = vec![0u8; READ_BUFFER_SIZE];
     let mut accumulated = Vec::<u8>::with_capacity(ACCUMULATED_INITIAL_CAPACITY);
 
     loop {
         match reader.read(&mut read_buffer).await {
-            Ok(0) => break,
+            Ok(0) => return Err("peer closed the connection".to_string()),
             Ok(read_bytes) => {
                 accumulated.extend_from_slice(&read_buffer[..read_bytes]);
                 if accumulated.len() > MAX_ACCUMULATED_BUFFER {
-                    eprintln!(
-                        "Dropping {remote}: buffered {} bytes without full parse (limit={MAX_ACCUMULATED_BUFFER})",
+                    return Err(format!(
+                        "buffered {} bytes without full parse (limit={MAX_ACCUMULATED_BUFFER})",
                         accumulated.len()
-                    );
-                    break;
+                    ));
                 }
                 let mut offset = 0usize;
 
                 while accumulated.len().saturating_sub(offset) >= HEADER_SIZE {
                     let frame_size = decode_frame_size(&accumulated[offset..offset + HEADER_SIZE]);
                     if !(HEADER_SIZE..=MAX_FRAME_SIZE).contains(&frame_size) {
-                        eprintln!("Invalid frame size from {remote}: {frame_size}");
-                        offset = accumulated.len();
-                        break;
+                        return Err(format!("invalid frame size {frame_size}"));
                     }
                     if accumulated.len() - offset < frame_size {
                         break;
@@ -617,8 +633,7 @@ async fn read_peer_frames(
                 }
             }
             Err(err) => {
-                eprintln!("Read failed from {remote}: {err}");
-                break;
+                return Err(format!("read failed: {err}"));
             }
         }
     }
@@ -725,12 +740,37 @@ fn update_state_without_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DEFAULT_PORT;
+    use crate::config::{Config, DEFAULT_GRPC_PORT, DEFAULT_PORT};
     use pretty_assertions::assert_eq;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr};
 
     fn peer(last_octet: u8) -> SocketAddrV4 {
         SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, last_octet), DEFAULT_PORT)
+    }
+
+    fn test_config() -> Arc<Config> {
+        Arc::new(Config {
+            listen_addr: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_PORT),
+            api_timeout: Duration::from_secs(1),
+            grpc_listen_addr: SocketAddr::from(([127, 0, 0, 1], DEFAULT_GRPC_PORT)),
+            grpc_enabled: true,
+            peer_port: DEFAULT_PORT,
+            target_outbound: 8,
+            max_incoming: 32,
+            max_seen: 1_000,
+            max_known_peers: 1_000,
+            reconnect_interval: Duration::from_secs(2),
+            relay_all: false,
+            dns_bootstrap: false,
+            dns_lite_peers: 0,
+            dns_timeout: Duration::from_secs(1),
+            traffic_log: false,
+            seed_peers: Vec::new(),
+            critical_peer_threshold: 4,
+            emergency_dns_bootstrap: false,
+            emergency_dns_backoff_initial_ms: 10_000,
+            emergency_dns_backoff_max_ms: 300_000,
+        })
     }
 
     #[test]
@@ -782,6 +822,75 @@ mod tests {
         assert_eq!(
             calculate_backoff(attempt, 1_000, 10_000),
             Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_reset_unregisters_outbound_session_and_allows_replacement() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test listener should bind");
+        let listener_addr = listener.local_addr().expect("listener should have address");
+        let (worker_stream, reset_stream) = tokio::join!(
+            async {
+                TcpStream::connect(listener_addr)
+                    .await
+                    .expect("worker stream should connect")
+            },
+            async {
+                listener
+                    .accept()
+                    .await
+                    .expect("test listener should accept")
+                    .0
+            }
+        );
+
+        let remote = peer(10);
+        let state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
+        let (tx, rx) = mpsc::channel(1);
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
+        let peer_id = state
+            .lock()
+            .await
+            .register_session(remote, true, tx, disconnect_tx, DEFAULT_PORT)
+            .expect("outbound session should register");
+        let worker = tokio::spawn(connection_worker(
+            worker_stream,
+            rx,
+            disconnect_rx,
+            ConnectionContext {
+                peer_id,
+                remote,
+                state: Arc::clone(&state),
+                latest_epoch_tick: Arc::new(AtomicU64::new(0)),
+                config: test_config(),
+            },
+        ));
+
+        socket2::SockRef::from(&reset_stream)
+            .set_linger(Some(Duration::ZERO))
+            .expect("test peer should configure reset-on-close");
+        drop(reset_stream);
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("connection worker should observe reset")
+            .expect("connection worker task should finish");
+
+        let mut locked = state.lock().await;
+        assert_eq!(locked.outgoing_count(), 0);
+        let (replacement_tx, _replacement_rx) = mpsc::channel(1);
+        let (replacement_disconnect_tx, _replacement_disconnect_rx) = watch::channel(false);
+        assert!(
+            locked
+                .register_session(
+                    remote,
+                    true,
+                    replacement_tx,
+                    replacement_disconnect_tx,
+                    DEFAULT_PORT,
+                )
+                .is_some()
         );
     }
 }

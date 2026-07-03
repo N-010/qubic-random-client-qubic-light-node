@@ -11,12 +11,11 @@ use crate::types::{BalanceResponse, TickTransaction};
 use rand::seq::SliceRandom;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 const RESPOND_ENTITY_MIN_PAYLOAD_SIZE: usize = 72;
 const TRANSACTION_BASE_SIZE: usize = 80;
@@ -29,10 +28,14 @@ pub(crate) async fn query_balance(
     wallet: &str,
     public_key: [u8; 32],
 ) -> Result<BalanceResponse, String> {
-    let mut peers = {
+    let timeout_duration = config.api_timeout;
+    let deadline = Instant::now() + timeout_duration;
+    let mut peers = timeout_at(deadline, async {
         let locked = state.lock().await;
         locked.peer_candidates(config.peer_port)
-    };
+    })
+    .await
+    .map_err(|_| api_timeout_error(timeout_duration))?;
     if peers.is_empty() {
         return Err("No known peers available".to_string());
     }
@@ -49,45 +52,56 @@ pub(crate) async fn query_balance(
 
     for _ in 0..parallelism {
         if let Some(peer) = peer_iter.next() {
-            let timeout_duration = config.api_timeout;
             let wallet = wallet_owned.clone();
             join_set.spawn(async move {
                 (
                     peer,
-                    query_balance_from_peer(peer, timeout_duration, &wallet, public_key).await,
+                    query_balance_from_peer(peer, deadline, &wallet, public_key).await,
                 )
             });
         }
     }
 
     let mut last_err = String::new();
-    while let Some(result) = join_set.join_next().await {
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = sleep_until(deadline) => {
+                join_set.abort_all();
+                return Err(api_timeout_error(timeout_duration));
+            }
+            result = join_set.join_next() => result,
+        };
+        let Some(result) = result else {
+            break;
+        };
         match result {
             Ok((peer, Ok(balance))) => {
-                state.lock().await.record_peer_success(peer);
+                timeout_at(deadline, async {
+                    state.lock().await.record_peer_success(peer);
+                })
+                .await
+                .map_err(|_| api_timeout_error(timeout_duration))?;
                 join_set.abort_all();
                 return Ok(balance);
             }
             Ok((peer, Err(err))) => {
-                state.lock().await.record_peer_failure(
-                    peer,
-                    config.reconnect_interval,
-                    std::time::Instant::now(),
-                );
+                timeout_at(deadline, async {
+                    state.lock().await.record_peer_failure(
+                        peer,
+                        config.reconnect_interval,
+                        std::time::Instant::now(),
+                    );
+                })
+                .await
+                .map_err(|_| api_timeout_error(timeout_duration))?;
                 last_err = format!("{peer}: {err}");
                 if let Some(next_peer) = peer_iter.next() {
-                    let timeout_duration = config.api_timeout;
                     let wallet = wallet_owned.clone();
                     join_set.spawn(async move {
                         (
                             next_peer,
-                            query_balance_from_peer(
-                                next_peer,
-                                timeout_duration,
-                                &wallet,
-                                public_key,
-                            )
-                            .await,
+                            query_balance_from_peer(next_peer, deadline, &wallet, public_key).await,
                         )
                     });
                 }
@@ -108,10 +122,14 @@ pub(crate) async fn query_tick_transactions(
     config: Arc<Config>,
     tick: u32,
 ) -> Result<Vec<TickTransaction>, String> {
-    let mut peers = {
+    let timeout_duration = config.api_timeout;
+    let deadline = Instant::now() + timeout_duration;
+    let mut peers = timeout_at(deadline, async {
         let locked = state.lock().await;
         locked.peer_candidates(config.peer_port)
-    };
+    })
+    .await
+    .map_err(|_| api_timeout_error(timeout_duration))?;
     if peers.is_empty() {
         return Err("No known peers available".to_string());
     }
@@ -127,38 +145,54 @@ pub(crate) async fn query_tick_transactions(
 
     for _ in 0..parallelism {
         if let Some(peer) = peer_iter.next() {
-            let timeout_duration = config.api_timeout;
             join_set.spawn(async move {
                 (
                     peer,
-                    query_tick_transactions_from_peer(peer, timeout_duration, tick).await,
+                    query_tick_transactions_from_peer(peer, deadline, tick).await,
                 )
             });
         }
     }
 
     let mut last_err = String::new();
-    while let Some(result) = join_set.join_next().await {
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = sleep_until(deadline) => {
+                join_set.abort_all();
+                return Err(api_timeout_error(timeout_duration));
+            }
+            result = join_set.join_next() => result,
+        };
+        let Some(result) = result else {
+            break;
+        };
         match result {
             Ok((peer, Ok(transactions))) => {
-                state.lock().await.record_peer_success(peer);
+                timeout_at(deadline, async {
+                    state.lock().await.record_peer_success(peer);
+                })
+                .await
+                .map_err(|_| api_timeout_error(timeout_duration))?;
                 join_set.abort_all();
                 return Ok(transactions);
             }
             Ok((peer, Err(err))) => {
-                state.lock().await.record_peer_failure(
-                    peer,
-                    config.reconnect_interval,
-                    std::time::Instant::now(),
-                );
+                timeout_at(deadline, async {
+                    state.lock().await.record_peer_failure(
+                        peer,
+                        config.reconnect_interval,
+                        std::time::Instant::now(),
+                    );
+                })
+                .await
+                .map_err(|_| api_timeout_error(timeout_duration))?;
                 last_err = format!("{peer}: {err}");
                 if let Some(next_peer) = peer_iter.next() {
-                    let timeout_duration = config.api_timeout;
                     join_set.spawn(async move {
                         (
                             next_peer,
-                            query_tick_transactions_from_peer(next_peer, timeout_duration, tick)
-                                .await,
+                            query_tick_transactions_from_peer(next_peer, deadline, tick).await,
                         )
                     });
                 }
@@ -176,18 +210,17 @@ pub(crate) async fn query_tick_transactions(
 
 async fn query_balance_from_peer(
     peer: SocketAddrV4,
-    timeout_duration: Duration,
+    deadline: Instant,
     wallet: &str,
     public_key: [u8; 32],
 ) -> Result<BalanceResponse, String> {
-    let mut stream = connect_to_peer(peer, timeout_duration).await?;
-    send_handshake_frame(&mut stream, timeout_duration).await?;
+    let mut stream = connect_to_peer(peer, deadline).await?;
+    send_handshake_frame(&mut stream, deadline).await?;
 
     let dejavu = random_non_zero_u32();
     let request = build_request_frame(REQUEST_ENTITY_TYPE, dejavu, &public_key)?;
-    write_frame(&mut stream, &request, timeout_duration).await?;
+    write_frame(&mut stream, &request, deadline).await?;
 
-    let deadline = Instant::now() + timeout_duration;
     loop {
         let frame = read_frame_until_deadline(&mut stream, deadline).await?;
         let response_dejavu = frame_dejavu(&frame)?;
@@ -210,17 +243,16 @@ async fn query_balance_from_peer(
 
 async fn query_tick_transactions_from_peer(
     peer: SocketAddrV4,
-    timeout_duration: Duration,
+    deadline: Instant,
     tick: u32,
 ) -> Result<Vec<TickTransaction>, String> {
-    let mut stream = connect_to_peer(peer, timeout_duration).await?;
-    send_handshake_frame(&mut stream, timeout_duration).await?;
+    let mut stream = connect_to_peer(peer, deadline).await?;
+    send_handshake_frame(&mut stream, deadline).await?;
 
     let dejavu = random_non_zero_u32();
     let request = build_request_tick_transactions_frame(dejavu, tick)?;
-    write_frame(&mut stream, &request, timeout_duration).await?;
+    write_frame(&mut stream, &request, deadline).await?;
 
-    let deadline = Instant::now() + timeout_duration;
     let mut transactions = Vec::<TickTransaction>::new();
     loop {
         let frame = read_frame_until_deadline(&mut stream, deadline).await?;
@@ -240,13 +272,10 @@ async fn query_tick_transactions_from_peer(
     }
 }
 
-async fn connect_to_peer(
-    peer: SocketAddrV4,
-    timeout_duration: Duration,
-) -> Result<TcpStream, String> {
-    let stream = timeout(timeout_duration, TcpStream::connect(peer))
+async fn connect_to_peer(peer: SocketAddrV4, deadline: Instant) -> Result<TcpStream, String> {
+    let stream = timeout_at(deadline, TcpStream::connect(peer))
         .await
-        .map_err(|_| format!("connect timeout after {} ms", timeout_duration.as_millis()))
+        .map_err(|_| "connect deadline exceeded".to_string())
         .and_then(|result| result.map_err(|err| err.to_string()))?;
 
     if let Err(err) = stream.set_nodelay(true) {
@@ -255,27 +284,24 @@ async fn connect_to_peer(
     Ok(stream)
 }
 
-async fn send_handshake_frame(
-    stream: &mut TcpStream,
-    timeout_duration: Duration,
-) -> Result<(), String> {
+async fn send_handshake_frame(stream: &mut TcpStream, deadline: Instant) -> Result<(), String> {
     let handshake = build_exchange_public_peers_frame([
         Ipv4Addr::new(0, 0, 0, 0),
         Ipv4Addr::new(0, 0, 0, 0),
         Ipv4Addr::new(0, 0, 0, 0),
         Ipv4Addr::new(0, 0, 0, 0),
     ]);
-    write_frame(stream, &handshake, timeout_duration).await
+    write_frame(stream, &handshake, deadline).await
 }
 
 async fn write_frame(
     stream: &mut TcpStream,
     frame: &[u8],
-    timeout_duration: Duration,
+    deadline: Instant,
 ) -> Result<(), String> {
-    timeout(timeout_duration, stream.write_all(frame))
+    timeout_at(deadline, stream.write_all(frame))
         .await
-        .map_err(|_| format!("write timeout after {} ms", timeout_duration.as_millis()))
+        .map_err(|_| "write deadline exceeded".to_string())
         .and_then(|result| result.map_err(|err| err.to_string()))
 }
 
@@ -309,14 +335,17 @@ async fn read_exact_until_deadline(
     buffer: &mut [u8],
     deadline: Instant,
 ) -> Result<(), String> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or_else(|| "request timeout".to_string())?;
-
-    timeout(remaining, stream.read_exact(buffer))
+    timeout_at(deadline, stream.read_exact(buffer))
         .await
-        .map_err(|_| "read timeout".to_string())
+        .map_err(|_| "read deadline exceeded".to_string())
         .and_then(|result| result.map(|_| ()).map_err(|err| err.to_string()))
+}
+
+fn api_timeout_error(timeout_duration: std::time::Duration) -> String {
+    format!(
+        "Peer-backed API query timed out after {} ms",
+        timeout_duration.as_millis()
+    )
 }
 
 fn parse_balance_payload(wallet: &str, payload: &[u8]) -> Result<BalanceResponse, String> {
@@ -379,4 +408,37 @@ fn parse_transaction_payload(payload: &[u8]) -> Result<TickTransaction, String> 
         input_hex: bytes_to_hex(&payload[input_start..input_end]),
         signature_hex: bytes_to_hex(&payload[signature_start..]),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn hung_peer_obeys_single_end_to_end_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test listener should bind");
+        let peer = match listener.local_addr().expect("listener should have address") {
+            std::net::SocketAddr::V4(peer) => peer,
+            std::net::SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("peer should connect");
+            std::future::pending::<()>().await;
+        });
+        let timeout_duration = std::time::Duration::from_millis(100);
+        let started = Instant::now();
+
+        let error =
+            query_balance_from_peer(peer, started + timeout_duration, "test-wallet", [0; 32])
+                .await
+                .expect_err("hung peer should time out");
+
+        assert_eq!(error, "read deadline exceeded");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        server.abort();
+    }
 }

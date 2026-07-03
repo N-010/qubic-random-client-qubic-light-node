@@ -143,7 +143,7 @@ Emergency DNS bootstrap runs when outbound connections fall below `--critical-pe
 - `--no-grpc`
   Disable the gRPC server.
 - `--api-timeout-ms <ms>`
-  Timeout used by peer-backed API queries such as balance and tick transactions. Default: `6000`. Values below `1000` are currently clamped to `1000` internally.
+  End-to-end deadline for a balance or tick-transactions query, including peer connection, handshake, writes, and reads. Default: `6000`. Values below `1000` are currently clamped to `1000` internally.
 
 To see the parser-generated help text:
 
@@ -169,6 +169,8 @@ Methods:
 Protocol file: `proto/lightnode.proto`
 
 The gRPC server also enables reflection, so tools like `grpcurl` can inspect the service without a separate generated client.
+
+At most four peer-backed gRPC calls run at once. Each call queries at most three peers concurrently, limiting the process to 12 query connections. Additional `GetBalance` or `GetTickTransactions` calls are rejected immediately with `ok=false` and an overload message; `GetStatus` and `BroadcastTransaction` remain available.
 
 ## Wallet Format For GetBalance
 

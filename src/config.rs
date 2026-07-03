@@ -206,7 +206,7 @@ struct Cli {
         long = "api-timeout-ms",
         value_name = "MS",
         default_value_t = DEFAULT_API_TIMEOUT_MS,
-        help = "Timeout for peer-backed API queries in milliseconds",
+        help = "End-to-end deadline for peer-backed API queries in milliseconds",
         help_heading = "API"
     )]
     api_timeout_ms: u64,

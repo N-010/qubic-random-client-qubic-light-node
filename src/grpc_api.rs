@@ -8,17 +8,24 @@ use crate::types::{
 };
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 #[derive(Clone)]
 pub(crate) struct GrpcService {
     pub(crate) api: ApiState,
+    peer_query_slots: Arc<Semaphore>,
 }
+
+const MAX_CONCURRENT_PEER_QUERIES: usize = 4;
+const PEER_QUERY_OVERLOADED_ERROR: &str =
+    "Peer-backed API is overloaded; retry after an in-flight query completes";
 
 pub(crate) async fn run_grpc_server(api_state: ApiState) -> std::io::Result<()> {
     let service = GrpcService {
         api: api_state.clone(),
+        peer_query_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_QUERIES)),
     };
     let reflection = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(LIGHTNODE_FILE_DESCRIPTOR_SET)
@@ -77,6 +84,13 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
     ) -> Result<Response<lightnodepb::GetBalanceResponse>, Status> {
         let wallet = request.into_inner().wallet;
         let public_key = parse_wallet_public_key(&wallet).map_err(Status::invalid_argument)?;
+        let Some(_permit) = self.try_acquire_peer_query_slot() else {
+            return Ok(Response::new(lightnodepb::GetBalanceResponse {
+                ok: false,
+                balance: None,
+                error: PEER_QUERY_OVERLOADED_ERROR.to_string(),
+            }));
+        };
 
         match query_balance(
             Arc::clone(&self.api.node_state),
@@ -104,6 +118,14 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
         request: Request<lightnodepb::GetTickTransactionsRequest>,
     ) -> Result<Response<lightnodepb::GetTickTransactionsResponse>, Status> {
         let tick = request.into_inner().tick;
+        let Some(_permit) = self.try_acquire_peer_query_slot() else {
+            return Ok(Response::new(lightnodepb::GetTickTransactionsResponse {
+                ok: false,
+                tick,
+                transactions: Vec::new(),
+                error: PEER_QUERY_OVERLOADED_ERROR.to_string(),
+            }));
+        };
         match query_tick_transactions(
             Arc::clone(&self.api.node_state),
             Arc::clone(&self.api.config),
@@ -155,6 +177,12 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
                 error: err,
             })),
         }
+    }
+}
+
+impl GrpcService {
+    fn try_acquire_peer_query_slot(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.peer_query_slots).try_acquire_owned().ok()
     }
 }
 
@@ -243,6 +271,7 @@ mod tests {
                 latest_epoch_tick: Arc::new(AtomicU64::new(0)),
                 config: test_config(),
             },
+            peer_query_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_QUERIES)),
         }
     }
 
@@ -307,6 +336,55 @@ mod tests {
                 error: "Transaction payload is empty".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn fifth_peer_backed_request_is_rejected_without_blocking_other_methods() {
+        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[]))));
+        let permits = (0..MAX_CONCURRENT_PEER_QUERIES)
+            .map(|_| {
+                service
+                    .try_acquire_peer_query_slot()
+                    .expect("test should acquire each available peer-query slot")
+            })
+            .collect::<Vec<_>>();
+
+        let overloaded = LightNode::get_tick_transactions(
+            &service,
+            Request::new(lightnodepb::GetTickTransactionsRequest { tick: 42 }),
+        )
+        .await
+        .expect("overloaded request should return grpc response")
+        .into_inner();
+        assert_eq!(
+            overloaded,
+            lightnodepb::GetTickTransactionsResponse {
+                ok: false,
+                tick: 42,
+                transactions: Vec::new(),
+                error: PEER_QUERY_OVERLOADED_ERROR.to_string(),
+            }
+        );
+
+        let status =
+            LightNode::get_status(&service, Request::new(lightnodepb::GetStatusRequest {}))
+                .await
+                .expect("status should remain available")
+                .into_inner();
+        assert!(status.error.contains("No tick data"));
+
+        let broadcast = LightNode::broadcast_transaction(
+            &service,
+            Request::new(lightnodepb::BroadcastTransactionRequest {
+                tx_bytes: Vec::new(),
+            }),
+        )
+        .await
+        .expect("broadcast should remain available")
+        .into_inner();
+        assert_eq!(broadcast.error, "Transaction payload is empty");
+
+        drop(permits);
     }
 
     #[tokio::test]
