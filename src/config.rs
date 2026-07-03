@@ -15,6 +15,7 @@ const DEFAULT_MAX_INCOMING: usize = 32;
 const DEFAULT_MAX_SEEN: usize = 65_536;
 const DEFAULT_MAX_KNOWN_PEERS: usize = 500;
 const DEFAULT_RECONNECT_MS: u64 = 2_000;
+const DEFAULT_PEER_WRITE_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_DNS_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_EMERGENCY_DNS_BACKOFF_INITIAL_MS: u64 = 10_000; // 10с
 const DEFAULT_EMERGENCY_DNS_BACKOFF_MAX_MS: u64 = 300_000; // 5мин
@@ -34,6 +35,7 @@ pub(crate) struct Config {
     pub(crate) max_seen: usize,
     pub(crate) max_known_peers: usize,
     pub(crate) reconnect_interval: Duration,
+    pub(crate) peer_write_timeout: Duration,
     pub(crate) relay_all: bool,
     pub(crate) dns_bootstrap: bool,
     pub(crate) dns_lite_peers: usize,
@@ -128,6 +130,15 @@ struct Cli {
         help_heading = "P2P"
     )]
     reconnect_ms: u64,
+
+    #[arg(
+        long = "peer-write-timeout-ms",
+        value_name = "MS",
+        default_value_t = DEFAULT_PEER_WRITE_TIMEOUT_MS,
+        help = "Disconnect a peer when a TCP frame write exceeds this duration",
+        help_heading = "P2P"
+    )]
+    peer_write_timeout_ms: u64,
 
     #[arg(
         long = "relay-all",
@@ -262,6 +273,7 @@ impl Config {
             max_seen: cli.max_seen,
             max_known_peers: cli.max_known_peers,
             reconnect_interval: Duration::from_millis(cli.reconnect_ms.max(MIN_RECONNECT_MS)),
+            peer_write_timeout: Duration::from_millis(cli.peer_write_timeout_ms),
             relay_all: cli.relay_all,
             dns_bootstrap: !cli.no_dns_bootstrap,
             dns_lite_peers: cli.dns_lite_peers,
@@ -343,6 +355,7 @@ mod tests {
                 max_seen: 65_536,
                 max_known_peers: 500,
                 reconnect_interval: Duration::from_millis(2_000),
+                peer_write_timeout: Duration::from_millis(5_000),
                 relay_all: false,
                 dns_bootstrap: true,
                 dns_lite_peers: 0,
@@ -387,6 +400,14 @@ mod tests {
         assert_eq!(config.api_timeout, Duration::from_millis(1_000));
         assert_eq!(config.reconnect_interval, Duration::from_millis(200));
         assert_eq!(config.dns_timeout, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn peer_write_timeout_is_configurable() {
+        assert_eq!(
+            parse_config(&["--peer-write-timeout-ms", "1234"]).peer_write_timeout,
+            Duration::from_millis(1_234)
+        );
     }
 
     #[test]

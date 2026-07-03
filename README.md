@@ -88,6 +88,8 @@ Important notes:
 - by default, relay is limited to frames with `dejavu == 0`; use `--relay-all` to also relay frames with non-zero `dejavu`
 - each relayed frame is queued to at most six randomly selected peers, matching the Qubic Core dissemination multiplier
 - a peer is disconnected when its bounded outbound queue is full, allowing the reconnect loop to replace a slow session
+- every peer write has a deadline controlled by `--peer-write-timeout-ms`; a peer that stops reading is disconnected and replaced instead of retaining a stalled writer
+- console logs use a bounded non-blocking queue and a dedicated writer thread, so a slow Docker log consumer cannot block the Tokio runtime; log messages are dropped if that queue is full
 - failed dial and peer-backed API attempts put that address into an exponential cooldown, starting at `--reconnect-ms` and capped at five minutes; a successful connection or API response clears its failure history
 - configured `--peer` addresses are retained even when the discovered-peer cache is full; active and pending connection addresses are protected from eviction as well
 - emergency DNS recovery is based only on the outbound connection count, so incoming connections cannot hide a depleted outbound pool
@@ -113,6 +115,8 @@ Important notes:
   Maximum number of discovered peers kept in memory. Default: `500`. Evictable addresses use LRU order; configured seeds, active peers, and pending dials are never evicted, so protected entries can temporarily keep the pool above the limit.
 - `--reconnect-ms <ms>`
   Delay between outbound reconnect attempts. Default: `2000`. Values below `200` are currently clamped to `200` internally.
+- `--peer-write-timeout-ms <ms>`
+  Maximum time allowed for one TCP frame write before the peer is disconnected. Default: `5000`.
 
 ### Relay
 
@@ -191,6 +195,8 @@ At most four peer-backed gRPC calls run at once. Each call queries at most three
   the node can still run, but it may not find peers until you add `--peer` values or receive inbound connections.
 - The pool reports many peers but makes no immediate dial attempts:
   inspect the `Peer pool` log. `cooldown` addresses are temporarily suppressed after failures, while `dialable` shows addresses eligible for a new outbound attempt now.
+- Peers repeatedly disconnect with `write timed out`:
+  those peers accepted a connection but did not consume outbound traffic within `--peer-write-timeout-ms`. The reconnect loop replaces them automatically; increase the timeout only when slow links are expected.
 - `GetStatus` says there is no tick data yet:
   wait until the node receives traffic from the network.
 - Balance or tick transaction requests fail:
