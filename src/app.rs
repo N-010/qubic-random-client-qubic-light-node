@@ -58,12 +58,13 @@ pub(crate) async fn run() -> std::io::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
 
     println!(
-        "Qubic light relay started at {} | peer_port={} | target_outbound={} | max_incoming={} | max_known_peers={} | seed_peers={} | traffic_log={} | grpc={}({}) | critical_threshold={} | emergency_dns={}",
+        "Qubic light relay started at {} | peer_port={} | target_outbound={} | max_incoming={} | max_known_peers={} | peer_write_timeout_ms={} | seed_peers={} | traffic_log={} | grpc={}({}) | critical_threshold={} | emergency_dns={}",
         config.listen_addr,
         config.peer_port,
         config.target_outbound,
         config.max_incoming,
         config.max_known_peers,
+        config.peer_write_timeout.as_millis(),
         config.seed_peers.len(),
         config.traffic_log,
         config.grpc_enabled,

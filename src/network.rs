@@ -11,12 +11,12 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, mpsc, watch};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 const OUTBOUND_QUEUE_CAPACITY: usize = NUMBER_OF_TRANSACTIONS_PER_TICK * 2;
 const DISSEMINATION_MULTIPLIER: usize = 6;
@@ -463,7 +463,7 @@ async fn establish_connection(
 
 async fn connection_worker(
     stream: TcpStream,
-    mut rx: mpsc::Receiver<Arc<[u8]>>,
+    rx: mpsc::Receiver<Arc<[u8]>>,
     mut disconnect_rx: watch::Receiver<bool>,
     context: ConnectionContext,
 ) {
@@ -474,77 +474,42 @@ async fn connection_worker(
         latest_epoch_tick,
         config,
     } = context;
-    let (reader, mut writer) = stream.into_split();
-    let traffic_log = config.traffic_log;
-    let writer_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
+    let disconnect_reason = {
+        let (reader, mut writer) = stream.into_split();
+        let writer_future = write_peer_frames(
+            &mut writer,
+            rx,
+            remote,
+            config.traffic_log,
+            Arc::clone(&latest_epoch_tick),
+            config.peer_write_timeout,
+        );
+        let read_future = read_peer_frames(
+            reader,
+            peer_id,
+            remote,
+            Arc::clone(&state),
+            latest_epoch_tick,
+            config,
+        );
+        tokio::pin!(writer_future);
+        tokio::pin!(read_future);
 
-    let mut writer_task = tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if traffic_log {
-                let (size, message_type, dejavu) = frame_meta(&frame);
-                let packed = writer_latest_epoch_tick.load(Ordering::Relaxed);
-                println!(
-                    "TX {} | size={} type={}({}) dejavu={} | {}",
-                    remote,
-                    size,
-                    message_type_name(message_type),
-                    message_type,
-                    dejavu,
-                    format_epoch_tick_packed(packed)
-                );
-            }
-            if let Err(err) = writer.write_all(&frame).await {
-                return Err(format!("write failed: {err}"));
-            }
-        }
-        writer
-            .shutdown()
-            .await
-            .map_err(|err| format!("writer shutdown failed: {err}"))?;
-        Ok::<(), String>(())
-    });
-
-    let read_future = read_peer_frames(
-        reader,
-        peer_id,
-        remote,
-        Arc::clone(&state),
-        latest_epoch_tick,
-        config,
-    );
-    tokio::pin!(read_future);
-
-    let (writer_finished, disconnect_reason) = tokio::select! {
-        result = &mut writer_task => {
-            let reason = match result {
-                Ok(Ok(())) => "outbound queue closed".to_string(),
-                Ok(Err(err)) => err,
-                Err(err) => format!("writer task failed: {err}"),
-            };
-            (true, reason)
-        }
-        result = &mut read_future => {
-            let reason = match result {
+        tokio::select! {
+            result = &mut writer_future => match result {
+                Ok(()) => "outbound queue closed".to_string(),
+                Err(err) => err,
+            },
+            result = &mut read_future => match result {
                 Ok(()) => "reader stopped".to_string(),
                 Err(err) => err,
-            };
-            (false, reason)
-        },
-        result = disconnect_rx.changed() => {
-            let reason = match result {
+            },
+            result = disconnect_rx.changed() => match result {
                 Ok(()) => "disconnect requested".to_string(),
                 Err(err) => format!("disconnect channel closed: {err}"),
-            };
-            (false, reason)
-        },
+            },
+        }
     };
-
-    eprintln!("Disconnecting {remote}: {disconnect_reason}");
-
-    if !writer_finished {
-        writer_task.abort();
-        let _ = writer_task.await;
-    }
 
     let (in_count, out_count, latest_tick) = {
         let mut locked = state.lock().await;
@@ -555,10 +520,47 @@ async fn connection_worker(
             locked.latest_tick(),
         )
     };
+    eprintln!("Disconnecting {remote}: {disconnect_reason}");
     println!(
         "Disconnected {remote} | in={in_count} out={out_count} | {}",
         format_epoch_tick(latest_tick)
     );
+}
+
+async fn write_peer_frames<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut rx: mpsc::Receiver<Arc<[u8]>>,
+    remote: SocketAddrV4,
+    traffic_log: bool,
+    latest_epoch_tick: Arc<AtomicU64>,
+    peer_write_timeout: Duration,
+) -> Result<(), String> {
+    while let Some(frame) = rx.recv().await {
+        if traffic_log {
+            let (size, message_type, dejavu) = frame_meta(&frame);
+            let packed = latest_epoch_tick.load(Ordering::Relaxed);
+            println!(
+                "TX {} | size={} type={}({}) dejavu={} | {}",
+                remote,
+                size,
+                message_type_name(message_type),
+                message_type,
+                dejavu,
+                format_epoch_tick_packed(packed)
+            );
+        }
+        match timeout(peer_write_timeout, writer.write_all(&frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(format!("write failed: {err}")),
+            Err(_) => {
+                return Err(format!(
+                    "write timed out after {} ms",
+                    peer_write_timeout.as_millis()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn read_peer_frames(
@@ -760,6 +762,7 @@ mod tests {
             max_seen: 1_000,
             max_known_peers: 1_000,
             reconnect_interval: Duration::from_secs(2),
+            peer_write_timeout: Duration::from_secs(5),
             relay_all: false,
             dns_bootstrap: false,
             dns_lite_peers: 0,
@@ -892,5 +895,80 @@ mod tests {
                 )
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_peer_write_times_out() {
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Arc::<[u8]>::from(vec![0; 1_024]))
+            .await
+            .expect("test frame should queue");
+
+        let result = write_peer_frames(
+            &mut writer,
+            rx,
+            peer(11),
+            false,
+            Arc::new(AtomicU64::new(0)),
+            Duration::from_millis(20),
+        )
+        .await;
+
+        assert_eq!(result, Err("write timed out after 20 ms".to_string()));
+    }
+
+    #[tokio::test]
+    async fn explicit_disconnect_unregisters_session_without_waiting_for_writer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("test listener should bind");
+        let listener_addr = listener.local_addr().expect("listener should have address");
+        let (worker_stream, _peer_stream) = tokio::join!(
+            async {
+                TcpStream::connect(listener_addr)
+                    .await
+                    .expect("worker stream should connect")
+            },
+            async {
+                listener
+                    .accept()
+                    .await
+                    .expect("test listener should accept")
+                    .0
+            }
+        );
+
+        let remote = peer(12);
+        let state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
+        let (tx, rx) = mpsc::channel(1);
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
+        let peer_id = state
+            .lock()
+            .await
+            .register_session(remote, true, tx, disconnect_tx.clone(), DEFAULT_PORT)
+            .expect("outbound session should register");
+        let worker = tokio::spawn(connection_worker(
+            worker_stream,
+            rx,
+            disconnect_rx,
+            ConnectionContext {
+                peer_id,
+                remote,
+                state: Arc::clone(&state),
+                latest_epoch_tick: Arc::new(AtomicU64::new(0)),
+                config: test_config(),
+            },
+        ));
+
+        disconnect_tx
+            .send(true)
+            .expect("disconnect request should send");
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("worker should stop immediately")
+            .expect("worker task should finish");
+
+        assert_eq!(state.lock().await.outgoing_count(), 0);
     }
 }

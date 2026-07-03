@@ -50,14 +50,7 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
         _request: Request<lightnodepb::GetStatusRequest>,
     ) -> Result<Response<lightnodepb::GetStatusResponse>, Status> {
         let packed = self.api.latest_epoch_tick.load(Ordering::Relaxed);
-        let cached = {
-            let cached_from_state = self.api.node_state.lock().await.latest_tick();
-            if cached_from_state.is_some() {
-                cached_from_state
-            } else {
-                tick_status_from_packed(packed)
-            }
-        };
+        let cached = tick_status_from_packed(packed);
         if let Some(status) = cached {
             Ok(Response::new(lightnodepb::GetStatusResponse {
                 ok: true,
@@ -251,6 +244,7 @@ mod tests {
             max_seen: 1_000,
             max_known_peers: 1_000,
             reconnect_interval: Duration::from_millis(2_000),
+            peer_write_timeout: Duration::from_secs(5),
             relay_all: false,
             dns_bootstrap: false,
             dns_lite_peers: 0,
@@ -385,6 +379,26 @@ mod tests {
         assert_eq!(broadcast.error, "Transaction payload is empty");
 
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn get_status_does_not_wait_for_node_state_lock() {
+        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
+        let mut service = test_service(Arc::clone(&node_state));
+        service.api.latest_epoch_tick =
+            Arc::new(AtomicU64::new(crate::types::pack_epoch_tick(7, 123)));
+        let _guard = node_state.lock().await;
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            LightNode::get_status(&service, Request::new(lightnodepb::GetStatusRequest {})),
+        )
+        .await
+        .expect("status must not wait for NodeState")
+        .expect("status should return")
+        .into_inner();
+
+        assert_eq!(response.status.expect("tick status should exist").tick, 123);
     }
 
     #[tokio::test]
