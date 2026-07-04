@@ -87,6 +87,8 @@ Important notes:
 - the process can still start even if DNS bootstrap fails; in that case you can wait for incoming peers or pass `--peer` manually
 - by default, relay is limited to frames with `dejavu == 0`; use `--relay-all` to also relay frames with non-zero `dejavu`
 - each relayed frame is queued to at most six randomly selected peers, matching the Qubic Core dissemination multiplier
+- TCP input is accumulated in reusable buffers and complete frames are split into immutable, reference-counted byte views; relay fanout shares the same frame storage across all selected peer queues without copying the payload per peer
+- peer/session state and the rolling deduplication window use separate lock domains, while the latest epoch/tick is kept in an atomic cache for lock-free status reads
 - a peer is disconnected when its bounded outbound queue is full, allowing the reconnect loop to replace a slow session
 - every peer write has a deadline controlled by `--peer-write-timeout-ms`; a peer that stops reading is disconnected and replaced instead of retaining a stalled writer
 - console logs use a bounded non-blocking queue and a dedicated writer thread, so a slow Docker log consumer cannot block the Tokio runtime; log messages are dropped if that queue is full

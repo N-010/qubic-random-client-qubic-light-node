@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::dns::fetch_seed_peers_from_dns;
 use crate::grpc_api::run_grpc_server;
 use crate::network::{accept_loop, dial_loop};
-use crate::state::NodeState;
+use crate::state::{DedupWindow, NodeState};
 use crate::types::ApiState;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -44,10 +44,10 @@ pub(crate) async fn run() -> std::io::Result<()> {
     }
 
     let state = Arc::new(Mutex::new(NodeState::new(
-        config.max_seen,
         config.max_known_peers,
         &configured_seed_peers,
     )));
+    let dedup = Arc::new(DedupWindow::new(config.max_seen));
     {
         let mut locked = state.lock().await;
         for peer in &config.seed_peers {
@@ -81,6 +81,7 @@ pub(crate) async fn run() -> std::io::Result<()> {
     if shared_config.grpc_enabled {
         let grpc_state = ApiState {
             node_state: Arc::clone(&state),
+            dedup: Arc::clone(&dedup),
             latest_epoch_tick: Arc::clone(&latest_epoch_tick),
             config: Arc::clone(&shared_config),
         };
@@ -92,12 +93,14 @@ pub(crate) async fn run() -> std::io::Result<()> {
     }
 
     let accept_state = Arc::clone(&state);
+    let accept_dedup = Arc::clone(&dedup);
     let accept_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
     let accept_config = Arc::clone(&shared_config);
     tokio::spawn(async move {
         accept_loop(
             listener,
             accept_state,
+            accept_dedup,
             accept_latest_epoch_tick,
             accept_config,
         )
@@ -108,7 +111,7 @@ pub(crate) async fn run() -> std::io::Result<()> {
     let dial_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
     let dial_config = Arc::clone(&shared_config);
     tokio::spawn(async move {
-        dial_loop(dial_state, dial_latest_epoch_tick, dial_config).await;
+        dial_loop(dial_state, dedup, dial_latest_epoch_tick, dial_config).await;
     });
 
     tokio::signal::ctrl_c().await?;

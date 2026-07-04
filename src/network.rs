@@ -5,8 +5,9 @@ use crate::frame::{
     decode_frame_size, frame_meta, message_type_name, parse_exchange_public_peers,
     parse_tick_status_from_frame,
 };
-use crate::state::{NodeState, PeerPoolStats, RelayTarget};
-use crate::types::{TickStatus, format_epoch_tick, format_epoch_tick_packed, pack_epoch_tick};
+use crate::state::{DedupWindow, NodeState, PeerPoolStats, RelayTarget};
+use crate::types::{format_epoch_tick_packed, pack_epoch_tick};
+use bytes::{Bytes, BytesMut};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,18 +106,16 @@ struct ConnectionContext {
     peer_id: u64,
     remote: SocketAddrV4,
     state: Arc<Mutex<NodeState>>,
+    dedup: Arc<DedupWindow>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 }
 
-fn dispatch_frame(targets: Vec<RelayTarget>, frame: &Arc<[u8]>) -> DispatchResult {
+fn dispatch_frame(targets: Vec<RelayTarget>, frame: &Bytes) -> DispatchResult {
     let mut result = DispatchResult::default();
 
     for target in targets {
-        if result.sent_count == DISSEMINATION_MULTIPLIER {
-            break;
-        }
-        match target.tx.try_send(Arc::clone(frame)) {
+        match target.tx.try_send(frame.clone()) {
             Ok(()) => {
                 result.sent_count += 1;
             }
@@ -150,6 +149,7 @@ async fn disconnect_failed_targets(state: &Arc<Mutex<NodeState>>, result: &Dispa
 
 pub(crate) async fn broadcast_transaction_to_network(
     state: Arc<Mutex<NodeState>>,
+    dedup: Arc<DedupWindow>,
     tx_bytes: &[u8],
 ) -> Result<(), String> {
     if tx_bytes.is_empty() {
@@ -161,17 +161,17 @@ pub(crate) async fn broadcast_transaction_to_network(
 
     let targets = {
         let locked = state.lock().await;
-        let targets = locked.collect_all_targets();
+        let targets = locked.collect_all_targets(DISSEMINATION_MULTIPLIER);
         if targets.is_empty() {
             return Err("No connected peers available for broadcast".to_string());
         }
-        if locked.is_seen(&digest) {
+        if dedup.contains(&digest) {
             return Ok(());
         }
         targets
     };
 
-    let frame = Arc::<[u8]>::from(frame);
+    let frame = Bytes::from(frame);
     let result = dispatch_frame(targets, &frame);
     disconnect_failed_targets(&state, &result).await;
 
@@ -194,8 +194,7 @@ pub(crate) async fn broadcast_transaction_to_network(
         );
     }
 
-    let mut locked = state.lock().await;
-    let _ = locked.mark_seen(digest);
+    let _ = dedup.mark_seen(digest);
 
     Ok(())
 }
@@ -203,6 +202,7 @@ pub(crate) async fn broadcast_transaction_to_network(
 pub(crate) async fn accept_loop(
     listener: TcpListener,
     state: Arc<Mutex<NodeState>>,
+    dedup: Arc<DedupWindow>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
@@ -224,6 +224,7 @@ pub(crate) async fn accept_loop(
                 }
 
                 let connection_state = Arc::clone(&state);
+                let connection_dedup = Arc::clone(&dedup);
                 let connection_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
                 let connection_config = Arc::clone(&config);
                 tokio::spawn(async move {
@@ -232,6 +233,7 @@ pub(crate) async fn accept_loop(
                         remote_v4,
                         false,
                         connection_state,
+                        connection_dedup,
                         connection_latest_epoch_tick,
                         connection_config,
                     )
@@ -248,6 +250,7 @@ pub(crate) async fn accept_loop(
 
 pub(crate) async fn dial_loop(
     state: Arc<Mutex<NodeState>>,
+    dedup: Arc<DedupWindow>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
@@ -353,6 +356,7 @@ pub(crate) async fn dial_loop(
 
         for target in targets {
             let state_for_task = Arc::clone(&state);
+            let dedup_for_task = Arc::clone(&dedup);
             let latest_epoch_tick_for_task = Arc::clone(&latest_epoch_tick);
             let config_for_task = Arc::clone(&config);
             tokio::spawn(async move {
@@ -369,6 +373,7 @@ pub(crate) async fn dial_loop(
                             target,
                             true,
                             state_for_task,
+                            dedup_for_task,
                             latest_epoch_tick_for_task,
                             config_for_task,
                         )
@@ -398,12 +403,13 @@ async fn establish_connection(
     remote: SocketAddrV4,
     outbound: bool,
     state: Arc<Mutex<NodeState>>,
+    dedup: Arc<DedupWindow>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
-    let (tx, rx) = mpsc::channel::<Arc<[u8]>>(OUTBOUND_QUEUE_CAPACITY);
+    let (tx, rx) = mpsc::channel::<Bytes>(OUTBOUND_QUEUE_CAPACITY);
     let (disconnect_tx, disconnect_rx) = watch::channel(false);
-    let (peer_id, handshake_payload, incoming_count, outgoing_count, latest_tick) = {
+    let (peer_id, handshake_payload, incoming_count, outgoing_count) = {
         let mut locked = state.lock().await;
 
         if !outbound && locked.incoming_count() >= config.max_incoming {
@@ -431,11 +437,10 @@ async fn establish_connection(
             build_exchange_public_peers_frame(peers_for_handshake),
             locked.incoming_count(),
             locked.outgoing_count(),
-            locked.latest_tick(),
         )
     };
 
-    if tx.try_send(Arc::<[u8]>::from(handshake_payload)).is_err() {
+    if tx.try_send(Bytes::from(handshake_payload)).is_err() {
         eprintln!("Failed to queue handshake frame for {remote}");
     }
     println!(
@@ -444,7 +449,7 @@ async fn establish_connection(
         if outbound { "out" } else { "in" },
         incoming_count,
         outgoing_count,
-        format_epoch_tick(latest_tick)
+        format_epoch_tick_packed(latest_epoch_tick.load(Ordering::Relaxed))
     );
 
     tokio::spawn(connection_worker(
@@ -455,7 +460,8 @@ async fn establish_connection(
             peer_id,
             remote,
             state,
-            latest_epoch_tick,
+            dedup,
+            latest_epoch_tick: Arc::clone(&latest_epoch_tick),
             config,
         },
     ));
@@ -463,7 +469,7 @@ async fn establish_connection(
 
 async fn connection_worker(
     stream: TcpStream,
-    rx: mpsc::Receiver<Arc<[u8]>>,
+    rx: mpsc::Receiver<Bytes>,
     mut disconnect_rx: watch::Receiver<bool>,
     context: ConnectionContext,
 ) {
@@ -471,6 +477,7 @@ async fn connection_worker(
         peer_id,
         remote,
         state,
+        dedup,
         latest_epoch_tick,
         config,
     } = context;
@@ -489,7 +496,8 @@ async fn connection_worker(
             peer_id,
             remote,
             Arc::clone(&state),
-            latest_epoch_tick,
+            dedup,
+            Arc::clone(&latest_epoch_tick),
             config,
         );
         tokio::pin!(writer_future);
@@ -511,25 +519,21 @@ async fn connection_worker(
         }
     };
 
-    let (in_count, out_count, latest_tick) = {
+    let (in_count, out_count) = {
         let mut locked = state.lock().await;
         let _ = locked.unregister_session(peer_id);
-        (
-            locked.incoming_count(),
-            locked.outgoing_count(),
-            locked.latest_tick(),
-        )
+        (locked.incoming_count(), locked.outgoing_count())
     };
     eprintln!("Disconnecting {remote}: {disconnect_reason}");
     println!(
         "Disconnected {remote} | in={in_count} out={out_count} | {}",
-        format_epoch_tick(latest_tick)
+        format_epoch_tick_packed(latest_epoch_tick.load(Ordering::Relaxed))
     );
 }
 
 async fn write_peer_frames<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    mut rx: mpsc::Receiver<Arc<[u8]>>,
+    mut rx: mpsc::Receiver<Bytes>,
     remote: SocketAddrV4,
     traffic_log: bool,
     latest_epoch_tick: Arc<AtomicU64>,
@@ -568,37 +572,24 @@ async fn read_peer_frames(
     peer_id: u64,
     remote: SocketAddrV4,
     state: Arc<Mutex<NodeState>>,
+    dedup: Arc<DedupWindow>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) -> Result<(), String> {
-    let mut read_buffer = vec![0u8; READ_BUFFER_SIZE];
-    let mut accumulated = Vec::<u8>::with_capacity(ACCUMULATED_INITIAL_CAPACITY);
+    let mut accumulated = BytesMut::with_capacity(ACCUMULATED_INITIAL_CAPACITY);
 
     loop {
-        match reader.read(&mut read_buffer).await {
+        accumulated.reserve(READ_BUFFER_SIZE);
+        match reader.read_buf(&mut accumulated).await {
             Ok(0) => return Err("peer closed the connection".to_string()),
-            Ok(read_bytes) => {
-                accumulated.extend_from_slice(&read_buffer[..read_bytes]);
+            Ok(_) => {
                 if accumulated.len() > MAX_ACCUMULATED_BUFFER {
                     return Err(format!(
                         "buffered {} bytes without full parse (limit={MAX_ACCUMULATED_BUFFER})",
                         accumulated.len()
                     ));
                 }
-                let mut offset = 0usize;
-
-                while accumulated.len().saturating_sub(offset) >= HEADER_SIZE {
-                    let frame_size = decode_frame_size(&accumulated[offset..offset + HEADER_SIZE]);
-                    if !(HEADER_SIZE..=MAX_FRAME_SIZE).contains(&frame_size) {
-                        return Err(format!("invalid frame size {frame_size}"));
-                    }
-                    if accumulated.len() - offset < frame_size {
-                        break;
-                    }
-                    let end = offset + frame_size;
-                    let frame = accumulated[offset..end].to_vec();
-                    offset = end;
-
+                while let Some(frame) = extract_frame(&mut accumulated)? {
                     if config.traffic_log {
                         let (size, message_type, dejavu) = frame_meta(&frame);
                         let packed = latest_epoch_tick.load(Ordering::Relaxed);
@@ -618,20 +609,19 @@ async fn read_peer_frames(
                         peer_id,
                         frame,
                         Arc::clone(&state),
+                        Arc::clone(&dedup),
                         Arc::clone(&latest_epoch_tick),
                         Arc::clone(&config),
                     )
                     .await;
                 }
 
-                if offset > 0 {
-                    accumulated.drain(0..offset);
-                }
-
                 if accumulated.capacity() > ACCUMULATED_SHRINK_THRESHOLD
                     && accumulated.len() < ACCUMULATED_RETAIN_CAPACITY
                 {
-                    accumulated.shrink_to(ACCUMULATED_RETAIN_CAPACITY);
+                    let mut compacted = BytesMut::with_capacity(ACCUMULATED_RETAIN_CAPACITY);
+                    compacted.extend_from_slice(&accumulated);
+                    accumulated = compacted;
                 }
             }
             Err(err) => {
@@ -641,10 +631,25 @@ async fn read_peer_frames(
     }
 }
 
+fn extract_frame(accumulated: &mut BytesMut) -> Result<Option<Bytes>, String> {
+    if accumulated.len() < HEADER_SIZE {
+        return Ok(None);
+    }
+    let frame_size = decode_frame_size(&accumulated[..HEADER_SIZE]);
+    if !(HEADER_SIZE..=MAX_FRAME_SIZE).contains(&frame_size) {
+        return Err(format!("invalid frame size {frame_size}"));
+    }
+    if accumulated.len() < frame_size {
+        return Ok(None);
+    }
+    Ok(Some(accumulated.split_to(frame_size).freeze()))
+}
+
 async fn process_incoming_frame(
     source_peer_id: u64,
-    frame: Vec<u8>,
+    frame: Bytes,
     state: Arc<Mutex<NodeState>>,
+    dedup: Arc<DedupWindow>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
@@ -655,48 +660,42 @@ async fn process_incoming_frame(
     let message_type = frame[3];
     let dejavu = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
 
-    let discovered = if message_type == EXCHANGE_PUBLIC_PEERS_TYPE {
-        parse_exchange_public_peers(&frame, config.peer_port)
-    } else {
-        Vec::new()
-    };
     let tick_update = parse_tick_status_from_frame(&frame);
     if let Some(status) = tick_update {
-        latest_epoch_tick.store(
-            pack_epoch_tick(status.epoch, status.tick),
-            Ordering::Relaxed,
-        );
+        update_latest_epoch_tick(&latest_epoch_tick, status.epoch, status.tick);
     }
 
     if !config.relay_all && dejavu != 0 {
-        let mut locked = state.lock().await;
-        update_state_without_relay(&mut locked, tick_update, discovered);
+        if message_type == EXCHANGE_PUBLIC_PEERS_TYPE {
+            update_discovered_peers(&state, &frame, config.peer_port).await;
+        }
         return;
     }
 
     let digest = *blake3::hash(&frame).as_bytes();
-    let (targets, latest_tick) = {
-        let mut locked = state.lock().await;
-        update_state_without_relay(&mut locked, tick_update, discovered);
-        if !locked.mark_seen(digest) {
-            if config.traffic_log {
-                let (size, message_type, dejavu) = frame_meta(&frame);
-                println!(
-                    "DROP_DUP peer_id={} size={} type={}({}) dejavu={} | {}",
-                    source_peer_id,
-                    size,
-                    message_type_name(message_type),
-                    message_type,
-                    dejavu,
-                    format_epoch_tick(locked.latest_tick())
-                );
-            }
-            return;
+    if !dedup.mark_seen(digest) {
+        if config.traffic_log {
+            let (size, message_type, dejavu) = frame_meta(&frame);
+            println!(
+                "DROP_DUP peer_id={} size={} type={}({}) dejavu={} | {}",
+                source_peer_id,
+                size,
+                message_type_name(message_type),
+                message_type,
+                dejavu,
+                format_epoch_tick_packed(latest_epoch_tick.load(Ordering::Relaxed))
+            );
         }
-        (locked.collect_targets(source_peer_id), locked.latest_tick())
-    };
+        return;
+    }
 
-    let frame = Arc::<[u8]>::from(frame);
+    let mut locked = state.lock().await;
+    if message_type == EXCHANGE_PUBLIC_PEERS_TYPE {
+        add_discovered_peers(&mut locked, &frame, config.peer_port);
+    }
+    let targets = locked.collect_targets(source_peer_id, DISSEMINATION_MULTIPLIER);
+    drop(locked);
+
     let result = dispatch_frame(targets, &frame);
     disconnect_failed_targets(&state, &result).await;
 
@@ -710,7 +709,7 @@ async fn process_incoming_frame(
             message_type_name(message_type),
             message_type,
             dejavu,
-            format_epoch_tick(latest_tick)
+            format_epoch_tick_packed(latest_epoch_tick.load(Ordering::Relaxed))
         );
         if !result.full_peer_ids.is_empty() {
             println!(
@@ -726,15 +725,20 @@ async fn process_incoming_frame(
     }
 }
 
-fn update_state_without_relay(
-    locked: &mut NodeState,
-    tick_update: Option<TickStatus>,
-    discovered: Vec<SocketAddrV4>,
-) {
-    if let Some(status) = tick_update {
-        locked.update_latest_tick(status);
-    }
-    for peer in discovered {
+fn update_latest_epoch_tick(latest: &AtomicU64, epoch: u16, tick: u32) {
+    let candidate = pack_epoch_tick(epoch, tick);
+    let _ = latest.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        (candidate >= current).then_some(candidate)
+    });
+}
+
+async fn update_discovered_peers(state: &Arc<Mutex<NodeState>>, frame: &[u8], peer_port: u16) {
+    let mut locked = state.lock().await;
+    add_discovered_peers(&mut locked, frame, peer_port);
+}
+
+fn add_discovered_peers(locked: &mut NodeState, frame: &[u8], peer_port: u16) {
+    for peer in parse_exchange_public_peers(frame, peer_port) {
         let _ = locked.add_discovered_peer(peer);
     }
 }
@@ -743,6 +747,7 @@ fn update_state_without_relay(
 mod tests {
     use super::*;
     use crate::config::{Config, DEFAULT_GRPC_PORT, DEFAULT_PORT};
+    use crate::frame::REQUEST_ENTITY_TYPE;
     use pretty_assertions::assert_eq;
     use std::net::{Ipv4Addr, SocketAddr};
 
@@ -777,8 +782,140 @@ mod tests {
     }
 
     #[test]
+    fn frame_extraction_waits_for_partial_header_and_payload() {
+        let expected = build_request_frame(REQUEST_ENTITY_TYPE, 7, &[1, 2, 3, 4])
+            .expect("test frame should build");
+        let mut buffered = BytesMut::new();
+        buffered.extend_from_slice(&expected[..4]);
+        assert_eq!(extract_frame(&mut buffered), Ok(None));
+
+        buffered.extend_from_slice(&expected[4..10]);
+        assert_eq!(extract_frame(&mut buffered), Ok(None));
+
+        buffered.extend_from_slice(&expected[10..]);
+        assert_eq!(
+            extract_frame(&mut buffered),
+            Ok(Some(Bytes::from(expected)))
+        );
+        assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn frame_extraction_returns_multiple_frames_from_one_read() {
+        let first = build_request_frame(REQUEST_ENTITY_TYPE, 1, &[1])
+            .expect("first test frame should build");
+        let second = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &[2, 3])
+            .expect("second test frame should build");
+        let mut buffered =
+            BytesMut::from([first.as_slice(), second.as_slice()].concat().as_slice());
+
+        assert_eq!(extract_frame(&mut buffered), Ok(Some(Bytes::from(first))));
+        assert_eq!(extract_frame(&mut buffered), Ok(Some(Bytes::from(second))));
+        assert_eq!(extract_frame(&mut buffered), Ok(None));
+    }
+
+    #[test]
+    fn frame_extraction_accepts_maximum_frame_size() {
+        let mut buffered = BytesMut::zeroed(MAX_FRAME_SIZE);
+        buffered[..3].copy_from_slice(&[0xff, 0xff, 0xff]);
+
+        let frame = extract_frame(&mut buffered)
+            .expect("maximum frame should be valid")
+            .expect("maximum frame should be complete");
+
+        assert_eq!(frame.len(), MAX_FRAME_SIZE);
+        assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn frame_extraction_rejects_size_smaller_than_header() {
+        let mut buffered = BytesMut::from(&[7, 0, 0, 0, 0, 0, 0, 0][..]);
+
+        assert_eq!(
+            extract_frame(&mut buffered),
+            Err("invalid frame size 7".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_non_relay_frame_does_not_wait_for_state_lock() {
+        let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
+        let _guard = state.lock().await;
+        let frame = Bytes::from(
+            build_request_frame(REQUEST_ENTITY_TYPE, 1, &[]).expect("test frame should build"),
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            process_incoming_frame(
+                1,
+                frame,
+                Arc::clone(&state),
+                Arc::new(DedupWindow::new(1_000)),
+                Arc::new(AtomicU64::new(0)),
+                test_config(),
+            ),
+        )
+        .await
+        .expect("unrelated response must not wait for NodeState");
+    }
+
+    #[tokio::test]
+    async fn non_relay_tick_updates_atomic_cache_without_state_lock() {
+        let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
+        let _guard = state.lock().await;
+        let latest = Arc::new(AtomicU64::new(0));
+        let mut payload = [0; 8];
+        payload[2..4].copy_from_slice(&7u16.to_le_bytes());
+        payload[4..8].copy_from_slice(&123u32.to_le_bytes());
+        let frame = Bytes::from(
+            build_request_frame(crate::frame::BROADCAST_TICK_TYPE, 1, &payload)
+                .expect("tick frame should build"),
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            process_incoming_frame(
+                1,
+                frame,
+                Arc::clone(&state),
+                Arc::new(DedupWindow::new(1_000)),
+                Arc::clone(&latest),
+                test_config(),
+            ),
+        )
+        .await
+        .expect("tick response must not wait for NodeState");
+
+        assert_eq!(latest.load(Ordering::Relaxed), pack_epoch_tick(7, 123));
+    }
+
+    #[tokio::test]
+    async fn peer_exchange_updates_known_peer_state() {
+        let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
+        let frame = Bytes::from(build_exchange_public_peers_frame([
+            Ipv4Addr::new(1, 1, 1, 1),
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::UNSPECIFIED,
+        ]));
+
+        process_incoming_frame(
+            1,
+            frame,
+            Arc::clone(&state),
+            Arc::new(DedupWindow::new(1_000)),
+            Arc::new(AtomicU64::new(0)),
+            test_config(),
+        )
+        .await;
+
+        assert_eq!(state.lock().await.pool_stats(Instant::now()).known, 1);
+    }
+
+    #[test]
     fn incoming_connections_do_not_suppress_emergency_dns() {
-        let mut state = NodeState::new(1_000, 10, &[]);
+        let mut state = NodeState::new(10, &[]);
         let (tx, _rx) = mpsc::channel(1);
         let (disconnect_tx, _disconnect_rx) = watch::channel(false);
         state
@@ -794,7 +931,7 @@ mod tests {
     fn empty_and_duplicate_dns_results_back_off_but_new_peer_recovers() {
         let existing = peer(2);
         let discovered = peer(3);
-        let mut state = NodeState::new(1_000, 10, &[existing]);
+        let mut state = NodeState::new(10, &[existing]);
         let mut attempt = 0;
 
         assert_eq!(
@@ -850,7 +987,7 @@ mod tests {
         );
 
         let remote = peer(10);
-        let state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
+        let state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
         let (tx, rx) = mpsc::channel(1);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
         let peer_id = state
@@ -866,6 +1003,7 @@ mod tests {
                 peer_id,
                 remote,
                 state: Arc::clone(&state),
+                dedup: Arc::new(DedupWindow::new(1_000)),
                 latest_epoch_tick: Arc::new(AtomicU64::new(0)),
                 config: test_config(),
             },
@@ -901,7 +1039,7 @@ mod tests {
     async fn stalled_peer_write_times_out() {
         let (mut writer, _reader) = tokio::io::duplex(1);
         let (tx, rx) = mpsc::channel(1);
-        tx.send(Arc::<[u8]>::from(vec![0; 1_024]))
+        tx.send(Bytes::from(vec![0; 1_024]))
             .await
             .expect("test frame should queue");
 
@@ -940,7 +1078,7 @@ mod tests {
         );
 
         let remote = peer(12);
-        let state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
+        let state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
         let (tx, rx) = mpsc::channel(1);
         let (disconnect_tx, disconnect_rx) = watch::channel(false);
         let peer_id = state
@@ -956,6 +1094,7 @@ mod tests {
                 peer_id,
                 remote,
                 state: Arc::clone(&state),
+                dedup: Arc::new(DedupWindow::new(1_000)),
                 latest_epoch_tick: Arc::new(AtomicU64::new(0)),
                 config: test_config(),
             },

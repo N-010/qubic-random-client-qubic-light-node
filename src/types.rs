@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::state::NodeState;
+use crate::state::{DedupWindow, NodeState};
 use serde::Serialize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -13,13 +13,6 @@ pub(crate) struct TickStatus {
     pub(crate) tick_duration_ms: u16,
     pub(crate) aligned_votes: u16,
     pub(crate) misaligned_votes: u16,
-}
-
-pub(crate) fn format_epoch_tick(status: Option<TickStatus>) -> String {
-    match status {
-        Some(status) => format!("epoch={} tick={}", status.epoch, status.tick),
-        None => "epoch=? tick=?".to_string(),
-    }
 }
 
 pub(crate) fn pack_epoch_tick(epoch: u16, tick: u32) -> u64 {
@@ -55,6 +48,7 @@ pub(crate) fn tick_status_from_packed(packed: u64) -> Option<TickStatus> {
 #[derive(Clone)]
 pub(crate) struct ApiState {
     pub(crate) node_state: Arc<Mutex<NodeState>>,
+    pub(crate) dedup: Arc<DedupWindow>,
     pub(crate) latest_epoch_tick: Arc<AtomicU64>,
     pub(crate) config: Arc<Config>,
 }
