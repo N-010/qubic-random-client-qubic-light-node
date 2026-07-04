@@ -1,9 +1,9 @@
 use crate::frame::is_bogon;
-use crate::types::TickStatus;
-use rand::seq::SliceRandom;
+use bytes::Bytes;
+use rand::seq::{IteratorRandom, SliceRandom};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
@@ -28,14 +28,14 @@ pub(crate) struct PeerPoolStats {
 #[derive(Clone, Debug)]
 pub(crate) struct RelayTarget {
     pub(crate) peer_id: u64,
-    pub(crate) tx: mpsc::Sender<Arc<[u8]>>,
+    pub(crate) tx: mpsc::Sender<Bytes>,
 }
 
 #[derive(Clone, Debug)]
 struct Session {
     remote: SocketAddrV4,
     outbound: bool,
-    tx: mpsc::Sender<Arc<[u8]>>,
+    tx: mpsc::Sender<Bytes>,
     disconnect_tx: watch::Sender<bool>,
 }
 
@@ -48,20 +48,12 @@ pub(crate) struct NodeState {
     seed_peers: HashSet<SocketAddrV4>,
     peer_health: HashMap<SocketAddrV4, PeerHealth>,
     pending_dials: HashSet<SocketAddrV4>,
-    seen_order: VecDeque<[u8; 32]>,
-    seen_set: HashSet<[u8; 32]>,
-    latest_tick: Option<TickStatus>,
-    max_seen: usize,
     max_known_peers: usize,
     next_peer_id: u64,
 }
 
 impl NodeState {
-    pub(crate) fn new(
-        max_seen: usize,
-        max_known_peers: usize,
-        seed_peers: &[SocketAddrV4],
-    ) -> Self {
+    pub(crate) fn new(max_known_peers: usize, seed_peers: &[SocketAddrV4]) -> Self {
         let mut node_state = Self {
             sessions: HashMap::new(),
             connected_ip_refcount: HashMap::new(),
@@ -70,10 +62,6 @@ impl NodeState {
             seed_peers: seed_peers.iter().copied().collect(),
             peer_health: HashMap::new(),
             pending_dials: HashSet::new(),
-            seen_order: VecDeque::new(),
-            seen_set: HashSet::new(),
-            latest_tick: None,
-            max_seen: max_seen.max(1_000),
             max_known_peers,
             next_peer_id: 1,
         };
@@ -99,7 +87,7 @@ impl NodeState {
         &mut self,
         remote: SocketAddrV4,
         outbound: bool,
-        tx: mpsc::Sender<Arc<[u8]>>,
+        tx: mpsc::Sender<Bytes>,
         disconnect_tx: watch::Sender<bool>,
         peer_port: u16,
     ) -> Option<u64> {
@@ -154,28 +142,8 @@ impl NodeState {
         Some(remote)
     }
 
-    pub(crate) fn is_seen(&self, digest: &[u8; 32]) -> bool {
-        self.seen_set.contains(digest)
-    }
-
-    pub(crate) fn mark_seen(&mut self, digest: [u8; 32]) -> bool {
-        if self.seen_set.contains(&digest) {
-            return false;
-        }
-        self.seen_set.insert(digest);
-        self.seen_order.push_back(digest);
-
-        while self.seen_order.len() > self.max_seen {
-            if let Some(old) = self.seen_order.pop_front() {
-                self.seen_set.remove(&old);
-            }
-        }
-        true
-    }
-
-    pub(crate) fn collect_targets(&self, source_peer_id: u64) -> Vec<RelayTarget> {
-        let mut targets = self
-            .sessions
+    pub(crate) fn collect_targets(&self, source_peer_id: u64, limit: usize) -> Vec<RelayTarget> {
+        self.sessions
             .iter()
             .filter_map(|(peer_id, session)| {
                 if *peer_id == source_peer_id {
@@ -187,22 +155,17 @@ impl NodeState {
                     })
                 }
             })
-            .collect::<Vec<_>>();
-        targets.shuffle(&mut rand::rng());
-        targets
+            .choose_multiple(&mut rand::rng(), limit)
     }
 
-    pub(crate) fn collect_all_targets(&self) -> Vec<RelayTarget> {
-        let mut targets = self
-            .sessions
+    pub(crate) fn collect_all_targets(&self, limit: usize) -> Vec<RelayTarget> {
+        self.sessions
             .iter()
             .map(|(peer_id, session)| RelayTarget {
                 peer_id: *peer_id,
                 tx: session.tx.clone(),
             })
-            .collect::<Vec<_>>();
-        targets.shuffle(&mut rand::rng());
-        targets
+            .choose_multiple(&mut rand::rng(), limit)
     }
 
     pub(crate) fn add_discovered_peer(&mut self, peer: SocketAddrV4) -> bool {
@@ -339,28 +302,6 @@ impl NodeState {
         selected
     }
 
-    pub(crate) fn update_latest_tick(&mut self, tick_status: TickStatus) {
-        if let Some(current) = self.latest_tick {
-            let is_newer_epoch = tick_status.epoch > current.epoch;
-            let is_same_epoch_newer_tick =
-                tick_status.epoch == current.epoch && tick_status.tick >= current.tick;
-            let enrich_same_tick = tick_status.epoch == current.epoch
-                && tick_status.tick == current.tick
-                && tick_status.initial_tick != 0
-                && current.initial_tick == 0;
-
-            if is_newer_epoch || is_same_epoch_newer_tick || enrich_same_tick {
-                self.latest_tick = Some(tick_status);
-            }
-        } else {
-            self.latest_tick = Some(tick_status);
-        }
-    }
-
-    pub(crate) fn latest_tick(&self) -> Option<TickStatus> {
-        self.latest_tick
-    }
-
     pub(crate) fn peer_candidates(&self, peer_port: u16) -> Vec<SocketAddrV4> {
         let now = Instant::now();
         let mut peers = HashSet::<SocketAddrV4>::new();
@@ -415,6 +356,57 @@ impl NodeState {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct DedupWindow {
+    inner: Mutex<DedupState>,
+}
+
+#[derive(Debug)]
+struct DedupState {
+    order: VecDeque<[u8; 32]>,
+    set: HashSet<[u8; 32]>,
+    max_seen: usize,
+}
+
+impl DedupWindow {
+    pub(crate) fn new(max_seen: usize) -> Self {
+        Self {
+            inner: Mutex::new(DedupState {
+                order: VecDeque::new(),
+                set: HashSet::new(),
+                max_seen: max_seen.max(1_000),
+            }),
+        }
+    }
+
+    pub(crate) fn contains(&self, digest: &[u8; 32]) -> bool {
+        self.inner
+            .lock()
+            .expect("dedup mutex should not be poisoned")
+            .set
+            .contains(digest)
+    }
+
+    pub(crate) fn mark_seen(&self, digest: [u8; 32]) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("dedup mutex should not be poisoned");
+        if inner.set.contains(&digest) {
+            return false;
+        }
+        inner.set.insert(digest);
+        inner.order.push_back(digest);
+
+        while inner.order.len() > inner.max_seen {
+            if let Some(old) = inner.order.pop_front() {
+                inner.set.remove(&old);
+            }
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,7 +419,7 @@ mod tests {
 
     #[test]
     fn relay_targets_exclude_source_peer() {
-        let mut state = NodeState::new(1_000, 1_000, &[]);
+        let mut state = NodeState::new(1_000, &[]);
         let mut peer_ids = Vec::new();
 
         for last_octet in 1..=3 {
@@ -442,7 +434,7 @@ mod tests {
 
         let source_peer_id = peer_ids[1];
         let mut target_peer_ids = state
-            .collect_targets(source_peer_id)
+            .collect_targets(source_peer_id, 6)
             .into_iter()
             .map(|target| target.peer_id)
             .collect::<Vec<_>>();
@@ -453,9 +445,69 @@ mod tests {
     }
 
     #[test]
+    fn relay_targets_are_limited_to_six() {
+        let mut state = NodeState::new(1_000, &[]);
+        for last_octet in 1..=8 {
+            let (tx, _rx) = mpsc::channel(1);
+            let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+            state
+                .register_session(
+                    peer(1, 1, 1, last_octet),
+                    true,
+                    tx,
+                    disconnect_tx,
+                    DEFAULT_PORT,
+                )
+                .expect("test peer should be registered");
+        }
+
+        assert_eq!(state.collect_all_targets(6).len(), 6);
+    }
+
+    #[test]
+    fn relay_targets_include_every_available_peer_below_limit() {
+        let mut state = NodeState::new(1_000, &[]);
+        for last_octet in 1..=3 {
+            let (tx, _rx) = mpsc::channel(1);
+            let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+            state
+                .register_session(
+                    peer(1, 1, 1, last_octet),
+                    true,
+                    tx,
+                    disconnect_tx,
+                    DEFAULT_PORT,
+                )
+                .expect("test peer should be registered");
+        }
+
+        assert_eq!(state.collect_all_targets(6).len(), 3);
+    }
+
+    #[test]
+    fn dedup_window_evicts_entries_in_fifo_order() {
+        let dedup = DedupWindow::new(1_000);
+        for value in 0..1_000u32 {
+            let mut digest = [0; 32];
+            digest[..4].copy_from_slice(&value.to_le_bytes());
+            assert!(dedup.mark_seen(digest));
+        }
+        let first = [0; 32];
+        assert!(dedup.contains(&first));
+
+        let mut newest = [0; 32];
+        newest[..4].copy_from_slice(&1_000u32.to_le_bytes());
+        assert!(dedup.mark_seen(newest));
+
+        assert!(!dedup.contains(&first));
+        assert!(dedup.contains(&newest));
+        assert!(!dedup.mark_seen(newest));
+    }
+
+    #[test]
     fn failed_peer_is_unavailable_until_cooldown_expires() {
         let target = peer(1, 1, 1, 1);
-        let mut state = NodeState::new(1_000, 10, &[target]);
+        let mut state = NodeState::new(10, &[target]);
         let now = Instant::now();
 
         state.record_peer_failure(target, Duration::from_secs(2), now);
@@ -473,7 +525,7 @@ mod tests {
     #[test]
     fn peer_cooldown_grows_to_maximum_and_success_resets_it() {
         let target = peer(1, 1, 1, 2);
-        let mut state = NodeState::new(1_000, 10, &[target]);
+        let mut state = NodeState::new(10, &[target]);
         let now = Instant::now();
 
         state.record_peer_failure(target, Duration::from_secs(200), now);
@@ -497,7 +549,7 @@ mod tests {
         let pending = peer(1, 1, 1, 5);
         let evictable = peer(1, 1, 1, 6);
         let replacement = peer(1, 1, 1, 7);
-        let mut state = NodeState::new(1_000, 4, &[seed]);
+        let mut state = NodeState::new(4, &[seed]);
         let (tx, _rx) = mpsc::channel(1);
         let (disconnect_tx, _disconnect_rx) = watch::channel(false);
         state.add_discovered_peer(active);
@@ -519,7 +571,7 @@ mod tests {
 
     #[test]
     fn configured_known_peer_limit_is_enforced() {
-        let mut state = NodeState::new(1_000, 500, &[]);
+        let mut state = NodeState::new(500, &[]);
         for index in 0..600u16 {
             state.add_discovered_peer(peer(11, (index / 256) as u8, (index % 256) as u8, 1));
         }

@@ -158,7 +158,13 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
         }
 
         let tx_id = tx_id_from_bytes(&tx_bytes);
-        match broadcast_transaction_to_network(Arc::clone(&self.api.node_state), &tx_bytes).await {
+        match broadcast_transaction_to_network(
+            Arc::clone(&self.api.node_state),
+            Arc::clone(&self.api.dedup),
+            &tx_bytes,
+        )
+        .await
+        {
             Ok(_) => Ok(Response::new(lightnodepb::BroadcastTransactionResponse {
                 ok: true,
                 tx_id,
@@ -226,6 +232,7 @@ mod tests {
     use crate::frame::{BROADCAST_TRANSACTION_TYPE, build_request_frame};
     use crate::lightnodepb::light_node_server::LightNode;
     use crate::state::NodeState;
+    use bytes::Bytes;
     use pretty_assertions::assert_eq;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::atomic::AtomicU64;
@@ -262,6 +269,7 @@ mod tests {
         GrpcService {
             api: ApiState {
                 node_state,
+                dedup: Arc::new(crate::state::DedupWindow::new(1_000)),
                 latest_epoch_tick: Arc::new(AtomicU64::new(0)),
                 config: test_config(),
             },
@@ -271,8 +279,8 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_transaction_success() {
-        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
-        let (peer_tx, mut peer_rx) = mpsc::channel::<Arc<[u8]>>(1);
+        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
+        let (peer_tx, mut peer_rx) = mpsc::channel::<Bytes>(1);
         {
             let mut locked = node_state.lock().await;
             let peer = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DEFAULT_PORT);
@@ -312,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_transaction_empty_payload() {
-        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[]))));
+        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
         let request = Request::new(lightnodepb::BroadcastTransactionRequest {
             tx_bytes: Vec::new(),
         });
@@ -334,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn fifth_peer_backed_request_is_rejected_without_blocking_other_methods() {
-        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[]))));
+        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
         let permits = (0..MAX_CONCURRENT_PEER_QUERIES)
             .map(|_| {
                 service
@@ -383,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_status_does_not_wait_for_node_state_lock() {
-        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
+        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
         let mut service = test_service(Arc::clone(&node_state));
         service.api.latest_epoch_tick =
             Arc::new(AtomicU64::new(crate::types::pack_epoch_tick(7, 123)));
@@ -403,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_transaction_no_peers_maps_to_error_response() {
-        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[]))));
+        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
         let request = Request::new(lightnodepb::BroadcastTransactionRequest {
             tx_bytes: vec![7, 8, 9],
         });
@@ -425,12 +433,12 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_transaction_sends_to_at_most_six_peers() {
-        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
+        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
         let mut peer_receivers = Vec::new();
         {
             let mut locked = node_state.lock().await;
             for last_octet in 1..=8 {
-                let (peer_tx, peer_rx) = mpsc::channel::<Arc<[u8]>>(1);
+                let (peer_tx, peer_rx) = mpsc::channel::<Bytes>(1);
                 let (disconnect_tx, _disconnect_rx) = watch::channel(false);
                 let peer = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, last_octet), DEFAULT_PORT);
                 let registered =
@@ -460,10 +468,10 @@ mod tests {
 
     #[tokio::test]
     async fn failed_broadcast_can_be_retried_after_full_peer_is_disconnected() {
-        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, 1_000, &[])));
-        let (full_peer_tx, _full_peer_rx) = mpsc::channel::<Arc<[u8]>>(1);
+        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
+        let (full_peer_tx, _full_peer_rx) = mpsc::channel::<Bytes>(1);
         full_peer_tx
-            .try_send(Arc::<[u8]>::from([0]))
+            .try_send(Bytes::from_static(&[0]))
             .expect("test peer queue should accept its first frame");
         let (disconnect_tx, mut disconnect_rx) = watch::channel(false);
         {
@@ -502,7 +510,7 @@ mod tests {
         assert_eq!(*disconnect_rx.borrow(), true);
         assert_eq!(node_state.lock().await.outgoing_count(), 0);
 
-        let (replacement_tx, mut replacement_rx) = mpsc::channel::<Arc<[u8]>>(1);
+        let (replacement_tx, mut replacement_rx) = mpsc::channel::<Bytes>(1);
         let (replacement_disconnect_tx, _replacement_disconnect_rx) = watch::channel(false);
         {
             let mut locked = node_state.lock().await;
