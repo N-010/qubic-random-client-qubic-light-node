@@ -18,7 +18,7 @@ pub(crate) struct GrpcService {
     peer_query_slots: Arc<Semaphore>,
 }
 
-const MAX_CONCURRENT_PEER_QUERIES: usize = 4;
+const MAX_CONCURRENT_PEER_QUERIES: usize = 64;
 const PEER_QUERY_OVERLOADED_ERROR: &str =
     "Peer-backed API is overloaded; retry after an in-flight query completes";
 
@@ -87,6 +87,7 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
 
         match query_balance(
             Arc::clone(&self.api.node_state),
+            Arc::clone(&self.api.pending_requests),
             Arc::clone(&self.api.config),
             &wallet,
             public_key,
@@ -121,6 +122,7 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
         };
         match query_tick_transactions(
             Arc::clone(&self.api.node_state),
+            Arc::clone(&self.api.pending_requests),
             Arc::clone(&self.api.config),
             tick,
         )
@@ -271,6 +273,7 @@ mod tests {
                 node_state,
                 dedup: Arc::new(crate::state::DedupWindow::new(1_000)),
                 latest_epoch_tick: Arc::new(AtomicU64::new(0)),
+                pending_requests: Arc::new(crate::pending::PendingRequests::default()),
                 config: test_config(),
             },
             peer_query_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_QUERIES)),
@@ -341,7 +344,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fifth_peer_backed_request_is_rejected_without_blocking_other_methods() {
+    async fn sixty_fifth_peer_backed_request_is_rejected_without_blocking_other_methods() {
         let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
         let permits = (0..MAX_CONCURRENT_PEER_QUERIES)
             .map(|_| {
@@ -387,6 +390,17 @@ mod tests {
         assert_eq!(broadcast.error, "Transaction payload is empty");
 
         drop(permits);
+    }
+
+    #[test]
+    fn fifteen_peer_backed_requests_fit_within_limit() {
+        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
+        let permits = (0..15)
+            .map(|_| service.try_acquire_peer_query_slot())
+            .collect::<Vec<_>>();
+
+        assert!(permits.iter().all(Option::is_some));
+        assert_eq!(service.peer_query_slots.available_permits(), 49);
     }
 
     #[tokio::test]

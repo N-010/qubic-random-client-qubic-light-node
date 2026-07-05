@@ -19,6 +19,7 @@ mod grpc_api;
 mod logging;
 mod network;
 mod peer_api;
+mod pending;
 mod state;
 mod types;
 

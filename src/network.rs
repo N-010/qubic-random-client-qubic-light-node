@@ -5,6 +5,7 @@ use crate::frame::{
     decode_frame_size, frame_meta, message_type_name, parse_exchange_public_peers,
     parse_tick_status_from_frame,
 };
+use crate::pending::PendingRequests;
 use crate::state::{DedupWindow, NodeState, PeerPoolStats, RelayTarget};
 use crate::types::{format_epoch_tick_packed, pack_epoch_tick};
 use bytes::{Bytes, BytesMut};
@@ -102,13 +103,19 @@ struct DispatchResult {
     closed_peer_ids: Vec<u64>,
 }
 
+#[derive(Clone)]
+struct NetworkResources {
+    state: Arc<Mutex<NodeState>>,
+    dedup: Arc<DedupWindow>,
+    pending: Arc<PendingRequests>,
+    latest_epoch_tick: Arc<AtomicU64>,
+    config: Arc<Config>,
+}
+
 struct ConnectionContext {
     peer_id: u64,
     remote: SocketAddrV4,
-    state: Arc<Mutex<NodeState>>,
-    dedup: Arc<DedupWindow>,
-    latest_epoch_tick: Arc<AtomicU64>,
-    config: Arc<Config>,
+    resources: NetworkResources,
 }
 
 fn dispatch_frame(targets: Vec<RelayTarget>, frame: &Bytes) -> DispatchResult {
@@ -203,9 +210,17 @@ pub(crate) async fn accept_loop(
     listener: TcpListener,
     state: Arc<Mutex<NodeState>>,
     dedup: Arc<DedupWindow>,
+    pending: Arc<PendingRequests>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
+    let resources = NetworkResources {
+        state: Arc::clone(&state),
+        dedup: Arc::clone(&dedup),
+        pending: Arc::clone(&pending),
+        latest_epoch_tick: Arc::clone(&latest_epoch_tick),
+        config: Arc::clone(&config),
+    };
     loop {
         match listener.accept().await {
             Ok((stream, remote_addr)) => {
@@ -223,21 +238,9 @@ pub(crate) async fn accept_loop(
                     eprintln!("Failed to set TCP keepalive for {remote_v4}: {err}");
                 }
 
-                let connection_state = Arc::clone(&state);
-                let connection_dedup = Arc::clone(&dedup);
-                let connection_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
-                let connection_config = Arc::clone(&config);
+                let connection_resources = resources.clone();
                 tokio::spawn(async move {
-                    establish_connection(
-                        stream,
-                        remote_v4,
-                        false,
-                        connection_state,
-                        connection_dedup,
-                        connection_latest_epoch_tick,
-                        connection_config,
-                    )
-                    .await;
+                    establish_connection(stream, remote_v4, false, connection_resources).await;
                 });
             }
             Err(err) => {
@@ -251,9 +254,17 @@ pub(crate) async fn accept_loop(
 pub(crate) async fn dial_loop(
     state: Arc<Mutex<NodeState>>,
     dedup: Arc<DedupWindow>,
+    pending: Arc<PendingRequests>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
+    let resources = NetworkResources {
+        state: Arc::clone(&state),
+        dedup: Arc::clone(&dedup),
+        pending: Arc::clone(&pending),
+        latest_epoch_tick: Arc::clone(&latest_epoch_tick),
+        config: Arc::clone(&config),
+    };
     let mut emergency_dns_attempt = 0u32;
     let mut last_emergency_dns = Instant::now()
         .checked_sub(Duration::from_secs(3600))
@@ -355,10 +366,7 @@ pub(crate) async fn dial_loop(
         }
 
         for target in targets {
-            let state_for_task = Arc::clone(&state);
-            let dedup_for_task = Arc::clone(&dedup);
-            let latest_epoch_tick_for_task = Arc::clone(&latest_epoch_tick);
-            let config_for_task = Arc::clone(&config);
+            let resources_for_task = resources.clone();
             tokio::spawn(async move {
                 match TcpStream::connect(target).await {
                     Ok(stream) => {
@@ -368,23 +376,14 @@ pub(crate) async fn dial_loop(
                         if let Err(err) = configure_tcp_keepalive(&stream) {
                             eprintln!("Failed to set TCP keepalive for {target}: {err}");
                         }
-                        establish_connection(
-                            stream,
-                            target,
-                            true,
-                            state_for_task,
-                            dedup_for_task,
-                            latest_epoch_tick_for_task,
-                            config_for_task,
-                        )
-                        .await;
+                        establish_connection(stream, target, true, resources_for_task).await;
                     }
                     Err(err) => {
                         {
-                            let mut locked = state_for_task.lock().await;
+                            let mut locked = resources_for_task.state.lock().await;
                             locked.record_peer_failure(
                                 target,
-                                config_for_task.reconnect_interval,
+                                resources_for_task.config.reconnect_interval,
                                 Instant::now(),
                             );
                         }
@@ -402,20 +401,17 @@ async fn establish_connection(
     stream: TcpStream,
     remote: SocketAddrV4,
     outbound: bool,
-    state: Arc<Mutex<NodeState>>,
-    dedup: Arc<DedupWindow>,
-    latest_epoch_tick: Arc<AtomicU64>,
-    config: Arc<Config>,
+    resources: NetworkResources,
 ) {
     let (tx, rx) = mpsc::channel::<Bytes>(OUTBOUND_QUEUE_CAPACITY);
     let (disconnect_tx, disconnect_rx) = watch::channel(false);
     let (peer_id, handshake_payload, incoming_count, outgoing_count) = {
-        let mut locked = state.lock().await;
+        let mut locked = resources.state.lock().await;
 
-        if !outbound && locked.incoming_count() >= config.max_incoming {
+        if !outbound && locked.incoming_count() >= resources.config.max_incoming {
             println!("Rejecting incoming {remote}: incoming limit reached.");
             locked.clear_pending_dial(remote);
-            locked.clear_pending_dial(SocketAddrV4::new(*remote.ip(), config.peer_port));
+            locked.clear_pending_dial(SocketAddrV4::new(*remote.ip(), resources.config.peer_port));
             return;
         }
 
@@ -424,10 +420,10 @@ async fn establish_connection(
             outbound,
             tx.clone(),
             disconnect_tx,
-            config.peer_port,
+            resources.config.peer_port,
         ) else {
             locked.clear_pending_dial(remote);
-            locked.clear_pending_dial(SocketAddrV4::new(*remote.ip(), config.peer_port));
+            locked.clear_pending_dial(SocketAddrV4::new(*remote.ip(), resources.config.peer_port));
             return;
         };
 
@@ -449,7 +445,7 @@ async fn establish_connection(
         if outbound { "out" } else { "in" },
         incoming_count,
         outgoing_count,
-        format_epoch_tick_packed(latest_epoch_tick.load(Ordering::Relaxed))
+        format_epoch_tick_packed(resources.latest_epoch_tick.load(Ordering::Relaxed))
     );
 
     tokio::spawn(connection_worker(
@@ -459,10 +455,7 @@ async fn establish_connection(
         ConnectionContext {
             peer_id,
             remote,
-            state,
-            dedup,
-            latest_epoch_tick: Arc::clone(&latest_epoch_tick),
-            config,
+            resources,
         },
     ));
 }
@@ -476,10 +469,7 @@ async fn connection_worker(
     let ConnectionContext {
         peer_id,
         remote,
-        state,
-        dedup,
-        latest_epoch_tick,
-        config,
+        resources,
     } = context;
     let disconnect_reason = {
         let (reader, mut writer) = stream.into_split();
@@ -487,19 +477,11 @@ async fn connection_worker(
             &mut writer,
             rx,
             remote,
-            config.traffic_log,
-            Arc::clone(&latest_epoch_tick),
-            config.peer_write_timeout,
+            resources.config.traffic_log,
+            Arc::clone(&resources.latest_epoch_tick),
+            resources.config.peer_write_timeout,
         );
-        let read_future = read_peer_frames(
-            reader,
-            peer_id,
-            remote,
-            Arc::clone(&state),
-            dedup,
-            Arc::clone(&latest_epoch_tick),
-            config,
-        );
+        let read_future = read_peer_frames(reader, peer_id, remote, resources.clone());
         tokio::pin!(writer_future);
         tokio::pin!(read_future);
 
@@ -520,14 +502,15 @@ async fn connection_worker(
     };
 
     let (in_count, out_count) = {
-        let mut locked = state.lock().await;
+        let mut locked = resources.state.lock().await;
         let _ = locked.unregister_session(peer_id);
         (locked.incoming_count(), locked.outgoing_count())
     };
+    resources.pending.peer_disconnected(peer_id);
     eprintln!("Disconnecting {remote}: {disconnect_reason}");
     println!(
         "Disconnected {remote} | in={in_count} out={out_count} | {}",
-        format_epoch_tick_packed(latest_epoch_tick.load(Ordering::Relaxed))
+        format_epoch_tick_packed(resources.latest_epoch_tick.load(Ordering::Relaxed))
     );
 }
 
@@ -571,10 +554,7 @@ async fn read_peer_frames(
     mut reader: OwnedReadHalf,
     peer_id: u64,
     remote: SocketAddrV4,
-    state: Arc<Mutex<NodeState>>,
-    dedup: Arc<DedupWindow>,
-    latest_epoch_tick: Arc<AtomicU64>,
-    config: Arc<Config>,
+    resources: NetworkResources,
 ) -> Result<(), String> {
     let mut accumulated = BytesMut::with_capacity(ACCUMULATED_INITIAL_CAPACITY);
 
@@ -590,9 +570,9 @@ async fn read_peer_frames(
                     ));
                 }
                 while let Some(frame) = extract_frame(&mut accumulated)? {
-                    if config.traffic_log {
+                    if resources.config.traffic_log {
                         let (size, message_type, dejavu) = frame_meta(&frame);
-                        let packed = latest_epoch_tick.load(Ordering::Relaxed);
+                        let packed = resources.latest_epoch_tick.load(Ordering::Relaxed);
                         println!(
                             "RX {} | peer_id={} size={} type={}({}) dejavu={} | {}",
                             remote,
@@ -608,10 +588,11 @@ async fn read_peer_frames(
                     process_incoming_frame(
                         peer_id,
                         frame,
-                        Arc::clone(&state),
-                        Arc::clone(&dedup),
-                        Arc::clone(&latest_epoch_tick),
-                        Arc::clone(&config),
+                        Arc::clone(&resources.state),
+                        Arc::clone(&resources.dedup),
+                        Arc::clone(&resources.pending),
+                        Arc::clone(&resources.latest_epoch_tick),
+                        Arc::clone(&resources.config),
                     )
                     .await;
                 }
@@ -650,6 +631,7 @@ async fn process_incoming_frame(
     frame: Bytes,
     state: Arc<Mutex<NodeState>>,
     dedup: Arc<DedupWindow>,
+    pending: Arc<PendingRequests>,
     latest_epoch_tick: Arc<AtomicU64>,
     config: Arc<Config>,
 ) {
@@ -659,6 +641,16 @@ async fn process_incoming_frame(
 
     let message_type = frame[3];
     let dejavu = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+
+    if matches!(
+        message_type,
+        crate::frame::RESPOND_ENTITY_TYPE
+            | BROADCAST_TRANSACTION_TYPE
+            | crate::frame::END_RESPONSE_TYPE
+    ) && pending.deliver(source_peer_id, dejavu, frame.clone())
+    {
+        return;
+    }
 
     let tick_update = parse_tick_status_from_frame(&frame);
     if let Some(status) = tick_update {
@@ -852,6 +844,7 @@ mod tests {
                 frame,
                 Arc::clone(&state),
                 Arc::new(DedupWindow::new(1_000)),
+                Arc::new(PendingRequests::default()),
                 Arc::new(AtomicU64::new(0)),
                 test_config(),
             ),
@@ -880,6 +873,7 @@ mod tests {
                 frame,
                 Arc::clone(&state),
                 Arc::new(DedupWindow::new(1_000)),
+                Arc::new(PendingRequests::default()),
                 Arc::clone(&latest),
                 test_config(),
             ),
@@ -905,12 +899,47 @@ mod tests {
             frame,
             Arc::clone(&state),
             Arc::new(DedupWindow::new(1_000)),
+            Arc::new(PendingRequests::default()),
             Arc::new(AtomicU64::new(0)),
             test_config(),
         )
         .await;
 
         assert_eq!(state.lock().await.pool_stats(Instant::now()).known, 1);
+    }
+
+    #[tokio::test]
+    async fn late_api_response_is_not_relayed_in_relay_all_mode() {
+        let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
+        let (target_tx, mut target_rx) = mpsc::channel(1);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+        state
+            .lock()
+            .await
+            .register_session(peer(20), true, target_tx, disconnect_tx, DEFAULT_PORT)
+            .unwrap();
+        let pending = Arc::new(PendingRequests::default());
+        let (registration, _receivers) = pending.register([999]);
+        let dejavu = registration.dejavu();
+        drop(registration);
+        let mut config = (*test_config()).clone();
+        config.relay_all = true;
+        let frame = Bytes::from(
+            build_request_frame(crate::frame::RESPOND_ENTITY_TYPE, dejavu, &[]).unwrap(),
+        );
+
+        process_incoming_frame(
+            999,
+            frame,
+            Arc::clone(&state),
+            Arc::new(DedupWindow::new(1_000)),
+            pending,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(config),
+        )
+        .await;
+
+        assert!(target_rx.try_recv().is_err());
     }
 
     #[test]
@@ -1002,10 +1031,13 @@ mod tests {
             ConnectionContext {
                 peer_id,
                 remote,
-                state: Arc::clone(&state),
-                dedup: Arc::new(DedupWindow::new(1_000)),
-                latest_epoch_tick: Arc::new(AtomicU64::new(0)),
-                config: test_config(),
+                resources: NetworkResources {
+                    state: Arc::clone(&state),
+                    dedup: Arc::new(DedupWindow::new(1_000)),
+                    pending: Arc::new(PendingRequests::default()),
+                    latest_epoch_tick: Arc::new(AtomicU64::new(0)),
+                    config: test_config(),
+                },
             },
         ));
 
@@ -1093,10 +1125,13 @@ mod tests {
             ConnectionContext {
                 peer_id,
                 remote,
-                state: Arc::clone(&state),
-                dedup: Arc::new(DedupWindow::new(1_000)),
-                latest_epoch_tick: Arc::new(AtomicU64::new(0)),
-                config: test_config(),
+                resources: NetworkResources {
+                    state: Arc::clone(&state),
+                    dedup: Arc::new(DedupWindow::new(1_000)),
+                    pending: Arc::new(PendingRequests::default()),
+                    latest_epoch_tick: Arc::new(AtomicU64::new(0)),
+                    config: test_config(),
+                },
             },
         ));
 

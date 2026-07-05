@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::pending::PendingRequests;
 use crate::state::{DedupWindow, NodeState};
 use serde::Serialize;
 use std::sync::Arc;
@@ -50,6 +51,7 @@ pub(crate) struct ApiState {
     pub(crate) node_state: Arc<Mutex<NodeState>>,
     pub(crate) dedup: Arc<DedupWindow>,
     pub(crate) latest_epoch_tick: Arc<AtomicU64>,
+    pub(crate) pending_requests: Arc<PendingRequests>,
     pub(crate) config: Arc<Config>,
 }
 

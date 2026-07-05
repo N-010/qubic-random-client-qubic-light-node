@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::dns::fetch_seed_peers_from_dns;
 use crate::grpc_api::run_grpc_server;
 use crate::network::{accept_loop, dial_loop};
+use crate::pending::PendingRequests;
 use crate::state::{DedupWindow, NodeState};
 use crate::types::ApiState;
 use std::sync::Arc;
@@ -48,6 +49,7 @@ pub(crate) async fn run() -> std::io::Result<()> {
         &configured_seed_peers,
     )));
     let dedup = Arc::new(DedupWindow::new(config.max_seen));
+    let pending_requests = Arc::new(PendingRequests::default());
     {
         let mut locked = state.lock().await;
         for peer in &config.seed_peers {
@@ -83,6 +85,7 @@ pub(crate) async fn run() -> std::io::Result<()> {
             node_state: Arc::clone(&state),
             dedup: Arc::clone(&dedup),
             latest_epoch_tick: Arc::clone(&latest_epoch_tick),
+            pending_requests: Arc::clone(&pending_requests),
             config: Arc::clone(&shared_config),
         };
         tokio::spawn(async move {
@@ -94,6 +97,7 @@ pub(crate) async fn run() -> std::io::Result<()> {
 
     let accept_state = Arc::clone(&state);
     let accept_dedup = Arc::clone(&dedup);
+    let accept_pending = Arc::clone(&pending_requests);
     let accept_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
     let accept_config = Arc::clone(&shared_config);
     tokio::spawn(async move {
@@ -101,6 +105,7 @@ pub(crate) async fn run() -> std::io::Result<()> {
             listener,
             accept_state,
             accept_dedup,
+            accept_pending,
             accept_latest_epoch_tick,
             accept_config,
         )
@@ -111,7 +116,14 @@ pub(crate) async fn run() -> std::io::Result<()> {
     let dial_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
     let dial_config = Arc::clone(&shared_config);
     tokio::spawn(async move {
-        dial_loop(dial_state, dedup, dial_latest_epoch_tick, dial_config).await;
+        dial_loop(
+            dial_state,
+            dedup,
+            pending_requests,
+            dial_latest_epoch_tick,
+            dial_config,
+        )
+        .await;
     });
 
     tokio::signal::ctrl_c().await?;

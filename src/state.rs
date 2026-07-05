@@ -302,36 +302,6 @@ impl NodeState {
         selected
     }
 
-    pub(crate) fn peer_candidates(&self, peer_port: u16) -> Vec<SocketAddrV4> {
-        let now = Instant::now();
-        let mut peers = HashSet::<SocketAddrV4>::new();
-
-        for session in self.sessions.values() {
-            if is_bogon(session.remote.ip()) {
-                continue;
-            }
-            if session.outbound {
-                peers.insert(session.remote);
-            } else {
-                peers.insert(SocketAddrV4::new(*session.remote.ip(), peer_port));
-            }
-        }
-
-        for peer in &self.known_peers {
-            if is_bogon(peer.ip()) {
-                continue;
-            }
-            if !self.is_cooling_down(*peer, now) {
-                peers.insert(*peer);
-            }
-        }
-
-        peers
-            .into_iter()
-            .filter(|peer| !self.is_cooling_down(*peer, now))
-            .collect()
-    }
-
     pub(crate) fn pool_stats(&self, now: Instant) -> PeerPoolStats {
         PeerPoolStats {
             known: self.known_peers.len(),

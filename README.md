@@ -92,7 +92,7 @@ Important notes:
 - a peer is disconnected when its bounded outbound queue is full, allowing the reconnect loop to replace a slow session
 - every peer write has a deadline controlled by `--peer-write-timeout-ms`; a peer that stops reading is disconnected and replaced instead of retaining a stalled writer
 - console logs use a bounded non-blocking queue and a dedicated writer thread, so a slow Docker log consumer cannot block the Tokio runtime; log messages are dropped if that queue is full
-- failed dial and peer-backed API attempts put that address into an exponential cooldown, starting at `--reconnect-ms` and capped at five minutes; a successful connection or API response clears its failure history
+- failed dial attempts put that address into an exponential cooldown, starting at `--reconnect-ms` and capped at five minutes; a successful connection clears its failure history
 - configured `--peer` addresses are retained even when the discovered-peer cache is full; active and pending connection addresses are protected from eviction as well
 - emergency DNS recovery is based only on the outbound connection count, so incoming connections cannot hide a depleted outbound pool
 - peer-pool changes are logged as `known`, `dialable`, `cooldown`, `pending`, `incoming`, `outgoing`, and `target` counts
@@ -149,7 +149,7 @@ Emergency DNS bootstrap runs when outbound connections fall below `--critical-pe
 - `--no-grpc`
   Disable the gRPC server.
 - `--api-timeout-ms <ms>`
-  End-to-end deadline for a balance or tick-transactions query, including peer connection, handshake, writes, and reads. Default: `6000`. Values below `1000` are currently clamped to `1000` internally.
+  End-to-end deadline for a balance or tick-transactions query over existing peer sessions. Default: `6000`. Values below `1000` are currently clamped to `1000` internally.
 
 To see the parser-generated help text:
 
@@ -176,7 +176,7 @@ Protocol file: `proto/lightnode.proto`
 
 The gRPC server also enables reflection, so tools like `grpcurl` can inspect the service without a separate generated client.
 
-At most four peer-backed gRPC calls run at once. Each call queries at most three peers concurrently, limiting the process to 12 query connections. Additional `GetBalance` or `GetTickTransactions` calls are rejected immediately with `ok=false` and an overload message; `GetStatus` and `BroadcastTransaction` remain available.
+At most 64 peer-backed gRPC calls run at once. Each call sends its request over at most three existing persistent peer sessions and returns the first successful response. No temporary query connections are opened. Additional `GetBalance` or `GetTickTransactions` calls are rejected immediately with `ok=false` and an overload message; `GetStatus` and `BroadcastTransaction` remain available.
 
 ## Wallet Format For GetBalance
 

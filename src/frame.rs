@@ -172,13 +172,6 @@ pub(crate) fn frame_payload(frame: &[u8]) -> Result<&[u8], String> {
     Ok(&frame[HEADER_SIZE..])
 }
 
-pub(crate) fn frame_dejavu(frame: &[u8]) -> Result<u32, String> {
-    if frame.len() < HEADER_SIZE {
-        return Err("Frame too small".to_string());
-    }
-    Ok(u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]))
-}
-
 pub(crate) fn parse_tick_status_from_frame(frame: &[u8]) -> Option<TickStatus> {
     if frame.len() < HEADER_SIZE {
         return None;
