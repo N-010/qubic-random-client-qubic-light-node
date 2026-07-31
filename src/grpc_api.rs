@@ -1,8 +1,9 @@
 use crate::LIGHTNODE_FILE_DESCRIPTOR_SET;
 use crate::codec::{parse_wallet_public_key, tx_id_from_bytes};
+use crate::frame::MAX_CONTRACT_FUNCTION_INPUT_SIZE;
 use crate::lightnodepb;
 use crate::network::broadcast_transaction_to_network;
-use crate::peer_api::{query_balance, query_tick_transactions};
+use crate::peer_api::{query_balance, query_contract_function, query_tick_transactions};
 use crate::types::{
     ApiState, BalanceResponse, TickStatus, TickTransaction, tick_status_from_packed,
 };
@@ -141,6 +142,54 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
                 ok: false,
                 tick,
                 transactions: Vec::new(),
+                error: err,
+            })),
+        }
+    }
+
+    async fn query_contract_function(
+        &self,
+        request: Request<lightnodepb::QueryContractFunctionRequest>,
+    ) -> Result<Response<lightnodepb::QueryContractFunctionResponse>, Status> {
+        let request = request.into_inner();
+        if request.contract_index == 0 {
+            return Err(Status::invalid_argument(
+                "contract_index must be greater than zero",
+            ));
+        }
+        let input_type = u16::try_from(request.input_type)
+            .map_err(|_| Status::invalid_argument("input_type must fit into uint16"))?;
+        if request.input.len() > MAX_CONTRACT_FUNCTION_INPUT_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "input must not exceed {MAX_CONTRACT_FUNCTION_INPUT_SIZE} bytes"
+            )));
+        }
+        let Some(_permit) = self.try_acquire_peer_query_slot() else {
+            return Ok(Response::new(lightnodepb::QueryContractFunctionResponse {
+                ok: false,
+                output: Vec::new(),
+                error: PEER_QUERY_OVERLOADED_ERROR.to_string(),
+            }));
+        };
+
+        match query_contract_function(
+            Arc::clone(&self.api.node_state),
+            Arc::clone(&self.api.pending_requests),
+            Arc::clone(&self.api.config),
+            request.contract_index,
+            input_type,
+            &request.input,
+        )
+        .await
+        {
+            Ok(output) => Ok(Response::new(lightnodepb::QueryContractFunctionResponse {
+                ok: true,
+                output,
+                error: String::new(),
+            })),
+            Err(err) => Ok(Response::new(lightnodepb::QueryContractFunctionResponse {
+                ok: false,
+                output: Vec::new(),
                 error: err,
             })),
         }
@@ -341,6 +390,35 @@ mod tests {
                 error: "Transaction payload is empty".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn query_contract_function_rejects_invalid_arguments() {
+        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
+
+        let zero_contract = LightNode::query_contract_function(
+            &service,
+            Request::new(lightnodepb::QueryContractFunctionRequest {
+                contract_index: 0,
+                input_type: 2,
+                input: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("zero contract index should be rejected");
+        assert_eq!(zero_contract.code(), tonic::Code::InvalidArgument);
+
+        let oversized = LightNode::query_contract_function(
+            &service,
+            Request::new(lightnodepb::QueryContractFunctionRequest {
+                contract_index: 3,
+                input_type: 2,
+                input: vec![0; MAX_CONTRACT_FUNCTION_INPUT_SIZE + 1],
+            }),
+        )
+        .await
+        .expect_err("oversized input should be rejected");
+        assert_eq!(oversized.code(), tonic::Code::InvalidArgument);
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ service LightNode {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
   rpc GetTickTransactions(GetTickTransactionsRequest) returns (GetTickTransactionsResponse);
+  rpc QueryContractFunction(QueryContractFunctionRequest) returns (QueryContractFunctionResponse);
   rpc BroadcastTransaction(BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
 }
 
@@ -72,6 +73,18 @@ message GetTickTransactionsResponse {
   uint32 tick = 2;
   repeated Transaction transactions = 3;
   string error = 4;
+}
+
+message QueryContractFunctionRequest {
+  uint32 contract_index = 1;
+  uint32 input_type = 2;
+  bytes input = 3;
+}
+
+message QueryContractFunctionResponse {
+  bool ok = 1;
+  bytes output = 2;
+  string error = 3;
 }
 
 message BroadcastTransactionRequest {

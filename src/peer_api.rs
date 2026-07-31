@@ -1,8 +1,10 @@
 use crate::codec::{bytes_to_hex, read_i32, read_i64, read_u16, read_u32};
 use crate::config::Config;
 use crate::frame::{
-    BROADCAST_TRANSACTION_TYPE, END_RESPONSE_TYPE, REQUEST_ENTITY_TYPE, RESPOND_ENTITY_TYPE,
-    build_request_frame, build_request_tick_transactions_frame, frame_payload,
+    BROADCAST_TRANSACTION_TYPE, END_RESPONSE_TYPE, REQUEST_ENTITY_TYPE,
+    RESPOND_CONTRACT_FUNCTION_TYPE, RESPOND_ENTITY_TYPE, TRY_AGAIN_TYPE,
+    build_request_contract_function_frame, build_request_frame,
+    build_request_tick_transactions_frame, frame_payload,
 };
 use crate::pending::{PendingEvent, PendingRequests};
 use crate::state::NodeState;
@@ -149,6 +151,74 @@ pub(crate) async fn query_tick_transactions(
     ))
 }
 
+pub(crate) async fn query_contract_function(
+    state: Arc<Mutex<NodeState>>,
+    pending: Arc<PendingRequests>,
+    config: Arc<Config>,
+    contract_index: u32,
+    input_type: u16,
+    input: &[u8],
+) -> Result<Vec<u8>, String> {
+    let timeout_duration = config.api_timeout;
+    let deadline = Instant::now() + timeout_duration;
+    let targets = timeout_at(deadline, state.lock())
+        .await
+        .map_err(|_| api_timeout_error(timeout_duration))?
+        .collect_all_targets(MAX_PARALLEL_PEER_QUERIES);
+    if targets.is_empty() {
+        return Err("No connected peers available".to_string());
+    }
+    let (registration, receivers) = pending.register(targets.iter().map(|target| target.peer_id));
+    let request = Bytes::from(build_request_contract_function_frame(
+        registration.dejavu(),
+        contract_index,
+        input_type,
+        input,
+    )?);
+    timeout_at(
+        deadline,
+        send_request_to_targets(&state, &pending, targets, &request),
+    )
+    .await
+    .map_err(|_| api_timeout_error(timeout_duration))?;
+
+    let mut join_set = JoinSet::new();
+    for (peer_id, receiver) in receivers {
+        join_set.spawn(async move { (peer_id, receive_contract_function(receiver).await) });
+    }
+
+    let mut last_err = String::new();
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = sleep_until(deadline) => {
+                join_set.abort_all();
+                return Err(api_timeout_error(timeout_duration));
+            }
+            result = join_set.join_next() => result,
+        };
+        let Some(result) = result else {
+            break;
+        };
+        match result {
+            Ok((_peer_id, Ok(output))) => {
+                join_set.abort_all();
+                return Ok(output);
+            }
+            Ok((peer_id, Err(err))) => {
+                last_err = format!("peer {peer_id}: {err}");
+            }
+            Err(err) => {
+                last_err = format!("task join error: {err}");
+            }
+        }
+    }
+
+    Err(format!(
+        "Failed to query contract function from peers (parallel): {last_err}"
+    ))
+}
+
 async fn receive_balance(
     mut receiver: mpsc::UnboundedReceiver<PendingEvent>,
     wallet: &str,
@@ -163,6 +233,7 @@ async fn receive_balance(
                 END_RESPONSE_TYPE => {
                     return Err("Peer returned END_RESPONSE without balance data".to_string());
                 }
+                TRY_AGAIN_TYPE => return Err("peer requested retry".to_string()),
                 _ => {}
             },
             PendingEvent::PeerDisconnected => return Err("peer disconnected".to_string()),
@@ -183,6 +254,28 @@ async fn receive_tick_transactions(
                     transactions.push(parse_transaction_payload(tx_payload)?);
                 }
                 END_RESPONSE_TYPE => return Ok(transactions),
+                TRY_AGAIN_TYPE => return Err("peer requested retry".to_string()),
+                _ => {}
+            },
+            PendingEvent::PeerDisconnected => return Err("peer disconnected".to_string()),
+        }
+    }
+    Err("pending response channel closed".to_string())
+}
+
+async fn receive_contract_function(
+    mut receiver: mpsc::UnboundedReceiver<PendingEvent>,
+) -> Result<Vec<u8>, String> {
+    while let Some(event) = receiver.recv().await {
+        match event {
+            PendingEvent::Frame(frame) => match frame[3] {
+                RESPOND_CONTRACT_FUNCTION_TYPE => return Ok(frame_payload(&frame)?.to_vec()),
+                TRY_AGAIN_TYPE => return Err("peer requested retry".to_string()),
+                END_RESPONSE_TYPE => {
+                    return Err(
+                        "Peer returned END_RESPONSE without contract function data".to_string()
+                    );
+                }
                 _ => {}
             },
             PendingEvent::PeerDisconnected => return Err("peer disconnected".to_string()),
@@ -422,5 +515,57 @@ mod tests {
             "Peer-backed API query timed out after 20 ms"
         );
         assert_eq!(pending.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn contract_function_returns_first_peer_response_and_cleans_pending_request() {
+        let (state, peer_id, mut peer_rx) = state_with_peer().await;
+        let pending = Arc::new(PendingRequests::default());
+        let query = tokio::spawn(query_contract_function(
+            state,
+            Arc::clone(&pending),
+            test_config(Duration::from_secs(1)),
+            3,
+            2,
+            &[9; 32],
+        ));
+        let request = peer_rx.recv().await.unwrap();
+        let dejavu = u32::from_le_bytes(request[4..8].try_into().unwrap());
+        let response = Bytes::from(
+            build_request_frame(RESPOND_CONTRACT_FUNCTION_TYPE, dejavu, &[1, 2, 3])
+                .expect("contract response should build"),
+        );
+
+        assert!(pending.deliver(peer_id, dejavu, response));
+        assert_eq!(query.await.unwrap().unwrap(), vec![1, 2, 3]);
+        assert_eq!(pending.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn contract_function_maps_try_again_to_peer_error() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(PendingEvent::Frame(Bytes::from(
+            build_request_frame(TRY_AGAIN_TYPE, 7, &[]).unwrap(),
+        )))
+        .unwrap();
+
+        assert_eq!(
+            receive_contract_function(rx).await.unwrap_err(),
+            "peer requested retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn contract_function_preserves_empty_response() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(PendingEvent::Frame(Bytes::from(
+            build_request_frame(RESPOND_CONTRACT_FUNCTION_TYPE, 7, &[]).unwrap(),
+        )))
+        .unwrap();
+
+        assert_eq!(
+            receive_contract_function(rx).await.unwrap(),
+            Vec::<u8>::new()
+        );
     }
 }

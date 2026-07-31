@@ -17,8 +17,12 @@ pub(crate) const REQUEST_TICK_TRANSACTIONS_TYPE: u8 = 29;
 pub(crate) const REQUEST_ENTITY_TYPE: u8 = 31;
 pub(crate) const RESPOND_ENTITY_TYPE: u8 = 32;
 pub(crate) const END_RESPONSE_TYPE: u8 = 35;
+pub(crate) const REQUEST_CONTRACT_FUNCTION_TYPE: u8 = 42;
+pub(crate) const RESPOND_CONTRACT_FUNCTION_TYPE: u8 = 43;
+pub(crate) const TRY_AGAIN_TYPE: u8 = 54;
 
 pub(crate) const NUMBER_OF_TRANSACTIONS_PER_TICK: usize = 4096;
+pub(crate) const MAX_CONTRACT_FUNCTION_INPUT_SIZE: usize = 1024;
 pub(crate) const REQUEST_TICK_TRANSACTION_FLAGS_SIZE: usize = NUMBER_OF_TRANSACTIONS_PER_TICK / 8;
 pub(crate) const REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE: usize =
     4 + REQUEST_TICK_TRANSACTION_FLAGS_SIZE;
@@ -157,6 +161,33 @@ pub(crate) fn build_request_tick_transactions_frame(
     build_request_frame(REQUEST_TICK_TRANSACTIONS_TYPE, dejavu, &payload)
 }
 
+pub(crate) fn build_request_contract_function_frame(
+    dejavu: u32,
+    contract_index: u32,
+    input_type: u16,
+    input: &[u8],
+) -> Result<Vec<u8>, String> {
+    if contract_index == 0 {
+        return Err("Contract index must be greater than zero".to_string());
+    }
+    if input.len() > MAX_CONTRACT_FUNCTION_INPUT_SIZE {
+        return Err(format!(
+            "Contract function input is too large: maximum {}, got {}",
+            MAX_CONTRACT_FUNCTION_INPUT_SIZE,
+            input.len()
+        ));
+    }
+
+    let input_size = u16::try_from(input.len())
+        .map_err(|_| format!("Contract function input is too large: {}", input.len()))?;
+    let mut payload = Vec::with_capacity(8 + input.len());
+    payload.extend_from_slice(&contract_index.to_le_bytes());
+    payload.extend_from_slice(&input_type.to_le_bytes());
+    payload.extend_from_slice(&input_size.to_le_bytes());
+    payload.extend_from_slice(input);
+    build_request_frame(REQUEST_CONTRACT_FUNCTION_TYPE, dejavu, &payload)
+}
+
 pub(crate) fn frame_payload(frame: &[u8]) -> Result<&[u8], String> {
     if frame.len() < HEADER_SIZE {
         return Err("Frame is smaller than header".to_string());
@@ -262,6 +293,54 @@ mod tests {
 
         assert_eq!(REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE, 516);
         assert_eq!(frame, expected);
+    }
+
+    #[test]
+    fn builds_request_contract_function_frame_for_current_core_layout() {
+        let frame =
+            build_request_contract_function_frame(0x1122_3344, 3, 2, &[0xAA, 0xBB]).unwrap();
+
+        assert_eq!(
+            frame,
+            vec![
+                18,
+                0,
+                0,
+                REQUEST_CONTRACT_FUNCTION_TYPE,
+                0x44,
+                0x33,
+                0x22,
+                0x11,
+                3,
+                0,
+                0,
+                0,
+                2,
+                0,
+                2,
+                0,
+                0xAA,
+                0xBB,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_contract_function_requests() {
+        assert_eq!(
+            build_request_contract_function_frame(1, 0, 2, &[]).unwrap_err(),
+            "Contract index must be greater than zero"
+        );
+        assert_eq!(
+            build_request_contract_function_frame(
+                1,
+                3,
+                2,
+                &vec![0; MAX_CONTRACT_FUNCTION_INPUT_SIZE + 1],
+            )
+            .unwrap_err(),
+            "Contract function input is too large: maximum 1024, got 1025"
+        );
     }
 
     #[test]

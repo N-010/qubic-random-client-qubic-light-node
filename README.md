@@ -9,7 +9,7 @@ It currently does four things:
 - connects to the public Qubic network over TCP
 - relays Qubic frames between peers
 - keeps the latest known tick in local memory
-- exposes a local `gRPC` API for status, balance, tick transactions, and transaction broadcast
+- exposes a local `gRPC` API for status, balance, tick transactions, contract function queries, and transaction broadcast
 
 There is no web UI and no HTTP REST API in the current codebase.
 
@@ -169,6 +169,8 @@ Methods:
   Queries peers for wallet balance data and returns the first successful response.
 - `GetTickTransactions`
   Queries peers for transactions from the requested tick and returns the first successful response.
+- `QueryContractFunction`
+  Calls a read-only smart-contract function and returns its raw output bytes.
 - `BroadcastTransaction`
   Broadcasts raw transaction bytes to currently connected peers.
 
@@ -176,7 +178,9 @@ Protocol file: `proto/lightnode.proto`
 
 The gRPC server also enables reflection, so tools like `grpcurl` can inspect the service without a separate generated client.
 
-At most 64 peer-backed gRPC calls run at once. Each call sends its request over at most three existing persistent peer sessions and returns the first successful response. No temporary query connections are opened. Additional `GetBalance` or `GetTickTransactions` calls are rejected immediately with `ok=false` and an overload message; `GetStatus` and `BroadcastTransaction` remain available.
+At most 64 peer-backed gRPC calls run at once. Each call sends its request over at most three existing persistent peer sessions and returns the first successful response. No temporary query connections are opened. Additional `GetBalance`, `GetTickTransactions`, or `QueryContractFunction` calls are rejected immediately with `ok=false` and an overload message; `GetStatus` and `BroadcastTransaction` remain available.
+
+`QueryContractFunction` accepts a contract index, a function input type, and up to 1024 raw input bytes. Contract-specific encoding and output decoding remain the caller's responsibility.
 
 ## Wallet Format For GetBalance
 

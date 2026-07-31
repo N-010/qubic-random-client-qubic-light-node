@@ -647,6 +647,8 @@ async fn process_incoming_frame(
         crate::frame::RESPOND_ENTITY_TYPE
             | BROADCAST_TRANSACTION_TYPE
             | crate::frame::END_RESPONSE_TYPE
+            | crate::frame::RESPOND_CONTRACT_FUNCTION_TYPE
+            | crate::frame::TRY_AGAIN_TYPE
     ) && pending.deliver(source_peer_id, dejavu, frame.clone())
     {
         return;
@@ -851,6 +853,44 @@ mod tests {
         )
         .await
         .expect("unrelated response must not wait for NodeState");
+    }
+
+    #[tokio::test]
+    async fn contract_function_response_is_routed_to_pending_request() {
+        let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
+        let _guard = state.lock().await;
+        let pending = Arc::new(PendingRequests::default());
+        let (registration, mut receivers) = pending.register([1]);
+        let dejavu = registration.dejavu();
+        let mut receiver = receivers.remove(0).1;
+        let frame = Bytes::from(
+            build_request_frame(
+                crate::frame::RESPOND_CONTRACT_FUNCTION_TYPE,
+                dejavu,
+                &[1, 2, 3],
+            )
+            .expect("contract response should build"),
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            process_incoming_frame(
+                1,
+                frame.clone(),
+                Arc::clone(&state),
+                Arc::new(DedupWindow::new(1_000)),
+                Arc::clone(&pending),
+                Arc::new(AtomicU64::new(0)),
+                test_config(),
+            ),
+        )
+        .await
+        .expect("contract response must not wait for NodeState");
+
+        let Some(crate::pending::PendingEvent::Frame(delivered)) = receiver.recv().await else {
+            panic!("contract response should be delivered");
+        };
+        assert_eq!(delivered, frame);
     }
 
     #[tokio::test]
