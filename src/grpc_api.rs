@@ -1,6 +1,6 @@
 use crate::LIGHTNODE_FILE_DESCRIPTOR_SET;
 use crate::codec::{parse_wallet_public_key, tx_id_from_bytes};
-use crate::frame::MAX_CONTRACT_FUNCTION_INPUT_SIZE;
+use crate::frame::{MAX_CONTRACT_FUNCTION_INPUT_SIZE, MAX_NUMBER_OF_CONTRACTS};
 use crate::lightnodepb;
 use crate::network::broadcast_transaction_to_network;
 use crate::peer_api::{query_balance, query_contract_function, query_tick_transactions};
@@ -55,9 +55,10 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
         if let Some(status) = cached {
             Ok(Response::new(lightnodepb::GetStatusResponse {
                 ok: true,
-                source: "cache".to_string(),
+                source: "broadcast_tick_cache".to_string(),
                 status: Some(map_tick_status(status)),
-                warning: String::new(),
+                warning: "Epoch and tick come from unverified peer broadcasts; initial_tick, tick_duration_ms, aligned_votes, and misaligned_votes are unavailable and returned as zero."
+                    .to_string(),
                 error: String::new(),
             }))
         } else {
@@ -152,9 +153,9 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
         request: Request<lightnodepb::QueryContractFunctionRequest>,
     ) -> Result<Response<lightnodepb::QueryContractFunctionResponse>, Status> {
         let request = request.into_inner();
-        if request.contract_index == 0 {
+        if !(1..MAX_NUMBER_OF_CONTRACTS).contains(&request.contract_index) {
             return Err(Status::invalid_argument(
-                "contract_index must be greater than zero",
+                "contract_index must be between 1 and 1023",
             ));
         }
         let input_type = u16::try_from(request.input_type)
@@ -280,7 +281,9 @@ fn map_transaction(tx: TickTransaction) -> lightnodepb::Transaction {
 mod tests {
     use super::*;
     use crate::config::{Config, DEFAULT_GRPC_PORT, DEFAULT_PORT};
-    use crate::frame::{BROADCAST_TRANSACTION_TYPE, build_request_frame};
+    use crate::frame::{
+        BROADCAST_TRANSACTION_TYPE, SIGNATURE_SIZE, TRANSACTION_BASE_SIZE, build_request_frame,
+    };
     use crate::lightnodepb::light_node_server::LightNode;
     use crate::state::NodeState;
     use bytes::Bytes;
@@ -329,6 +332,15 @@ mod tests {
         }
     }
 
+    fn valid_transaction(marker: u8) -> Vec<u8> {
+        let mut transaction = vec![0; TRANSACTION_BASE_SIZE + SIGNATURE_SIZE];
+        transaction[0] = marker;
+        transaction[64..72].copy_from_slice(&100i64.to_le_bytes());
+        transaction[72..76].copy_from_slice(&123u32.to_le_bytes());
+        transaction[TRANSACTION_BASE_SIZE] = marker;
+        transaction
+    }
+
     #[tokio::test]
     async fn broadcast_transaction_success() {
         let node_state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
@@ -343,8 +355,9 @@ mod tests {
         }
 
         let service = test_service(Arc::clone(&node_state));
+        let tx_bytes = valid_transaction(1);
         let request = Request::new(lightnodepb::BroadcastTransactionRequest {
-            tx_bytes: vec![1, 2, 3],
+            tx_bytes: tx_bytes.clone(),
         });
 
         let response = LightNode::broadcast_transaction(&service, request)
@@ -356,7 +369,7 @@ mod tests {
             response,
             lightnodepb::BroadcastTransactionResponse {
                 ok: true,
-                tx_id: tx_id_from_bytes(&[1, 2, 3]),
+                tx_id: tx_id_from_bytes(&tx_bytes),
                 error: String::new(),
             }
         );
@@ -365,7 +378,7 @@ mod tests {
             .recv()
             .await
             .expect("peer should receive broadcast frame");
-        let expected_frame = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &[1, 2, 3])
+        let expected_frame = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &tx_bytes)
             .expect("broadcast frame should be buildable");
         assert_eq!(&*outbound_frame, expected_frame.as_slice());
     }
@@ -393,6 +406,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broadcast_transaction_rejects_malformed_payload() {
+        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
+
+        let response = LightNode::broadcast_transaction(
+            &service,
+            Request::new(lightnodepb::BroadcastTransactionRequest {
+                tx_bytes: vec![1, 2, 3],
+            }),
+        )
+        .await
+        .expect("broadcast_transaction should return grpc response")
+        .into_inner();
+
+        assert_eq!(
+            response,
+            lightnodepb::BroadcastTransactionResponse {
+                ok: false,
+                tx_id: String::new(),
+                error: "Transaction payload too small: 3".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn query_contract_function_rejects_invalid_arguments() {
         let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
 
@@ -407,6 +444,18 @@ mod tests {
         .await
         .expect_err("zero contract index should be rejected");
         assert_eq!(zero_contract.code(), tonic::Code::InvalidArgument);
+
+        let out_of_range_contract = LightNode::query_contract_function(
+            &service,
+            Request::new(lightnodepb::QueryContractFunctionRequest {
+                contract_index: MAX_NUMBER_OF_CONTRACTS,
+                input_type: 2,
+                input: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("contract index 1024 should be rejected");
+        assert_eq!(out_of_range_contract.code(), tonic::Code::InvalidArgument);
 
         let oversized = LightNode::query_contract_function(
             &service,
@@ -498,6 +547,8 @@ mod tests {
         .expect("status should return")
         .into_inner();
 
+        assert_eq!(response.source, "broadcast_tick_cache");
+        assert!(response.warning.contains("unverified peer broadcasts"));
         assert_eq!(response.status.expect("tick status should exist").tick, 123);
     }
 
@@ -505,7 +556,7 @@ mod tests {
     async fn broadcast_transaction_no_peers_maps_to_error_response() {
         let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
         let request = Request::new(lightnodepb::BroadcastTransactionRequest {
-            tx_bytes: vec![7, 8, 9],
+            tx_bytes: valid_transaction(7),
         });
 
         let response = LightNode::broadcast_transaction(&service, request)
@@ -542,7 +593,7 @@ mod tests {
 
         let service = test_service(node_state);
         let request = Request::new(lightnodepb::BroadcastTransactionRequest {
-            tx_bytes: vec![4, 5, 6],
+            tx_bytes: valid_transaction(4),
         });
         let response = LightNode::broadcast_transaction(&service, request)
             .await
@@ -575,7 +626,7 @@ mod tests {
         }
 
         let service = test_service(Arc::clone(&node_state));
-        let tx_bytes = vec![7, 7, 7];
+        let tx_bytes = valid_transaction(7);
         let first_response = LightNode::broadcast_transaction(
             &service,
             Request::new(lightnodepb::BroadcastTransactionRequest {

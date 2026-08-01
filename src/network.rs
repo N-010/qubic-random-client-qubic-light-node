@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::frame::{
-    BROADCAST_TRANSACTION_TYPE, EXCHANGE_PUBLIC_PEERS_TYPE, HEADER_SIZE, MAX_FRAME_SIZE,
-    NUMBER_OF_TRANSACTIONS_PER_TICK, build_exchange_public_peers_frame, build_request_frame,
-    decode_frame_size, frame_meta, message_type_name, parse_exchange_public_peers,
-    parse_tick_status_from_frame,
+    BROADCAST_TICK_TYPE, BROADCAST_TRANSACTION_TYPE, EXCHANGE_PUBLIC_PEERS_TYPE, HEADER_SIZE,
+    MAX_FRAME_SIZE, NUMBER_OF_TRANSACTIONS_PER_TICK, OC_MACHINE_INVOCATION_TYPE,
+    ORACLE_MACHINE_QUERY_TYPE, ORACLE_MACHINE_REPLY_TYPE, build_exchange_public_peers_frame,
+    build_request_frame, decode_frame_size, frame_meta, frame_payload, message_type_name,
+    parse_exchange_public_peers, parse_tick_status_from_frame, parse_transaction_layout,
 };
 use crate::pending::PendingRequests;
 use crate::state::{DedupWindow, NodeState, PeerPoolStats, RelayTarget};
@@ -162,6 +163,7 @@ pub(crate) async fn broadcast_transaction_to_network(
     if tx_bytes.is_empty() {
         return Err("Transaction payload is empty".to_string());
     }
+    parse_transaction_layout(tx_bytes, None)?;
 
     let frame = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, tx_bytes)?;
     let digest = *blake3::hash(&frame).as_bytes();
@@ -655,14 +657,35 @@ async fn process_incoming_frame(
     }
 
     let tick_update = parse_tick_status_from_frame(&frame);
+    if message_type == BROADCAST_TICK_TYPE && tick_update.is_none() {
+        return;
+    }
     if let Some(status) = tick_update {
         update_latest_epoch_tick(&latest_epoch_tick, status.epoch, status.tick);
     }
 
-    if !config.relay_all && dejavu != 0 {
-        if message_type == EXCHANGE_PUBLIC_PEERS_TYPE {
-            update_discovered_peers(&state, &frame, config.peer_port).await;
+    if message_type == EXCHANGE_PUBLIC_PEERS_TYPE {
+        update_discovered_peers(&state, &frame, config.peer_port).await;
+        return;
+    }
+
+    if matches!(
+        message_type,
+        ORACLE_MACHINE_QUERY_TYPE | ORACLE_MACHINE_REPLY_TYPE | OC_MACHINE_INVOCATION_TYPE
+    ) {
+        return;
+    }
+
+    if message_type == BROADCAST_TRANSACTION_TYPE {
+        let Ok(payload) = frame_payload(&frame) else {
+            return;
+        };
+        if parse_transaction_layout(payload, None).is_err() {
+            return;
         }
+    }
+
+    if !config.relay_all && dejavu != 0 {
         return;
     }
 
@@ -683,10 +706,7 @@ async fn process_incoming_frame(
         return;
     }
 
-    let mut locked = state.lock().await;
-    if message_type == EXCHANGE_PUBLIC_PEERS_TYPE {
-        add_discovered_peers(&mut locked, &frame, config.peer_port);
-    }
+    let locked = state.lock().await;
     let targets = locked.collect_targets(source_peer_id, DISSEMINATION_MULTIPLIER);
     drop(locked);
 
@@ -898,7 +918,7 @@ mod tests {
         let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
         let _guard = state.lock().await;
         let latest = Arc::new(AtomicU64::new(0));
-        let mut payload = [0; 8];
+        let mut payload = [0; crate::frame::BROADCAST_TICK_PAYLOAD_SIZE];
         payload[2..4].copy_from_slice(&7u16.to_le_bytes());
         payload[4..8].copy_from_slice(&123u32.to_le_bytes());
         let frame = Bytes::from(
@@ -980,6 +1000,71 @@ mod tests {
         .await;
 
         assert!(target_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn relay_filters_handshake_internal_channels_and_malformed_transactions() {
+        let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
+        let (target_tx, mut target_rx) = mpsc::channel(1);
+        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+        state
+            .lock()
+            .await
+            .register_session(peer(20), true, target_tx, disconnect_tx, DEFAULT_PORT)
+            .unwrap();
+        let mut config = (*test_config()).clone();
+        config.relay_all = true;
+        let config = Arc::new(config);
+        let dedup = Arc::new(DedupWindow::new(1_000));
+        let pending = Arc::new(PendingRequests::default());
+        let latest = Arc::new(AtomicU64::new(0));
+
+        for message_type in [
+            ORACLE_MACHINE_QUERY_TYPE,
+            ORACLE_MACHINE_REPLY_TYPE,
+            OC_MACHINE_INVOCATION_TYPE,
+        ] {
+            process_incoming_frame(
+                999,
+                Bytes::from(build_request_frame(message_type, 0, &[1]).unwrap()),
+                Arc::clone(&state),
+                Arc::clone(&dedup),
+                Arc::clone(&pending),
+                Arc::clone(&latest),
+                Arc::clone(&config),
+            )
+            .await;
+        }
+
+        process_incoming_frame(
+            999,
+            Bytes::from(build_exchange_public_peers_frame([
+                Ipv4Addr::new(2, 2, 2, 2),
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv4Addr::UNSPECIFIED,
+            ])),
+            Arc::clone(&state),
+            Arc::clone(&dedup),
+            Arc::clone(&pending),
+            Arc::clone(&latest),
+            Arc::clone(&config),
+        )
+        .await;
+
+        process_incoming_frame(
+            999,
+            Bytes::from(build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &[1, 2, 3]).unwrap()),
+            Arc::clone(&state),
+            dedup,
+            pending,
+            latest,
+            config,
+        )
+        .await;
+
+        assert!(target_rx.try_recv().is_err());
+        assert_eq!(state.lock().await.pool_stats(Instant::now()).known, 2);
     }
 
     #[test]

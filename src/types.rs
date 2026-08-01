@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::sync::Mutex;
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct TickStatus {
     pub(crate) epoch: u16,
     pub(crate) tick: u32,

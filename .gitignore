@@ -20,6 +20,14 @@ target*
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
-# Codex
+# LLM
 /.codex*
 /target-codex*
+.agents
+.claude
+AGENTS.md
+CLAUDE.md
+
+# GitNexus
+.gitnexusrc
+.gitnexusignore

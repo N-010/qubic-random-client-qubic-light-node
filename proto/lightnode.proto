@@ -15,6 +15,7 @@ message GetStatusRequest {}
 message TickStatus {
   uint32 epoch = 1;
   uint32 tick = 2;
+  // These fields are zero when status comes only from a BROADCAST_TICK cache entry.
   uint32 initial_tick = 3;
   uint32 tick_duration_ms = 4;
   uint32 aligned_votes = 5;
@@ -83,6 +84,7 @@ message QueryContractFunctionRequest {
 
 message QueryContractFunctionResponse {
   bool ok = 1;
+  // A successful Core response is non-empty. Empty output is reported as an error.
   bytes output = 2;
   string error = 3;
 }
@@ -93,6 +95,7 @@ message BroadcastTransactionRequest {
 
 message BroadcastTransactionResponse {
   bool ok = 1;
+  // Canonical lowercase 60-character Qubic identity derived from K12(tx_bytes).
   string tx_id = 2;
   string error = 3;
 }

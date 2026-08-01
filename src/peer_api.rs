@@ -1,10 +1,11 @@
-use crate::codec::{bytes_to_hex, read_i32, read_i64, read_u16, read_u32};
+use crate::codec::{bytes_to_hex, read_i32, read_i64, read_u32};
 use crate::config::Config;
 use crate::frame::{
-    BROADCAST_TRANSACTION_TYPE, END_RESPONSE_TYPE, REQUEST_ENTITY_TYPE,
-    RESPOND_CONTRACT_FUNCTION_TYPE, RESPOND_ENTITY_TYPE, TRY_AGAIN_TYPE,
+    BROADCAST_TRANSACTION_TYPE, END_RESPONSE_TYPE, MAX_CONTRACT_FUNCTION_OUTPUT_SIZE,
+    NUMBER_OF_TRANSACTIONS_PER_TICK, REQUEST_ENTITY_TYPE, RESPOND_CONTRACT_FUNCTION_TYPE,
+    RESPOND_ENTITY_PAYLOAD_SIZE, RESPOND_ENTITY_TYPE, SPECTRUM_CAPACITY, TRY_AGAIN_TYPE,
     build_request_contract_function_frame, build_request_frame,
-    build_request_tick_transactions_frame, frame_payload,
+    build_request_tick_transactions_frame, frame_payload, parse_transaction_layout,
 };
 use crate::pending::{PendingEvent, PendingRequests};
 use crate::state::NodeState;
@@ -15,9 +16,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
-const RESPOND_ENTITY_MIN_PAYLOAD_SIZE: usize = 72;
-const TRANSACTION_BASE_SIZE: usize = 80;
-const SIGNATURE_SIZE: usize = 64;
 const MAX_PARALLEL_PEER_QUERIES: usize = 3;
 
 pub(crate) async fn query_balance(
@@ -52,7 +50,12 @@ pub(crate) async fn query_balance(
     let mut join_set = JoinSet::new();
     for (peer_id, receiver) in receivers {
         let wallet = wallet.to_string();
-        join_set.spawn(async move { (peer_id, receive_balance(receiver, &wallet).await) });
+        join_set.spawn(async move {
+            (
+                peer_id,
+                receive_balance(receiver, &wallet, public_key).await,
+            )
+        });
     }
 
     let mut last_err = String::new();
@@ -116,7 +119,7 @@ pub(crate) async fn query_tick_transactions(
 
     let mut join_set = JoinSet::new();
     for (peer_id, receiver) in receivers {
-        join_set.spawn(async move { (peer_id, receive_tick_transactions(receiver).await) });
+        join_set.spawn(async move { (peer_id, receive_tick_transactions(receiver, tick).await) });
     }
 
     let mut last_err = String::new();
@@ -222,13 +225,14 @@ pub(crate) async fn query_contract_function(
 async fn receive_balance(
     mut receiver: mpsc::UnboundedReceiver<PendingEvent>,
     wallet: &str,
+    public_key: [u8; 32],
 ) -> Result<BalanceResponse, String> {
     while let Some(event) = receiver.recv().await {
         match event {
             PendingEvent::Frame(frame) => match frame[3] {
                 RESPOND_ENTITY_TYPE => {
                     let payload = frame_payload(&frame)?;
-                    return parse_balance_payload(wallet, payload);
+                    return parse_balance_payload(wallet, public_key, payload);
                 }
                 END_RESPONSE_TYPE => {
                     return Err("Peer returned END_RESPONSE without balance data".to_string());
@@ -244,14 +248,20 @@ async fn receive_balance(
 
 async fn receive_tick_transactions(
     mut receiver: mpsc::UnboundedReceiver<PendingEvent>,
+    requested_tick: u32,
 ) -> Result<Vec<TickTransaction>, String> {
     let mut transactions = Vec::<TickTransaction>::new();
     while let Some(event) = receiver.recv().await {
         match event {
             PendingEvent::Frame(frame) => match frame[3] {
                 BROADCAST_TRANSACTION_TYPE => {
+                    if transactions.len() >= NUMBER_OF_TRANSACTIONS_PER_TICK {
+                        return Err(format!(
+                            "Peer returned more than {NUMBER_OF_TRANSACTIONS_PER_TICK} transactions"
+                        ));
+                    }
                     let tx_payload = frame_payload(&frame)?;
-                    transactions.push(parse_transaction_payload(tx_payload)?);
+                    transactions.push(parse_transaction_payload(tx_payload, requested_tick)?);
                 }
                 END_RESPONSE_TYPE => return Ok(transactions),
                 TRY_AGAIN_TYPE => return Err("peer requested retry".to_string()),
@@ -269,7 +279,19 @@ async fn receive_contract_function(
     while let Some(event) = receiver.recv().await {
         match event {
             PendingEvent::Frame(frame) => match frame[3] {
-                RESPOND_CONTRACT_FUNCTION_TYPE => return Ok(frame_payload(&frame)?.to_vec()),
+                RESPOND_CONTRACT_FUNCTION_TYPE => {
+                    let payload = frame_payload(&frame)?;
+                    if payload.is_empty() {
+                        return Err("contract function invocation failed".to_string());
+                    }
+                    if payload.len() > MAX_CONTRACT_FUNCTION_OUTPUT_SIZE {
+                        return Err(format!(
+                            "Contract function output is too large: maximum {MAX_CONTRACT_FUNCTION_OUTPUT_SIZE}, got {}",
+                            payload.len()
+                        ));
+                    }
+                    return Ok(payload.to_vec());
+                }
                 TRY_AGAIN_TYPE => return Err("peer requested retry".to_string()),
                 END_RESPONSE_TYPE => {
                     return Err(
@@ -305,27 +327,44 @@ fn api_timeout_error(timeout_duration: std::time::Duration) -> String {
     )
 }
 
-fn parse_balance_payload(wallet: &str, payload: &[u8]) -> Result<BalanceResponse, String> {
-    if payload.len() < RESPOND_ENTITY_MIN_PAYLOAD_SIZE {
+fn parse_balance_payload(
+    wallet: &str,
+    requested_public_key: [u8; 32],
+    payload: &[u8],
+) -> Result<BalanceResponse, String> {
+    if payload.len() != RESPOND_ENTITY_PAYLOAD_SIZE {
         return Err(format!(
-            "RespondEntity payload too small: {}",
+            "RespondEntity payload size mismatch: expected {RESPOND_ENTITY_PAYLOAD_SIZE}, got {}",
             payload.len()
         ));
+    }
+    if payload[..32] != requested_public_key {
+        return Err("RespondEntity public key does not match request".to_string());
     }
 
     let incoming_amount =
         read_i64(payload, 32).ok_or_else(|| "incomingAmount missing".to_string())?;
     let outgoing_amount =
         read_i64(payload, 40).ok_or_else(|| "outgoingAmount missing".to_string())?;
+    let balance = incoming_amount
+        .checked_sub(outgoing_amount)
+        .ok_or_else(|| "RespondEntity balance overflows int64".to_string())?;
+    let spectrum_index =
+        read_i32(payload, 68).ok_or_else(|| "spectrumIndex missing".to_string())?;
+    if spectrum_index != -1 && !(0..SPECTRUM_CAPACITY).contains(&spectrum_index) {
+        return Err(format!(
+            "RespondEntity spectrumIndex is out of range: {spectrum_index}"
+        ));
+    }
 
     Ok(BalanceResponse {
         wallet: wallet.to_string(),
         public_key_hex: format!("0x{}", bytes_to_hex(&payload[0..32])),
         tick: read_u32(payload, 64).ok_or_else(|| "tick missing".to_string())?,
-        spectrum_index: read_i32(payload, 68).ok_or_else(|| "spectrumIndex missing".to_string())?,
+        spectrum_index,
         incoming_amount,
         outgoing_amount,
-        balance: incoming_amount - outgoing_amount,
+        balance,
         number_of_incoming_transfers: read_u32(payload, 48)
             .ok_or_else(|| "numberOfIncomingTransfers missing".to_string())?,
         number_of_outgoing_transfers: read_u32(payload, 52)
@@ -337,33 +376,22 @@ fn parse_balance_payload(wallet: &str, payload: &[u8]) -> Result<BalanceResponse
     })
 }
 
-fn parse_transaction_payload(payload: &[u8]) -> Result<TickTransaction, String> {
-    if payload.len() < TRANSACTION_BASE_SIZE + SIGNATURE_SIZE {
-        return Err(format!("Transaction payload too small: {}", payload.len()));
-    }
-
-    let input_size = read_u16(payload, 78).ok_or_else(|| "inputSize missing".to_string())? as usize;
-    let expected_size = TRANSACTION_BASE_SIZE + input_size + SIGNATURE_SIZE;
-    if payload.len() != expected_size {
-        return Err(format!(
-            "Transaction payload size mismatch: expected {expected_size}, got {}",
-            payload.len()
-        ));
-    }
-
-    let input_start = TRANSACTION_BASE_SIZE;
-    let input_end = input_start + input_size;
-    let signature_start = input_end;
+fn parse_transaction_payload(
+    payload: &[u8],
+    expected_tick: u32,
+) -> Result<TickTransaction, String> {
+    let layout = parse_transaction_layout(payload, Some(expected_tick))?;
+    let input_end = layout.input_start + layout.input_size as usize;
 
     Ok(TickTransaction {
         source_public_key_hex: format!("0x{}", bytes_to_hex(&payload[0..32])),
         destination_public_key_hex: format!("0x{}", bytes_to_hex(&payload[32..64])),
-        amount: read_i64(payload, 64).ok_or_else(|| "amount missing".to_string())?,
-        tick: read_u32(payload, 72).ok_or_else(|| "tick missing".to_string())?,
-        input_type: read_u16(payload, 76).ok_or_else(|| "inputType missing".to_string())?,
-        input_size: input_size as u16,
-        input_hex: bytes_to_hex(&payload[input_start..input_end]),
-        signature_hex: bytes_to_hex(&payload[signature_start..]),
+        amount: layout.amount,
+        tick: layout.tick,
+        input_type: layout.input_type,
+        input_size: layout.input_size,
+        input_hex: bytes_to_hex(&payload[layout.input_start..input_end]),
+        signature_hex: bytes_to_hex(&payload[layout.signature_start..]),
     })
 }
 
@@ -371,7 +399,7 @@ fn parse_transaction_payload(payload: &[u8]) -> Result<TickTransaction, String> 
 mod tests {
     use super::*;
     use crate::config::{DEFAULT_GRPC_PORT, DEFAULT_PORT};
-    use crate::frame::build_request_frame;
+    use crate::frame::{SIGNATURE_SIZE, TRANSACTION_BASE_SIZE, build_request_frame};
     use pretty_assertions::assert_eq;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
@@ -427,7 +455,7 @@ mod tests {
         payload[78..80].copy_from_slice(&1u16.to_le_bytes());
 
         assert_eq!(
-            parse_transaction_payload(&payload).unwrap_err(),
+            parse_transaction_payload(&payload, 0).unwrap_err(),
             "Transaction payload size mismatch: expected 145, got 144"
         );
     }
@@ -435,10 +463,17 @@ mod tests {
     fn transaction_frame(dejavu: u32, amount: i64) -> Bytes {
         let mut payload = vec![0; TRANSACTION_BASE_SIZE + SIGNATURE_SIZE];
         payload[64..72].copy_from_slice(&amount.to_le_bytes());
+        payload[72..76].copy_from_slice(&42u32.to_le_bytes());
         Bytes::from(
             build_request_frame(BROADCAST_TRANSACTION_TYPE, dejavu, &payload)
                 .expect("transaction frame should build"),
         )
+    }
+
+    fn entity_payload(public_key: [u8; 32]) -> [u8; RESPOND_ENTITY_PAYLOAD_SIZE] {
+        let mut payload = [0; RESPOND_ENTITY_PAYLOAD_SIZE];
+        payload[..32].copy_from_slice(&public_key);
+        payload
     }
 
     #[tokio::test]
@@ -458,11 +493,60 @@ mod tests {
             )))
             .unwrap();
 
-        let peer_2_transactions = receive_tick_transactions(peer_2_rx).await.unwrap();
+        let peer_2_transactions = receive_tick_transactions(peer_2_rx, 42).await.unwrap();
 
         assert_eq!(peer_2_transactions.len(), 1);
         assert_eq!(peer_2_transactions[0].amount, 22);
         assert!(!peer_1_rx.is_empty());
+    }
+
+    #[test]
+    fn balance_response_is_bound_to_request_and_exact_core_layout() {
+        let public_key = [9; 32];
+        let payload = entity_payload(public_key);
+
+        assert!(parse_balance_payload("wallet", public_key, &payload).is_ok());
+        assert_eq!(
+            parse_balance_payload("wallet", public_key, &payload[..72]).unwrap_err(),
+            "RespondEntity payload size mismatch: expected 840, got 72"
+        );
+        assert_eq!(
+            parse_balance_payload("wallet", [8; 32], &payload).unwrap_err(),
+            "RespondEntity public key does not match request"
+        );
+    }
+
+    #[test]
+    fn balance_response_rejects_invalid_index_and_overflow() {
+        let public_key = [9; 32];
+        let mut invalid_index = entity_payload(public_key);
+        invalid_index[68..72].copy_from_slice(&SPECTRUM_CAPACITY.to_le_bytes());
+        assert_eq!(
+            parse_balance_payload("wallet", public_key, &invalid_index).unwrap_err(),
+            "RespondEntity spectrumIndex is out of range: 16777216"
+        );
+
+        let mut overflowing = entity_payload(public_key);
+        overflowing[32..40].copy_from_slice(&i64::MAX.to_le_bytes());
+        overflowing[40..48].copy_from_slice(&(-1i64).to_le_bytes());
+        assert_eq!(
+            parse_balance_payload("wallet", public_key, &overflowing).unwrap_err(),
+            "RespondEntity balance overflows int64"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_response_rejects_more_than_core_transaction_limit() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for _ in 0..=NUMBER_OF_TRANSACTIONS_PER_TICK {
+            tx.send(PendingEvent::Frame(transaction_frame(7, 0)))
+                .unwrap();
+        }
+
+        assert_eq!(
+            receive_tick_transactions(rx, 42).await.unwrap_err(),
+            "Peer returned more than 4096 transactions"
+        );
     }
 
     #[tokio::test]
@@ -478,7 +562,7 @@ mod tests {
         ));
         let request = peer_rx.recv().await.unwrap();
         let dejavu = u32::from_le_bytes(request[4..8].try_into().unwrap());
-        let mut payload = [0; RESPOND_ENTITY_MIN_PAYLOAD_SIZE];
+        let mut payload = [0; RESPOND_ENTITY_PAYLOAD_SIZE];
         payload[..32].copy_from_slice(&[9; 32]);
         payload[32..40].copy_from_slice(&100i64.to_le_bytes());
         payload[40..48].copy_from_slice(&40i64.to_le_bytes());
@@ -556,7 +640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contract_function_preserves_empty_response() {
+    async fn contract_function_rejects_empty_response_as_core_failure() {
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(PendingEvent::Frame(Bytes::from(
             build_request_frame(RESPOND_CONTRACT_FUNCTION_TYPE, 7, &[]).unwrap(),
@@ -564,8 +648,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            receive_contract_function(rx).await.unwrap(),
-            Vec::<u8>::new()
+            receive_contract_function(rx).await.unwrap_err(),
+            "contract function invocation failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn contract_function_rejects_output_larger_than_core_u16_size() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(PendingEvent::Frame(Bytes::from(
+            build_request_frame(
+                RESPOND_CONTRACT_FUNCTION_TYPE,
+                7,
+                &vec![0; MAX_CONTRACT_FUNCTION_OUTPUT_SIZE + 1],
+            )
+            .unwrap(),
+        )))
+        .unwrap();
+
+        assert_eq!(
+            receive_contract_function(rx).await.unwrap_err(),
+            "Contract function output is too large: maximum 65535, got 65536"
         );
     }
 }

@@ -86,6 +86,8 @@ Important notes:
 - right after start, `GetStatus` can return no local tick data yet; this is normal until the node receives network frames
 - the process can still start even if DNS bootstrap fails; in that case you can wait for incoming peers or pass `--peer` manually
 - by default, relay is limited to frames with `dejavu == 0`; use `--relay-all` to also relay frames with non-zero `dejavu`
+- peer exchange frames are consumed locally and are never relayed; Oracle Machine and Outsourced Computation channel-only message types (`190`-`192`) are also never forwarded to ordinary Qubic peers
+- known broadcast transaction and tick layouts are checked against the current Core constants before they update local state or enter relay fanout; this is structural validation, not FourQ signature verification
 - each relayed frame is queued to at most six randomly selected peers, matching the Qubic Core dissemination multiplier
 - TCP input is accumulated in reusable buffers and complete frames are split into immutable, reference-counted byte views; relay fanout shares the same frame storage across all selected peer queues without copying the payload per peer
 - peer/session state and the rolling deduplication window use separate lock domains, while the latest epoch/tick is kept in an atomic cache for lock-free status reads
@@ -164,15 +166,15 @@ Service name: `lightnode.LightNode`
 Methods:
 
 - `GetStatus`
-  Returns the latest tick known to the node's local cache.
+  Returns the latest epoch and tick observed in the node's local broadcast cache. The response warning states that peer broadcasts are unverified and that fields unavailable from `BROADCAST_TICK` are returned as zero.
 - `GetBalance`
-  Queries peers for wallet balance data and returns the first successful response.
+  Queries peers for wallet balance data and returns the first structurally valid response whose public key matches the request.
 - `GetTickTransactions`
-  Queries peers for transactions from the requested tick and returns the first successful response.
+  Queries peers for transactions from the requested tick and returns the first structurally valid response. Transactions must satisfy the Core wire-size, tick, amount, input-size, and per-tick count limits.
 - `QueryContractFunction`
-  Calls a read-only smart-contract function and returns its raw output bytes.
+  Calls a read-only smart-contract function and returns its raw output bytes. An empty Core response is treated as invocation failure, while `TRY_AGAIN` lets another queried peer win the race.
 - `BroadcastTransaction`
-  Broadcasts raw transaction bytes to currently connected peers.
+  Structurally validates and broadcasts raw transaction bytes to currently connected peers. A successful response contains the canonical lowercase 60-character Qubic transaction ID derived from the KangarooTwelve digest of the complete transaction.
 
 Protocol file: `proto/lightnode.proto`
 
@@ -182,11 +184,15 @@ At most 64 peer-backed gRPC calls run at once. Each call sends its request over 
 
 `QueryContractFunction` accepts a contract index, a function input type, and up to 1024 raw input bytes. Contract-specific encoding and output decoding remain the caller's responsibility.
 
+Peer-backed responses are not cryptographically trustless in this release. The node does not yet verify FourQ signatures, the `RespondEntity` Merkle proof, or transaction membership in signed `TickData`; it races up to three peers and accepts the first response that passes strict structural and request-binding validation.
+
+`BroadcastTransaction.ok=true` means that the transaction passed the locally available subset of Core's `Transaction::checkValidity()` and was queued to at least one connected peer. It does not mean that a Core node accepted the signature or that the network confirmed the transaction.
+
 ## Wallet Format For GetBalance
 
 `GetBalance` accepts either:
 
-- a Qubic identity of 60 letters `A-Z`; lowercase input is normalized automatically
+- a Qubic identity of 60 letters `A-Z`; lowercase input is normalized automatically and the four-character K12 checksum is validated
 - a public key in hex form: either `0x` + 64 hex characters or plain 64 hex characters
 
 ## Troubleshooting
