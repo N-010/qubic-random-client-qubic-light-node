@@ -25,9 +25,11 @@ target*
 /target-codex*
 .agents
 .claude
-AGENTS.md
-CLAUDE.md
 
 # GitNexus
 .gitnexusrc
 .gitnexusignore
+
+
+*.md
+!docs/**/*.md

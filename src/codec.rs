@@ -75,7 +75,7 @@ pub(crate) fn tx_id_from_bytes(tx_bytes: &[u8]) -> String {
     qubic_identity(&kangaroo_twelve(tx_bytes), true)
 }
 
-fn kangaroo_twelve(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn kangaroo_twelve(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = KangarooTwelve::new(&[]);
     hasher.update(bytes);
     let mut digest = [0u8; 32];

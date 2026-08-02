@@ -1,6 +1,6 @@
 [package]
 name = "QubicLightNode"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [workspace]
@@ -19,9 +19,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 socket2 = "0.5"
 tokio = { version = "1.48.0", features = ["full"] }
-tokio-stream = "0.1.18"
 tonic = { version = "0.12.3", features = ["transport"] }
-tonic-reflection = "0.12.3"
 tiny-keccak = { version = "2.0.2", features = ["k12"] }
 
 [build-dependencies]
@@ -30,6 +28,8 @@ tonic-build = "0.12.3"
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"
+proptest = "1.7.0"
+qubic-fourq-verifier = { path = "crates/qubic-fourq-verifier", features = ["test-signing"] }
 
 # The FourQ implementation intentionally relies on wrapping integer
 # arithmetic. Keep overflow checks enabled for this crate and disable them only

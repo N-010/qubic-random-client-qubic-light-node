@@ -1,6 +1,7 @@
-use crate::codec::{read_i64, read_u16, read_u32};
+use crate::codec::{kangaroo_twelve, read_i64, read_u16, read_u32};
 #[cfg(test)]
 use crate::types::TickStatus;
+use qubic_fourq_verifier::verify_digest;
 use rand::Rng;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -17,18 +18,13 @@ pub(crate) const REQUEST_COMPUTORS_TYPE: u8 = 11;
 pub(crate) const BROADCAST_TRANSACTION_TYPE: u8 = 24;
 #[cfg(test)]
 pub(crate) const RESPOND_CURRENT_TICK_INFO_TYPE: u8 = 28;
-pub(crate) const REQUEST_TICK_TRANSACTIONS_TYPE: u8 = 29;
 pub(crate) const REQUEST_ENTITY_TYPE: u8 = 31;
 pub(crate) const RESPOND_ENTITY_TYPE: u8 = 32;
 pub(crate) const END_RESPONSE_TYPE: u8 = 35;
 pub(crate) const REQUEST_CONTRACT_FUNCTION_TYPE: u8 = 42;
 pub(crate) const RESPOND_CONTRACT_FUNCTION_TYPE: u8 = 43;
 pub(crate) const TRY_AGAIN_TYPE: u8 = 54;
-pub(crate) const ORACLE_MACHINE_QUERY_TYPE: u8 = 190;
-pub(crate) const ORACLE_MACHINE_REPLY_TYPE: u8 = 191;
-pub(crate) const OC_MACHINE_INVOCATION_TYPE: u8 = 192;
 
-pub(crate) const NUMBER_OF_TRANSACTIONS_PER_TICK: usize = 4096;
 pub(crate) const NUMBER_OF_COMPUTORS: usize = 676;
 pub(crate) const MAX_NUMBER_OF_CONTRACTS: u32 = 1024;
 pub(crate) const MAX_INPUT_SIZE: usize = 1024;
@@ -37,8 +33,6 @@ pub(crate) const MAX_CONTRACT_FUNCTION_OUTPUT_SIZE: usize = u16::MAX as usize;
 pub(crate) const MAX_AMOUNT: i64 = 1_000_000_000_000_000;
 pub(crate) const TRANSACTION_BASE_SIZE: usize = 80;
 pub(crate) const SIGNATURE_SIZE: usize = 64;
-pub(crate) const MAX_TRANSACTION_FRAME_BYTES: usize =
-    HEADER_SIZE + TRANSACTION_BASE_SIZE + MAX_INPUT_SIZE + SIGNATURE_SIZE;
 pub(crate) const SPECTRUM_DEPTH: usize = 24;
 pub(crate) const SPECTRUM_CAPACITY: i32 = 1 << SPECTRUM_DEPTH;
 pub(crate) const RESPOND_ENTITY_PAYLOAD_SIZE: usize = 64 + 8 + 32 * SPECTRUM_DEPTH;
@@ -48,9 +42,6 @@ pub(crate) const BROADCAST_COMPUTORS_PAYLOAD_SIZE: usize =
     2 + COMPUTORS_PUBLIC_KEYS_SIZE + SIGNATURE_SIZE;
 pub(crate) const MIN_OPERATIONAL_FRAME_BYTES: usize =
     HEADER_SIZE + 8 + MAX_CONTRACT_FUNCTION_INPUT_SIZE;
-pub(crate) const REQUEST_TICK_TRANSACTION_FLAGS_SIZE: usize = NUMBER_OF_TRANSACTIONS_PER_TICK / 8;
-pub(crate) const REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE: usize =
-    4 + REQUEST_TICK_TRANSACTION_FLAGS_SIZE;
 #[cfg(test)]
 pub(crate) const RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE: usize = 16;
 
@@ -78,7 +69,6 @@ pub(crate) fn message_type_name(message_type: u8) -> &'static str {
         26 => "REQUEST_TRANSACTION_INFO",
         27 => "REQUEST_CURRENT_TICK_INFO",
         28 => "RESPOND_CURRENT_TICK_INFO",
-        29 => "REQUEST_TICK_TRANSACTIONS",
         31 => "REQUEST_ENTITY",
         32 => "RESPOND_ENTITY",
         33 => "REQUEST_CONTRACT_IPO",
@@ -179,15 +169,6 @@ pub(crate) fn build_request_frame(
     frame.extend_from_slice(&dejavu.to_le_bytes());
     frame.extend_from_slice(payload);
     Ok(frame)
-}
-
-pub(crate) fn build_request_tick_transactions_frame(
-    dejavu: u32,
-    tick: u32,
-) -> Result<Vec<u8>, String> {
-    let mut payload = [0u8; REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE];
-    payload[..4].copy_from_slice(&tick.to_le_bytes());
-    build_request_frame(REQUEST_TICK_TRANSACTIONS_TYPE, dejavu, &payload)
 }
 
 pub(crate) fn build_request_contract_function_frame(
@@ -331,6 +312,52 @@ pub(crate) struct TransactionLayout {
     pub(crate) signature_start: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ValidatedTransaction<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ValidatedTransaction<'a> {
+    pub(crate) fn bytes(self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+pub(crate) fn validate_transaction(
+    payload: &[u8],
+    expected_tick: Option<u32>,
+) -> Result<ValidatedTransaction<'_>, String> {
+    let layout = parse_transaction_layout(payload, expected_tick)?;
+    let public_key: [u8; 32] = payload[..32]
+        .try_into()
+        .expect("validated transaction contains a source public key");
+    let signature: [u8; SIGNATURE_SIZE] = payload[layout.signature_start..]
+        .try_into()
+        .expect("validated transaction contains an exact-size signature");
+    let digest = kangaroo_twelve(&payload[..layout.signature_start]);
+    if !verify_digest(&public_key, &digest, &signature) {
+        return Err("Transaction signature is invalid".to_string());
+    }
+    Ok(ValidatedTransaction { bytes: payload })
+}
+
+#[cfg(test)]
+pub(crate) fn signed_transaction_for_test(marker: u8) -> Vec<u8> {
+    let subseed = [marker.max(1); 32];
+    let (public_key, _) = qubic_fourq_verifier::test_signing::sign_digest(&subseed, &[0; 32]);
+    let mut transaction = vec![0; TRANSACTION_BASE_SIZE + SIGNATURE_SIZE];
+    transaction[..32].copy_from_slice(&public_key);
+    transaction[32..64].fill(marker);
+    transaction[64..72].copy_from_slice(&100i64.to_le_bytes());
+    transaction[72..76].copy_from_slice(&123u32.to_le_bytes());
+    let digest = kangaroo_twelve(&transaction[..TRANSACTION_BASE_SIZE]);
+    let (signed_public_key, signature) =
+        qubic_fourq_verifier::test_signing::sign_digest(&subseed, &digest);
+    debug_assert_eq!(signed_public_key, public_key);
+    transaction[TRANSACTION_BASE_SIZE..].copy_from_slice(&signature);
+    transaction
+}
+
 pub(crate) fn parse_transaction_layout(
     payload: &[u8],
     expected_tick: Option<u32>,
@@ -384,22 +411,7 @@ pub(crate) fn parse_transaction_layout(
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
-
-    #[test]
-    fn builds_request_tick_transactions_frame_for_current_core_layout() {
-        let dejavu = 0x90AB_CDEF;
-        let tick = 0x1234_5678;
-
-        let frame = build_request_tick_transactions_frame(dejavu, tick).unwrap();
-        let mut expected = vec![0u8; 524];
-        expected[..3].copy_from_slice(&[0x0C, 0x02, 0x00]);
-        expected[3] = REQUEST_TICK_TRANSACTIONS_TYPE;
-        expected[4..8].copy_from_slice(&dejavu.to_le_bytes());
-        expected[8..12].copy_from_slice(&tick.to_le_bytes());
-
-        assert_eq!(REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE, 516);
-        assert_eq!(frame, expected);
-    }
+    use proptest::prelude::*;
 
     #[test]
     fn builds_request_contract_function_frame_for_current_core_layout() {
@@ -527,6 +539,50 @@ mod tests {
                 signature_start: TRANSACTION_BASE_SIZE + MAX_INPUT_SIZE,
             })
         );
+    }
+
+    #[test]
+    fn validates_core_signed_transaction_and_rejects_any_signature_mutation() {
+        let transaction = signed_transaction_for_test(7);
+        assert!(validate_transaction(&transaction, Some(123)).is_ok());
+
+        for signature_index in TRANSACTION_BASE_SIZE..transaction.len() {
+            let mut mutated = transaction.clone();
+            mutated[signature_index] ^= 1;
+            assert!(validate_transaction(&mutated, Some(123)).is_err());
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn transaction_layout_accepts_exactly_the_declared_input_size(
+            input_size in 0usize..=MAX_INPUT_SIZE,
+            extra_bytes in 1usize..=8,
+        ) {
+            let valid = transaction_payload(input_size, 0, 123);
+            prop_assert!(parse_transaction_layout(&valid, Some(123)).is_ok());
+
+            let mut too_long = valid.clone();
+            too_long.extend(std::iter::repeat_n(0, extra_bytes));
+            prop_assert!(parse_transaction_layout(&too_long, Some(123)).is_err());
+
+            let too_short = &valid[..valid.len() - extra_bytes.min(valid.len())];
+            prop_assert!(parse_transaction_layout(too_short, Some(123)).is_err());
+        }
+
+        #[test]
+        fn non_canonical_fourq_encoding_is_rejected_before_curve_work(
+            public_key in any::<[u8; 32]>(),
+            digest in any::<[u8; 32]>(),
+            mut signature in any::<[u8; 64]>(),
+        ) {
+            signature[15] |= 0x80;
+            prop_assert!(!qubic_fourq_verifier::verify_digest(
+                &public_key,
+                &digest,
+                &signature,
+            ));
+        }
     }
 
     #[test]

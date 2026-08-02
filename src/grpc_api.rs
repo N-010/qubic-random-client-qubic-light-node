@@ -1,24 +1,16 @@
-use crate::LIGHTNODE_FILE_DESCRIPTOR_SET;
 use crate::codec::{parse_wallet_public_key, tx_id_from_bytes};
 use crate::frame::{
-    MAX_CONTRACT_FUNCTION_INPUT_SIZE, MAX_NUMBER_OF_CONTRACTS, parse_transaction_layout,
+    MAX_CONTRACT_FUNCTION_INPUT_SIZE, MAX_NUMBER_OF_CONTRACTS, validate_transaction,
 };
 use crate::lightnodepb;
 use crate::network::broadcast_transaction_to_network;
-use crate::peer_api::{
-    PeerQueryError, query_balance, query_contract_function, stream_tick_transactions,
-};
-use crate::types::{ApiState, BalanceResponse, TickStatus, TickTransaction};
+use crate::peer_api::{query_balance, query_contract_function};
+use crate::types::{ApiState, BalanceResponse, TickStatus};
 use std::collections::HashMap;
-use std::future::Future;
 use std::net::IpAddr;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
-use tokio::time::{Instant as TokioInstant, sleep_until, timeout_at};
-use tokio_stream::Stream;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
@@ -26,104 +18,27 @@ use tonic::{Request, Response, Status};
 pub(crate) struct GrpcService {
     pub(crate) api: ApiState,
     peer_query_slots: Arc<Semaphore>,
-    tick_stream_slots: Arc<Semaphore>,
     broadcast_slots: Arc<Semaphore>,
     broadcast_rate: Arc<StdMutex<BroadcastRateLimiter>>,
     broadcasts_inflight: Arc<StdMutex<BroadcastInflight>>,
 }
 
 const MAX_CONCURRENT_PEER_QUERIES: usize = 64;
-const MAX_CONCURRENT_TICK_STREAMS: usize = 8;
 const MAX_CONCURRENT_BROADCASTS: usize = 32;
 const PEER_QUERY_OVERLOADED_ERROR: &str =
     "Peer-backed API is overloaded; retry after an in-flight query completes";
-
-#[derive(Debug)]
-pub(crate) struct TickTransactionStream {
-    data: mpsc::Receiver<lightnodepb::Transaction>,
-    terminal: oneshot::Receiver<Option<Status>>,
-    data_closed: bool,
-    terminal_done: bool,
-}
-
-impl Stream for TickTransactionStream {
-    type Item = Result<lightnodepb::Transaction, Status>;
-
-    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if !self.data_closed {
-            match Pin::new(&mut self.data).poll_recv(context) {
-                Poll::Ready(Some(transaction)) => return Poll::Ready(Some(Ok(transaction))),
-                Poll::Ready(None) => self.data_closed = true,
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-        if self.terminal_done {
-            return Poll::Ready(None);
-        }
-        match Pin::new(&mut self.terminal).poll(context) {
-            Poll::Ready(Ok(None)) => {
-                self.terminal_done = true;
-                Poll::Ready(None)
-            }
-            Poll::Ready(Ok(Some(status))) => {
-                self.terminal_done = true;
-                Poll::Ready(Some(Err(status)))
-            }
-            Poll::Ready(Err(_)) => {
-                self.terminal_done = true;
-                Poll::Ready(Some(Err(Status::internal(
-                    "tick stream bridge stopped before reporting completion",
-                ))))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-fn peer_query_status(error: PeerQueryError) -> Status {
-    let message = error.to_string();
-    match error {
-        PeerQueryError::Deadline(_) => Status::deadline_exceeded(message),
-        PeerQueryError::NoPeers | PeerQueryError::PeerUnavailable(_) => {
-            Status::unavailable(message)
-        }
-        PeerQueryError::LocalOverload(_) => Status::resource_exhausted(message),
-        PeerQueryError::Protocol(_) => Status::data_loss(message),
-        PeerQueryError::Cancelled => Status::cancelled(message),
-        PeerQueryError::Internal(_) => Status::internal(message),
-    }
-}
-
-fn map_tick_query_result(
-    result: Result<Result<(), PeerQueryError>, tokio::task::JoinError>,
-) -> Option<Status> {
-    match result {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(peer_query_status(error)),
-        Err(error) if error.is_cancelled() => Some(Status::cancelled("tick stream task cancelled")),
-        Err(error) => Some(Status::internal(format!(
-            "tick stream task failed: {error}"
-        ))),
-    }
-}
 
 pub(crate) async fn run_grpc_server(api_state: ApiState) -> std::io::Result<()> {
     let service = GrpcService {
         api: api_state.clone(),
         peer_query_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_QUERIES)),
-        tick_stream_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_TICK_STREAMS)),
         broadcast_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BROADCASTS)),
         broadcast_rate: Arc::new(StdMutex::new(BroadcastRateLimiter::default())),
         broadcasts_inflight: Arc::new(StdMutex::new(BroadcastInflight::default())),
     };
-    let reflection = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(LIGHTNODE_FILE_DESCRIPTOR_SET)
-        .build_v1()
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
     println!("gRPC listening on {}", api_state.config.grpc_listen_addr);
 
     Server::builder()
-        .add_service(reflection)
         .add_service(lightnodepb::light_node_server::LightNodeServer::new(
             service,
         ))
@@ -178,6 +93,7 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
             Arc::clone(&self.api.node_state),
             Arc::clone(&self.api.pending_requests),
             Arc::clone(&self.api.outbound_budget),
+            Arc::clone(&self.api.trusted_network),
             Arc::clone(&self.api.config),
             &wallet,
             public_key,
@@ -195,114 +111,6 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
                 error: err.to_string(),
             })),
         }
-    }
-
-    type StreamTickTransactionsStream = TickTransactionStream;
-
-    async fn stream_tick_transactions(
-        &self,
-        request: Request<lightnodepb::GetTickTransactionsRequest>,
-    ) -> Result<Response<Self::StreamTickTransactionsStream>, Status> {
-        let tick = request.into_inner().tick;
-        let Ok(permit) = Arc::clone(&self.tick_stream_slots).try_acquire_owned() else {
-            return Err(Status::resource_exhausted(
-                "Tick transaction stream limit reached",
-            ));
-        };
-        let deadline = TokioInstant::now() + self.api.config.api_timeout;
-        let (rpc_tx, rpc_rx) = mpsc::channel(32);
-        let (terminal_tx, terminal_rx) = oneshot::channel();
-        let api = self.api.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let (domain_tx, mut domain_rx) = mpsc::channel(32);
-            let mut query = tokio::spawn(stream_tick_transactions(
-                Arc::clone(&api.node_state),
-                Arc::clone(&api.pending_requests),
-                Arc::clone(&api.outbound_budget),
-                Arc::clone(&api.config),
-                tick,
-                domain_tx,
-                deadline,
-            ));
-            let mut query_result = None;
-            let mut query_joined = false;
-            let mut domain_open = true;
-            let terminal_status = loop {
-                tokio::select! {
-                    biased;
-                    _ = rpc_tx.closed() => {
-                        if query_result.is_none() {
-                            query.abort();
-                            let _ = (&mut query).await;
-                        }
-                        return;
-                    }
-                    _ = sleep_until(deadline) => {
-                        if query_result.is_none() {
-                            query.abort();
-                            let _ = (&mut query).await;
-                            query_joined = true;
-                        }
-                        break Some(Status::deadline_exceeded(
-                            "Tick transaction stream deadline exceeded",
-                        ));
-                    }
-                    result = &mut query, if query_result.is_none() => {
-                        query_result = Some(result);
-                        query_joined = true;
-                        if !domain_open {
-                            break map_tick_query_result(query_result.take().expect("query result was just stored"));
-                        }
-                    }
-                    transaction = domain_rx.recv(), if domain_open => {
-                        let Some(transaction) = transaction else {
-                            domain_open = false;
-                            if query_result.is_some() {
-                                break map_tick_query_result(query_result.take().expect("completed query has a result"));
-                            }
-                            continue;
-                        };
-                        let rpc_item = match transaction {
-                            Ok(transaction) => map_transaction(transaction),
-                            Err(err) => break Some(peer_query_status(err)),
-                        };
-                        match timeout_at(deadline, rpc_tx.send(rpc_item)).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) => {
-                                if query_result.is_none() {
-                                    query.abort();
-                                    let _ = (&mut query).await;
-                                }
-                                return;
-                            }
-                            Err(_) => {
-                                if query_result.is_none() {
-                                    query.abort();
-                                    let _ = (&mut query).await;
-                                    query_joined = true;
-                                }
-                                break Some(Status::deadline_exceeded(
-                                    "Tick transaction stream deadline exceeded",
-                                ));
-                            }
-                        }
-                    }
-                }
-            };
-            if !query_joined {
-                query.abort();
-                let _ = (&mut query).await;
-            }
-            drop(rpc_tx);
-            let _ = terminal_tx.send(terminal_status);
-        });
-        Ok(Response::new(TickTransactionStream {
-            data: rpc_rx,
-            terminal: terminal_rx,
-            data_closed: false,
-            terminal_done: false,
-        }))
     }
 
     async fn query_contract_function(
@@ -368,7 +176,8 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
             }));
         }
 
-        parse_transaction_layout(&tx_bytes, None).map_err(Status::invalid_argument)?;
+        let transaction =
+            validate_transaction(&tx_bytes, None).map_err(Status::invalid_argument)?;
         let _broadcast_permit = Arc::clone(&self.broadcast_slots)
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("Broadcast concurrency limit reached"))?;
@@ -394,9 +203,8 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
                     BroadcastLeaderGuard::new(Arc::clone(&self.broadcasts_inflight), digest);
                 let result = broadcast_transaction_to_network(
                     Arc::clone(&self.api.node_state),
-                    Arc::clone(&self.api.dedup),
                     Arc::clone(&self.api.outbound_budget),
-                    &tx_bytes,
+                    transaction,
                 )
                 .await;
                 leader.complete(result.clone());
@@ -599,26 +407,11 @@ fn map_balance(balance: BalanceResponse) -> lightnodepb::Balance {
     }
 }
 
-fn map_transaction(tx: TickTransaction) -> lightnodepb::Transaction {
-    lightnodepb::Transaction {
-        source_public_key_hex: tx.source_public_key_hex,
-        destination_public_key_hex: tx.destination_public_key_hex,
-        amount: tx.amount,
-        tick: tx.tick,
-        input_type: tx.input_type as u32,
-        input_size: tx.input_size as u32,
-        input_hex: tx.input_hex,
-        signature_hex: tx.signature_hex,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Config, DEFAULT_GRPC_PORT, DEFAULT_PORT};
-    use crate::frame::{
-        BROADCAST_TRANSACTION_TYPE, SIGNATURE_SIZE, TRANSACTION_BASE_SIZE, build_request_frame,
-    };
+    use crate::frame::{BROADCAST_TRANSACTION_TYPE, build_request_frame};
     use crate::lightnodepb::light_node_server::LightNode;
     use crate::state::NodeState;
     use bytes::Bytes;
@@ -626,18 +419,13 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
     use tokio::sync::{Mutex, mpsc, watch};
-    use tokio_stream::StreamExt;
 
     fn test_config() -> Arc<Config> {
         Arc::new(Config {
-            listen_addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), DEFAULT_PORT),
             api_timeout: Duration::from_secs(1),
             grpc_listen_addr: SocketAddr::from(([127, 0, 0, 1], DEFAULT_GRPC_PORT)),
-            grpc_enabled: true,
             peer_port: DEFAULT_PORT,
             target_outbound: 8,
-            max_incoming: 32,
-            max_seen: 1_000,
             max_known_peers: 1_000,
             reconnect_interval: Duration::from_millis(2_000),
             peer_write_timeout: Duration::from_secs(5),
@@ -645,7 +433,6 @@ mod tests {
             peer_handshake_timeout: Duration::from_secs(5),
             peer_frame_timeout: Duration::from_secs(30),
             max_frame_bytes: 1024 * 1024,
-            relay_all: false,
             dns_bootstrap: false,
             dns_lite_peers: 0,
             dns_timeout: Duration::from_secs(1),
@@ -663,14 +450,12 @@ mod tests {
         GrpcService {
             api: ApiState {
                 node_state,
-                dedup: Arc::new(crate::state::DedupWindow::new(1_000)),
                 pending_requests: Arc::new(crate::pending::PendingRequests::default()),
                 trusted_network: Arc::new(crate::verified::TrustedNetworkState::default()),
                 outbound_budget,
                 config: test_config(),
             },
             peer_query_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_PEER_QUERIES)),
-            tick_stream_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_TICK_STREAMS)),
             broadcast_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BROADCASTS)),
             broadcast_rate: Arc::new(StdMutex::new(BroadcastRateLimiter::default())),
             broadcasts_inflight: Arc::new(StdMutex::new(BroadcastInflight::default())),
@@ -678,21 +463,22 @@ mod tests {
     }
 
     fn valid_transaction(marker: u8) -> Vec<u8> {
-        let mut transaction = vec![0; TRANSACTION_BASE_SIZE + SIGNATURE_SIZE];
-        transaction[0] = marker;
-        transaction[64..72].copy_from_slice(&100i64.to_le_bytes());
-        transaction[72..76].copy_from_slice(&123u32.to_le_bytes());
-        transaction[TRANSACTION_BASE_SIZE] = marker;
-        transaction
+        crate::frame::signed_transaction_for_test(marker)
     }
 
     #[test]
-    fn proto_exposes_only_the_streaming_tick_transaction_rpc() {
+    fn proto_exposes_exactly_the_random_client_backend_rpcs() {
         let proto = include_str!("../proto/lightnode.proto");
-        assert!(proto.contains(
-            "rpc StreamTickTransactions(GetTickTransactionsRequest) returns (stream Transaction);"
-        ));
-        assert!(!proto.contains("rpc GetTickTransactions(GetTickTransactionsRequest)"));
+        assert_eq!(proto.matches("  rpc ").count(), 4);
+        for method in [
+            "GetStatus",
+            "GetBalance",
+            "QueryContractFunction",
+            "BroadcastTransaction",
+        ] {
+            assert!(proto.contains(&format!("rpc {method}(")));
+        }
+        assert!(!proto.contains("TickTransactions"));
     }
 
     #[tokio::test]
@@ -738,7 +524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequential_duplicate_broadcast_is_idempotent() {
+    async fn sequential_valid_broadcasts_are_forwarded_independently() {
         let node_state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
         let (peer_tx, mut peer_rx) = mpsc::channel(2);
         let (disconnect_tx, _disconnect_rx) = watch::channel(false);
@@ -770,7 +556,7 @@ mod tests {
         }
 
         assert!(peer_rx.recv().await.is_some());
-        assert!(peer_rx.try_recv().is_err());
+        assert!(peer_rx.recv().await.is_some());
     }
 
     #[tokio::test]
@@ -948,111 +734,6 @@ mod tests {
 
         assert!(!limiter.allow(Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), now));
         assert!(limiter.clients.is_empty());
-    }
-
-    #[tokio::test]
-    async fn terminal_error_survives_a_full_transaction_buffer() {
-        let (data_tx, data_rx) = mpsc::channel(1);
-        data_tx
-            .send(lightnodepb::Transaction::default())
-            .await
-            .expect("test stream should accept its buffered transaction");
-        drop(data_tx);
-        let (terminal_tx, terminal_rx) = oneshot::channel();
-        terminal_tx
-            .send(Some(Status::deadline_exceeded("deadline")))
-            .expect("test stream should accept its terminal status");
-        let mut stream = TickTransactionStream {
-            data: data_rx,
-            terminal: terminal_rx,
-            data_closed: false,
-            terminal_done: false,
-        };
-
-        assert!(
-            stream
-                .next()
-                .await
-                .expect("buffered item should exist")
-                .is_ok()
-        );
-        let terminal = stream
-            .next()
-            .await
-            .expect("terminal error should be emitted")
-            .expect_err("terminal item should be an error");
-        assert_eq!(terminal.code(), tonic::Code::DeadlineExceeded);
-        assert!(stream.next().await.is_none());
-    }
-
-    #[test]
-    fn local_peer_query_overload_is_retryable_resource_exhaustion() {
-        let status = peer_query_status(PeerQueryError::LocalOverload("overloaded"));
-        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
-    }
-
-    #[tokio::test]
-    async fn cancelled_tick_client_releases_stream_permit_and_pending_route() {
-        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
-        let (peer_tx, mut peer_rx) = mpsc::channel(16);
-        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
-        node_state
-            .lock()
-            .await
-            .register_session(
-                SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DEFAULT_PORT),
-                true,
-                peer_tx,
-                disconnect_tx,
-                DEFAULT_PORT,
-            )
-            .expect("peer should register");
-        let service = test_service(node_state);
-        let mut streams = Vec::new();
-        for tick in 1..=MAX_CONCURRENT_TICK_STREAMS as u32 {
-            streams.push(
-                LightNode::stream_tick_transactions(
-                    &service,
-                    Request::new(lightnodepb::GetTickTransactionsRequest { tick }),
-                )
-                .await
-                .expect("first eight streams should start")
-                .into_inner(),
-            );
-        }
-        for _ in 0..MAX_CONCURRENT_TICK_STREAMS {
-            peer_rx
-                .recv()
-                .await
-                .expect("each stream should issue one peer request");
-        }
-        let overloaded = LightNode::stream_tick_transactions(
-            &service,
-            Request::new(lightnodepb::GetTickTransactionsRequest { tick: 9 }),
-        )
-        .await
-        .expect_err("ninth stream should be rejected");
-        assert_eq!(overloaded.code(), tonic::Code::ResourceExhausted);
-
-        drop(streams.pop());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while service.tick_stream_slots.available_permits() == 0
-                || service.api.pending_requests.active_count() == MAX_CONCURRENT_TICK_STREAMS
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled stream should release its resources");
-
-        let replacement = LightNode::stream_tick_transactions(
-            &service,
-            Request::new(lightnodepb::GetTickTransactionsRequest { tick: 9 }),
-        )
-        .await
-        .expect("replacement stream should start");
-        drop(replacement);
-        drop(streams);
     }
 
     #[tokio::test]

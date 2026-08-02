@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::pending::PendingRequests;
-use crate::state::{DedupWindow, NodeState};
+use crate::state::NodeState;
 use crate::verified::TrustedNetworkState;
 use serde::Serialize;
 use std::sync::Arc;
@@ -38,7 +38,6 @@ pub(crate) fn format_epoch_tick_packed(packed: u64) -> String {
 #[derive(Clone)]
 pub(crate) struct ApiState {
     pub(crate) node_state: Arc<Mutex<NodeState>>,
-    pub(crate) dedup: Arc<DedupWindow>,
     pub(crate) pending_requests: Arc<PendingRequests>,
     pub(crate) trusted_network: Arc<TrustedNetworkState>,
     pub(crate) outbound_budget: Arc<Semaphore>,
@@ -58,16 +57,4 @@ pub(crate) struct BalanceResponse {
     pub(crate) number_of_outgoing_transfers: u32,
     pub(crate) latest_incoming_transfer_tick: u32,
     pub(crate) latest_outgoing_transfer_tick: u32,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct TickTransaction {
-    pub(crate) source_public_key_hex: String,
-    pub(crate) destination_public_key_hex: String,
-    pub(crate) amount: i64,
-    pub(crate) tick: u32,
-    pub(crate) input_type: u16,
-    pub(crate) input_size: u16,
-    pub(crate) input_hex: String,
-    pub(crate) signature_hex: String,
 }

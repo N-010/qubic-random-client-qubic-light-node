@@ -471,6 +471,7 @@ impl Drop for PendingRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const CORE_MAX_RESPONSE_FRAMES: usize = 4096;
 
     #[tokio::test]
     async fn routes_by_peer_and_dejavu_and_suppresses_late_frames() {
@@ -613,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn core_sized_tick_burst_fits_and_the_next_frame_is_a_protocol_violation() {
         let pending = Arc::new(PendingRequests::default());
-        let frame_count = crate::frame::NUMBER_OF_TRANSACTIONS_PER_TICK + 1;
+        let frame_count = CORE_MAX_RESPONSE_FRAMES + 1;
         let (registration, mut receivers) = pending.register_with_spec(
             [10],
             PendingSpec {
@@ -622,7 +623,7 @@ mod tests {
                         message_type: 24,
                         min_frame_bytes: 8,
                         max_frame_bytes: 8,
-                        max_frames: crate::frame::NUMBER_OF_TRANSACTIONS_PER_TICK,
+                        max_frames: CORE_MAX_RESPONSE_FRAMES,
                         terminal: false,
                     },
                     ResponseRule {
@@ -640,7 +641,7 @@ mod tests {
         let dejavu = registration.dejavu();
         let (_, _receiver) = receivers.remove(0);
 
-        for _ in 0..crate::frame::NUMBER_OF_TRANSACTIONS_PER_TICK {
+        for _ in 0..CORE_MAX_RESPONSE_FRAMES {
             assert_eq!(
                 pending.deliver(10, dejavu, Bytes::from_static(&[8, 0, 0, 24, 0, 0, 0, 0]),),
                 DeliveryOutcome::Delivered
@@ -659,7 +660,7 @@ mod tests {
                         message_type: 24,
                         min_frame_bytes: 8,
                         max_frame_bytes: 8,
-                        max_frames: crate::frame::NUMBER_OF_TRANSACTIONS_PER_TICK,
+                        max_frames: CORE_MAX_RESPONSE_FRAMES,
                         terminal: false,
                     },
                     ResponseRule {
@@ -676,7 +677,7 @@ mod tests {
         );
         let dejavu = registration.dejavu();
         let (_, _receiver) = receivers.remove(0);
-        for _ in 0..crate::frame::NUMBER_OF_TRANSACTIONS_PER_TICK {
+        for _ in 0..CORE_MAX_RESPONSE_FRAMES {
             assert_eq!(
                 pending.deliver(10, dejavu, Bytes::from_static(&[8, 0, 0, 24, 0, 0, 0, 0]),),
                 DeliveryOutcome::Delivered

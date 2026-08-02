@@ -101,7 +101,6 @@ pub(crate) struct PeerPoolStats {
     pub(crate) dialable: usize,
     pub(crate) cooldown: usize,
     pub(crate) pending: usize,
-    pub(crate) incoming: usize,
     pub(crate) outgoing: usize,
 }
 
@@ -116,7 +115,6 @@ pub(crate) struct RelayTarget {
 struct Session {
     transport_remote: SocketAddrV4,
     dial_endpoint: SocketAddrV4,
-    outbound: bool,
     connected_at: Instant,
     tx: mpsc::Sender<OutboundFrame>,
     byte_budget: Arc<Semaphore>,
@@ -160,7 +158,7 @@ impl NodeState {
     }
 
     pub(crate) fn outgoing_count(&self) -> usize {
-        self.sessions.values().filter(|s| s.outbound).count()
+        self.sessions.len()
     }
 
     pub(crate) fn set_reconnect_interval(&mut self, reconnect_interval: Duration) {
@@ -173,10 +171,6 @@ impl NodeState {
             .map(|session| *session.transport_remote.ip())
     }
 
-    pub(crate) fn incoming_count(&self) -> usize {
-        self.sessions.values().filter(|s| !s.outbound).count()
-    }
-
     fn is_ip_connected(&self, ip: Ipv4Addr) -> bool {
         self.connected_ip_refcount.contains_key(&ip)
     }
@@ -184,10 +178,10 @@ impl NodeState {
     pub(crate) fn register_session(
         &mut self,
         remote: SocketAddrV4,
-        outbound: bool,
+        _outbound: bool,
         tx: mpsc::Sender<OutboundFrame>,
         disconnect_tx: watch::Sender<bool>,
-        peer_port: u16,
+        _peer_port: u16,
     ) -> Option<u64> {
         let remote_ip = *remote.ip();
         if self.is_ip_connected(remote_ip) {
@@ -197,17 +191,12 @@ impl NodeState {
         let peer_id = self.next_peer_id;
         self.next_peer_id = self.next_peer_id.wrapping_add(1);
 
-        let dial_endpoint = if outbound {
-            remote
-        } else {
-            SocketAddrV4::new(remote_ip, peer_port)
-        };
+        let dial_endpoint = remote;
         self.sessions.insert(
             peer_id,
             Session {
                 transport_remote: remote,
                 dial_endpoint,
-                outbound,
                 connected_at: Instant::now(),
                 tx,
                 byte_budget: Arc::new(Semaphore::new(PEER_OUTBOUND_QUEUE_BYTES)),
@@ -268,23 +257,6 @@ impl NodeState {
 
     pub(crate) fn take_disconnect_reason(&mut self, peer_id: u64) -> Option<DisconnectReason> {
         self.disconnect_reasons.remove(&peer_id)
-    }
-
-    pub(crate) fn collect_targets(&self, source_peer_id: u64, limit: usize) -> Vec<RelayTarget> {
-        self.sessions
-            .iter()
-            .filter_map(|(peer_id, session)| {
-                if *peer_id == source_peer_id {
-                    None
-                } else {
-                    Some(RelayTarget {
-                        peer_id: *peer_id,
-                        tx: session.tx.clone(),
-                        byte_budget: Arc::clone(&session.byte_budget),
-                    })
-                }
-            })
-            .choose_multiple(&mut rand::rng(), limit)
     }
 
     pub(crate) fn collect_all_targets(&self, limit: usize) -> Vec<RelayTarget> {
@@ -551,7 +523,6 @@ impl NodeState {
                 .filter(|peer| self.is_cooling_down(**peer, now))
                 .count(),
             pending: self.pending_dials.len(),
-            incoming: self.incoming_count(),
             outgoing: self.outgoing_count(),
         }
     }
@@ -701,34 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_targets_exclude_source_peer() {
-        let mut state = NodeState::new(1_000, &[]);
-        let mut peer_ids = Vec::new();
-
-        for last_octet in 1..=3 {
-            let (tx, _rx) = mpsc::channel(1);
-            let (disconnect_tx, _disconnect_rx) = watch::channel(false);
-            let remote = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, last_octet), DEFAULT_PORT);
-            let peer_id = state
-                .register_session(remote, true, tx, disconnect_tx, DEFAULT_PORT)
-                .expect("test peer should be registered");
-            peer_ids.push(peer_id);
-        }
-
-        let source_peer_id = peer_ids[1];
-        let mut target_peer_ids = state
-            .collect_targets(source_peer_id, 6)
-            .into_iter()
-            .map(|target| target.peer_id)
-            .collect::<Vec<_>>();
-        target_peer_ids.sort_unstable();
-        peer_ids.remove(1);
-
-        assert_eq!(target_peer_ids, peer_ids);
-    }
-
-    #[test]
-    fn relay_targets_are_limited_to_six() {
+    fn broadcast_targets_are_limited_to_six() {
         let mut state = NodeState::new(1_000, &[]);
         for last_octet in 1..=8 {
             let (tx, _rx) = mpsc::channel(1);
@@ -748,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_targets_include_every_available_peer_below_limit() {
+    fn broadcast_targets_include_every_available_peer_below_limit() {
         let mut state = NodeState::new(1_000, &[]);
         for last_octet in 1..=3 {
             let (tx, _rx) = mpsc::channel(1);

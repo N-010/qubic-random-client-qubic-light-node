@@ -81,6 +81,7 @@ struct TrustedState {
     vote_clock: u64,
     status: Option<TickStatus>,
     status_digest: Option<[u8; 32]>,
+    spectrum_roots: BTreeMap<u32, [u8; 32]>,
 }
 
 #[derive(Debug, Default)]
@@ -104,11 +105,31 @@ impl TrustedNetworkState {
             .is_some()
     }
 
+    pub(crate) fn spectrum_root(&self, tick: u32) -> Option<[u8; 32]> {
+        self.inner
+            .lock()
+            .expect("trusted network mutex should not be poisoned")
+            .spectrum_roots
+            .get(&tick)
+            .copied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_spectrum_root_for_test(&self, tick: u32, root: [u8; 32]) {
+        self.inner
+            .lock()
+            .expect("trusted network mutex should not be poisoned")
+            .spectrum_roots
+            .insert(tick, root);
+    }
+
     pub(crate) fn parse_computors(
         &self,
         payload: &[u8],
     ) -> Result<AuthenticatedComputors, ComputorVerification> {
-        if payload.len() != BROADCAST_COMPUTORS_PAYLOAD_SIZE {
+        if !(BROADCAST_COMPUTORS_PAYLOAD_SIZE..=BROADCAST_COMPUTORS_PAYLOAD_SIZE + 4)
+            .contains(&payload.len())
+        {
             return Err(ComputorVerification::Malformed);
         }
 
@@ -135,7 +156,7 @@ impl TrustedNetworkState {
             return false;
         };
         let Some(signature) = payload
-            .get(signature_offset..)
+            .get(signature_offset..signature_offset + SIGNATURE_SIZE)
             .and_then(signature_from_slice)
         else {
             return false;
@@ -175,6 +196,7 @@ impl TrustedNetworkState {
         inner.vote_clock = 0;
         inner.status = None;
         inner.status_digest = None;
+        inner.spectrum_roots.clear();
         ComputorVerification::Accepted
     }
 
@@ -296,6 +318,12 @@ impl TrustedNetworkState {
             let status = tick_status(parsed.epoch, parsed.tick, aligned, total);
             inner.status = Some(status);
             inner.status_digest = Some(body_digest);
+            inner
+                .spectrum_roots
+                .insert(parsed.tick, parsed.prev_spectrum_digest);
+            while inner.spectrum_roots.len() > MAX_UNCONFIRMED_TICKS {
+                inner.spectrum_roots.pop_first();
+            }
             inner.votes.retain(|tick, _| *tick >= status.tick);
             return TickVerification::Quorum(status);
         }
@@ -315,18 +343,6 @@ impl TrustedNetworkState {
         }
 
         TickVerification::Accepted
-    }
-
-    #[cfg(test)]
-    pub(crate) fn verify_computors(&self, payload: &[u8]) -> ComputorVerification {
-        let computors = match self.parse_computors(payload) {
-            Ok(computors) => computors,
-            Err(outcome) => return outcome,
-        };
-        if !self.computor_signature_is_valid(payload) {
-            return ComputorVerification::BadSignature;
-        }
-        self.apply_computors(computors)
     }
 
     #[cfg(test)]
@@ -387,6 +403,7 @@ struct ParsedTick {
     epoch: u16,
     tick: u32,
     timestamp_millis: i64,
+    prev_spectrum_digest: [u8; 32],
     signature: [u8; SIGNATURE_SIZE],
 }
 
@@ -419,7 +436,7 @@ impl ParsedTick {
             || hour > 23
             || !(1..=12).contains(&month)
             || day == 0
-            || day > days_in_month(year, month)
+            || day > days_in_month(wire_year, month)
         {
             return None;
         }
@@ -428,6 +445,7 @@ impl ParsedTick {
             epoch: u16::from_le_bytes(payload[2..4].try_into().ok()?),
             tick: u32::from_le_bytes(payload[4..8].try_into().ok()?),
             timestamp_millis: utc_millis(year, month, day, hour, minute, second, millisecond),
+            prev_spectrum_digest: payload[32..64].try_into().ok()?,
             signature: signature_from_slice(&payload[TICK_UNSIGNED_SIZE..])?,
         })
     }
@@ -450,18 +468,18 @@ fn tick_signature_digest(payload: &[u8]) -> [u8; 32] {
     k12(&signed_body)
 }
 
-fn days_in_month(year: u16, month: u8) -> u8 {
+fn days_in_month(wire_year: u8, month: u8) -> u8 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
+        2 if wire_year.is_multiple_of(4) => 29,
         2 => 28,
         _ => 0,
     }
 }
 
-fn is_leap_year(year: u16) -> bool {
-    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+fn is_qubic_leap_year(year: u16) -> bool {
+    year.is_multiple_of(4)
 }
 
 fn utc_millis(
@@ -474,10 +492,16 @@ fn utc_millis(
     millisecond: u16,
 ) -> i64 {
     let days_before_year: i64 = (1970..year)
-        .map(|candidate| if is_leap_year(candidate) { 366 } else { 365 })
+        .map(|candidate| {
+            if is_qubic_leap_year(candidate) {
+                366
+            } else {
+                365
+            }
+        })
         .sum();
     let days_before_month: i64 = (1..month)
-        .map(|candidate| i64::from(days_in_month(year, candidate)))
+        .map(|candidate| i64::from(days_in_month((year - 2000) as u8, candidate)))
         .sum();
     let days = days_before_year + days_before_month + i64::from(day - 1);
     (((days * 24 + i64::from(hour)) * 60 + i64::from(minute)) * 60 + i64::from(second)) * 1_000
@@ -524,6 +548,7 @@ mod tests {
             epoch,
             tick,
             timestamp_millis: 0,
+            prev_spectrum_digest: [0; 32],
             signature: [0; SIGNATURE_SIZE],
         }
     }
@@ -547,7 +572,7 @@ mod tests {
         payload[15] = 3;
         assert!(ParsedTick::parse(&payload).is_none());
         payload[15] = 100;
-        assert!(ParsedTick::parse(&payload).is_none());
+        assert!(ParsedTick::parse(&payload).is_some());
     }
 
     #[test]
@@ -618,12 +643,14 @@ mod tests {
     }
 
     #[test]
-    fn computor_payload_padding_is_rejected_before_signature_verification() {
+    fn computor_payload_accepts_core_struct_padding() {
         for padding in 1..=4 {
-            let payload = vec![0; BROADCAST_COMPUTORS_PAYLOAD_SIZE + padding];
-            assert_eq!(
-                TrustedNetworkState::default().verify_computors(&payload),
-                ComputorVerification::Malformed
+            let mut payload = vec![0; BROADCAST_COMPUTORS_PAYLOAD_SIZE + padding];
+            payload[2..2 + COMPUTORS_PUBLIC_KEYS_SIZE].fill(1);
+            assert!(
+                TrustedNetworkState::default()
+                    .parse_computors(&payload)
+                    .is_ok()
             );
         }
     }

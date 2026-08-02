@@ -1,17 +1,16 @@
-use crate::codec::{bytes_to_hex, read_i32, read_i64, read_u32};
+use crate::codec::{bytes_to_hex, kangaroo_twelve, read_i32, read_i64, read_u32};
 use crate::config::Config;
 use crate::frame::{
-    BROADCAST_TRANSACTION_TYPE, END_RESPONSE_TYPE, HEADER_SIZE, MAX_CONTRACT_FUNCTION_OUTPUT_SIZE,
-    MAX_TRANSACTION_FRAME_BYTES, NUMBER_OF_TRANSACTIONS_PER_TICK, REQUEST_ENTITY_TYPE,
+    END_RESPONSE_TYPE, HEADER_SIZE, MAX_CONTRACT_FUNCTION_OUTPUT_SIZE, REQUEST_ENTITY_TYPE,
     RESPOND_CONTRACT_FUNCTION_TYPE, RESPOND_ENTITY_PAYLOAD_SIZE, RESPOND_ENTITY_TYPE,
-    SIGNATURE_SIZE, SPECTRUM_CAPACITY, TRANSACTION_BASE_SIZE, TRY_AGAIN_TYPE,
-    build_request_contract_function_frame, build_request_frame,
-    build_request_tick_transactions_frame, frame_payload, parse_transaction_layout,
+    SPECTRUM_CAPACITY, SPECTRUM_DEPTH, TRY_AGAIN_TYPE, build_request_contract_function_frame,
+    build_request_frame, frame_payload,
 };
 use crate::pending::{PendingEvent, PendingRequests};
 use crate::pending::{PendingSpec, ResponseRule};
 use crate::state::{DisconnectReason, NodeState, OutboundAdmissionError, OutboundFrame};
-use crate::types::{BalanceResponse, TickTransaction};
+use crate::types::BalanceResponse;
+use crate::verified::TrustedNetworkState;
 use bytes::Bytes;
 use std::collections::HashSet;
 use std::fmt;
@@ -28,29 +27,6 @@ const BALANCE_RESPONSE_RULES: &[ResponseRule] = &[
         max_frame_bytes: HEADER_SIZE + RESPOND_ENTITY_PAYLOAD_SIZE,
         max_frames: 1,
         terminal: true,
-    },
-    ResponseRule {
-        message_type: END_RESPONSE_TYPE,
-        min_frame_bytes: HEADER_SIZE,
-        max_frame_bytes: HEADER_SIZE,
-        max_frames: 1,
-        terminal: true,
-    },
-    ResponseRule {
-        message_type: TRY_AGAIN_TYPE,
-        min_frame_bytes: HEADER_SIZE,
-        max_frame_bytes: HEADER_SIZE,
-        max_frames: 1,
-        terminal: true,
-    },
-];
-const TICK_RESPONSE_RULES: &[ResponseRule] = &[
-    ResponseRule {
-        message_type: BROADCAST_TRANSACTION_TYPE,
-        min_frame_bytes: HEADER_SIZE + TRANSACTION_BASE_SIZE + SIGNATURE_SIZE,
-        max_frame_bytes: MAX_TRANSACTION_FRAME_BYTES,
-        max_frames: NUMBER_OF_TRANSACTIONS_PER_TICK,
-        terminal: false,
     },
     ResponseRule {
         message_type: END_RESPONSE_TYPE,
@@ -98,7 +74,6 @@ pub(crate) enum PeerQueryError {
     LocalOverload(&'static str),
     PeerUnavailable(String),
     Protocol(String),
-    Cancelled,
     Internal(String),
 }
 
@@ -115,7 +90,6 @@ impl fmt::Display for PeerQueryError {
             Self::PeerUnavailable(message) | Self::Protocol(message) | Self::Internal(message) => {
                 formatter.write_str(message)
             }
-            Self::Cancelled => formatter.write_str("Tick transaction stream was cancelled"),
         }
     }
 }
@@ -132,6 +106,7 @@ pub(crate) async fn query_balance(
     state: Arc<Mutex<NodeState>>,
     pending: Arc<PendingRequests>,
     outbound_budget: Arc<Semaphore>,
+    trusted_network: Arc<TrustedNetworkState>,
     config: Arc<Config>,
     wallet: &str,
     public_key: [u8; 32],
@@ -172,10 +147,11 @@ pub(crate) async fn query_balance(
         .filter(|(peer_id, _)| accepted.contains(peer_id))
     {
         let wallet = wallet.to_string();
+        let trusted_network = Arc::clone(&trusted_network);
         join_set.spawn(async move {
             (
                 peer_id,
-                receive_balance(receiver, &wallet, public_key).await,
+                receive_balance(receiver, &wallet, public_key, &trusted_network).await,
             )
         });
     }
@@ -213,99 +189,6 @@ pub(crate) async fn query_balance(
     Err(PeerQueryError::PeerUnavailable(format!(
         "Failed to query balance from peers (parallel): {last_err}"
     )))
-}
-
-pub(crate) async fn stream_tick_transactions(
-    state: Arc<Mutex<NodeState>>,
-    pending: Arc<PendingRequests>,
-    outbound_budget: Arc<Semaphore>,
-    config: Arc<Config>,
-    tick: u32,
-    output: mpsc::Sender<Result<TickTransaction, PeerQueryError>>,
-    deadline: Instant,
-) -> Result<(), PeerQueryError> {
-    let timeout_duration = config.api_timeout;
-    let targets = timeout_at(deadline, state.lock())
-        .await
-        .map_err(|_| api_timeout_error(timeout_duration))?
-        .collect_all_targets(1);
-    if targets.is_empty() {
-        return Err(PeerQueryError::NoPeers);
-    }
-    let (registration, receivers) = pending.register_with_spec(
-        targets.iter().map(|target| target.peer_id),
-        PendingSpec {
-            response_rules: TICK_RESPONSE_RULES,
-            max_response_frames: NUMBER_OF_TRANSACTIONS_PER_TICK + 1,
-            max_response_bytes: NUMBER_OF_TRANSACTIONS_PER_TICK * MAX_TRANSACTION_FRAME_BYTES
-                + HEADER_SIZE,
-        },
-    );
-    let request = Bytes::from(
-        build_request_tick_transactions_frame(registration.dejavu(), tick)
-            .map_err(PeerQueryError::Internal)?,
-    );
-    ensure_local_request_size(&request, &config)?;
-    let accepted = timeout_at(
-        deadline,
-        send_request_to_targets(&state, &pending, targets, &request, &outbound_budget),
-    )
-    .await
-    .map_err(|_| api_timeout_error(timeout_duration))??;
-    registration.retain_peers(&accepted);
-
-    let (peer_id, mut receiver) = receivers
-        .into_iter()
-        .find(|(peer_id, _)| accepted.contains(peer_id))
-        .expect("one selected target has one pending receiver");
-    let mut transaction_count = 0usize;
-    loop {
-        let event = timeout_at(deadline, receiver.recv())
-            .await
-            .map_err(|_| api_timeout_error(timeout_duration))?;
-        let Some(event) = event else {
-            return Err(PeerQueryError::PeerUnavailable(format!(
-                "peer {peer_id}: pending response channel closed"
-            )));
-        };
-        match event {
-            PendingEvent::Frame(frame) => match frame[3] {
-                BROADCAST_TRANSACTION_TYPE => {
-                    if transaction_count >= NUMBER_OF_TRANSACTIONS_PER_TICK {
-                        return Err(PeerQueryError::Protocol(format!(
-                            "peer {peer_id}: returned more than {NUMBER_OF_TRANSACTIONS_PER_TICK} transactions"
-                        )));
-                    }
-                    let transaction = match frame_payload(&frame)
-                        .and_then(|payload| parse_transaction_payload(payload, tick))
-                    {
-                        Ok(transaction) => transaction,
-                        Err(err) => {
-                            penalize_protocol_peer(&state, peer_id).await;
-                            return Err(PeerQueryError::Protocol(format!("peer {peer_id}: {err}")));
-                        }
-                    };
-                    transaction_count += 1;
-                    timeout_at(deadline, output.send(Ok(transaction)))
-                        .await
-                        .map_err(|_| api_timeout_error(timeout_duration))?
-                        .map_err(|_| PeerQueryError::Cancelled)?;
-                }
-                END_RESPONSE_TYPE => return Ok(()),
-                TRY_AGAIN_TYPE => {
-                    return Err(PeerQueryError::PeerUnavailable(format!(
-                        "peer {peer_id}: requested retry"
-                    )));
-                }
-                _ => {}
-            },
-            PendingEvent::PeerDisconnected => {
-                return Err(PeerQueryError::PeerUnavailable(format!(
-                    "peer {peer_id}: disconnected"
-                )));
-            }
-        }
-    }
 }
 
 pub(crate) async fn query_contract_function(
@@ -399,14 +282,33 @@ async fn receive_balance(
     mut receiver: mpsc::Receiver<PendingEvent>,
     wallet: &str,
     public_key: [u8; 32],
+    trusted_network: &TrustedNetworkState,
 ) -> Result<BalanceResponse, PeerQueryError> {
     while let Some(event) = receiver.recv().await {
         match event {
             PendingEvent::Frame(frame) => match frame[3] {
                 RESPOND_ENTITY_TYPE => {
                     let payload = frame_payload(&frame)?;
-                    return parse_balance_payload(wallet, public_key, payload)
-                        .map_err(PeerQueryError::Protocol);
+                    let parsed = parse_balance_payload(wallet, public_key, payload)
+                        .map_err(PeerQueryError::Protocol)?;
+                    if parsed.response.spectrum_index < 0 {
+                        return Err(PeerQueryError::PeerUnavailable(
+                            "RespondEntity cannot prove that the entity is absent".to_string(),
+                        ));
+                    }
+                    let Some(root) = trusted_network.spectrum_root(parsed.response.tick) else {
+                        return Err(PeerQueryError::PeerUnavailable(format!(
+                            "no verified spectrum root for entity tick {}",
+                            parsed.response.tick
+                        )));
+                    };
+                    if parsed.proof_root() != root {
+                        return Err(PeerQueryError::Protocol(
+                            "RespondEntity Merkle proof does not match the verified spectrum root"
+                                .to_string(),
+                        ));
+                    }
+                    return Ok(parsed.response);
                 }
                 END_RESPONSE_TYPE => {
                     return Err(PeerQueryError::Protocol(
@@ -565,11 +467,39 @@ async fn penalize_protocol_peer(state: &Arc<Mutex<NodeState>>, peer_id: u64) {
         .disconnect_session_with_reason(peer_id, DisconnectReason::ProtocolViolation);
 }
 
+#[derive(Debug)]
+struct ParsedBalance {
+    response: BalanceResponse,
+    entity_record: [u8; 64],
+    siblings: [[u8; 32]; SPECTRUM_DEPTH],
+}
+
+impl ParsedBalance {
+    fn proof_root(&self) -> [u8; 32] {
+        let mut digest = kangaroo_twelve(&self.entity_record);
+        let mut index = usize::try_from(self.response.spectrum_index)
+            .expect("proof root is only computed for a non-negative spectrum index");
+        for sibling in self.siblings {
+            let mut pair = [0; 64];
+            if index & 1 == 0 {
+                pair[..32].copy_from_slice(&digest);
+                pair[32..].copy_from_slice(&sibling);
+            } else {
+                pair[..32].copy_from_slice(&sibling);
+                pair[32..].copy_from_slice(&digest);
+            }
+            digest = kangaroo_twelve(&pair);
+            index >>= 1;
+        }
+        digest
+    }
+}
+
 fn parse_balance_payload(
     wallet: &str,
     requested_public_key: [u8; 32],
     payload: &[u8],
-) -> Result<BalanceResponse, String> {
+) -> Result<ParsedBalance, String> {
     if payload.len() != RESPOND_ENTITY_PAYLOAD_SIZE {
         return Err(format!(
             "RespondEntity payload size mismatch: expected {RESPOND_ENTITY_PAYLOAD_SIZE}, got {}",
@@ -595,41 +525,36 @@ fn parse_balance_payload(
         ));
     }
 
-    Ok(BalanceResponse {
-        wallet: wallet.to_string(),
-        public_key_hex: format!("0x{}", bytes_to_hex(&payload[0..32])),
-        tick: read_u32(payload, 64).ok_or_else(|| "tick missing".to_string())?,
-        spectrum_index,
-        incoming_amount,
-        outgoing_amount,
-        balance,
-        number_of_incoming_transfers: read_u32(payload, 48)
-            .ok_or_else(|| "numberOfIncomingTransfers missing".to_string())?,
-        number_of_outgoing_transfers: read_u32(payload, 52)
-            .ok_or_else(|| "numberOfOutgoingTransfers missing".to_string())?,
-        latest_incoming_transfer_tick: read_u32(payload, 56)
-            .ok_or_else(|| "latestIncomingTransferTick missing".to_string())?,
-        latest_outgoing_transfer_tick: read_u32(payload, 60)
-            .ok_or_else(|| "latestOutgoingTransferTick missing".to_string())?,
-    })
-}
+    let entity_record = payload[..64]
+        .try_into()
+        .expect("RespondEntity contains an exact-size entity record");
+    let siblings = core::array::from_fn(|index| {
+        let offset = 72 + index * 32;
+        payload[offset..offset + 32]
+            .try_into()
+            .expect("RespondEntity contains an exact-size sibling path")
+    });
 
-fn parse_transaction_payload(
-    payload: &[u8],
-    expected_tick: u32,
-) -> Result<TickTransaction, String> {
-    let layout = parse_transaction_layout(payload, Some(expected_tick))?;
-    let input_end = layout.input_start + layout.input_size as usize;
-
-    Ok(TickTransaction {
-        source_public_key_hex: format!("0x{}", bytes_to_hex(&payload[0..32])),
-        destination_public_key_hex: format!("0x{}", bytes_to_hex(&payload[32..64])),
-        amount: layout.amount,
-        tick: layout.tick,
-        input_type: layout.input_type,
-        input_size: layout.input_size,
-        input_hex: bytes_to_hex(&payload[layout.input_start..input_end]),
-        signature_hex: bytes_to_hex(&payload[layout.signature_start..]),
+    Ok(ParsedBalance {
+        response: BalanceResponse {
+            wallet: wallet.to_string(),
+            public_key_hex: format!("0x{}", bytes_to_hex(&payload[0..32])),
+            tick: read_u32(payload, 64).ok_or_else(|| "tick missing".to_string())?,
+            spectrum_index,
+            incoming_amount,
+            outgoing_amount,
+            balance,
+            number_of_incoming_transfers: read_u32(payload, 48)
+                .ok_or_else(|| "numberOfIncomingTransfers missing".to_string())?,
+            number_of_outgoing_transfers: read_u32(payload, 52)
+                .ok_or_else(|| "numberOfOutgoingTransfers missing".to_string())?,
+            latest_incoming_transfer_tick: read_u32(payload, 56)
+                .ok_or_else(|| "latestIncomingTransferTick missing".to_string())?,
+            latest_outgoing_transfer_tick: read_u32(payload, 60)
+                .ok_or_else(|| "latestOutgoingTransferTick missing".to_string())?,
+        },
+        entity_record,
+        siblings,
     })
 }
 
@@ -637,8 +562,9 @@ fn parse_transaction_payload(
 mod tests {
     use super::*;
     use crate::config::{DEFAULT_GRPC_PORT, DEFAULT_PORT};
-    use crate::frame::{SIGNATURE_SIZE, TRANSACTION_BASE_SIZE, build_request_frame};
+    use crate::frame::build_request_frame;
     use pretty_assertions::assert_eq;
+    use proptest::prelude::*;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::Duration;
     use tokio::sync::watch;
@@ -649,14 +575,10 @@ mod tests {
 
     fn test_config(api_timeout: Duration) -> Arc<Config> {
         Arc::new(Config {
-            listen_addr: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_PORT),
             api_timeout,
             grpc_listen_addr: SocketAddr::from(([127, 0, 0, 1], DEFAULT_GRPC_PORT)),
-            grpc_enabled: true,
             peer_port: DEFAULT_PORT,
             target_outbound: 8,
-            max_incoming: 32,
-            max_seen: 1_000,
             max_known_peers: 1_000,
             reconnect_interval: Duration::from_secs(2),
             peer_write_timeout: Duration::from_secs(5),
@@ -664,7 +586,6 @@ mod tests {
             peer_handshake_timeout: Duration::from_secs(5),
             peer_frame_timeout: Duration::from_secs(30),
             max_frame_bytes: 1024 * 1024,
-            relay_all: false,
             dns_bootstrap: false,
             dns_lite_peers: 0,
             dns_timeout: Duration::from_secs(1),
@@ -703,189 +624,10 @@ mod tests {
         Arc::new(Semaphore::new(crate::network::GLOBAL_OUTBOUND_QUEUE_BYTES))
     }
 
-    #[test]
-    fn rejects_transaction_with_inconsistent_input_size() {
-        let mut payload = vec![0; TRANSACTION_BASE_SIZE + SIGNATURE_SIZE];
-        payload[78..80].copy_from_slice(&1u16.to_le_bytes());
-
-        assert_eq!(
-            parse_transaction_payload(&payload, 0).unwrap_err(),
-            "Transaction payload size mismatch: expected 145, got 144"
-        );
-    }
-
     fn entity_payload(public_key: [u8; 32]) -> [u8; RESPOND_ENTITY_PAYLOAD_SIZE] {
         let mut payload = [0; RESPOND_ENTITY_PAYLOAD_SIZE];
         payload[..32].copy_from_slice(&public_key);
         payload
-    }
-
-    fn transaction_frame(dejavu: u32, amount: i64) -> Bytes {
-        let mut payload = vec![0; TRANSACTION_BASE_SIZE + SIGNATURE_SIZE];
-        payload[64..72].copy_from_slice(&amount.to_le_bytes());
-        payload[72..76].copy_from_slice(&42u32.to_le_bytes());
-        Bytes::from(
-            build_request_frame(BROADCAST_TRANSACTION_TYPE, dejavu, &payload)
-                .expect("transaction frame should build"),
-        )
-    }
-
-    #[tokio::test]
-    async fn tick_request_uses_one_peer_and_empty_end_response_succeeds() {
-        let state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
-        let (peer_1_tx, mut peer_1_rx) = mpsc::channel(2);
-        let (peer_2_tx, mut peer_2_rx) = mpsc::channel(2);
-        let (disconnect_1_tx, _disconnect_1_rx) = watch::channel(false);
-        let (disconnect_2_tx, _disconnect_2_rx) = watch::channel(false);
-        let (peer_1_id, peer_2_id) = {
-            let mut locked = state.lock().await;
-            let peer_1_id = locked
-                .register_session(
-                    SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DEFAULT_PORT),
-                    true,
-                    peer_1_tx,
-                    disconnect_1_tx,
-                    DEFAULT_PORT,
-                )
-                .unwrap();
-            let peer_2_id = locked
-                .register_session(
-                    SocketAddrV4::new(Ipv4Addr::new(2, 2, 2, 2), DEFAULT_PORT),
-                    true,
-                    peer_2_tx,
-                    disconnect_2_tx,
-                    DEFAULT_PORT,
-                )
-                .unwrap();
-            (peer_1_id, peer_2_id)
-        };
-        let pending = Arc::new(PendingRequests::default());
-        let (output_tx, mut output_rx) = mpsc::channel(4);
-        let query = tokio::spawn(stream_tick_transactions(
-            Arc::clone(&state),
-            Arc::clone(&pending),
-            outbound_budget(),
-            test_config(Duration::from_secs(1)),
-            42,
-            output_tx,
-            Instant::now() + Duration::from_secs(1),
-        ));
-
-        let (selected_peer_id, request) = tokio::select! {
-            request = peer_1_rx.recv() => (peer_1_id, request.unwrap()),
-            request = peer_2_rx.recv() => (peer_2_id, request.unwrap()),
-        };
-        let dejavu = u32::from_le_bytes(request.bytes[4..8].try_into().unwrap());
-        assert_eq!(
-            peer_1_rx.try_recv().is_ok() as u8 + peer_2_rx.try_recv().is_ok() as u8,
-            0
-        );
-        assert_eq!(
-            pending.deliver(
-                selected_peer_id,
-                dejavu,
-                Bytes::from(build_request_frame(END_RESPONSE_TYPE, dejavu, &[]).unwrap()),
-            ),
-            crate::pending::DeliveryOutcome::Delivered
-        );
-
-        assert_eq!(query.await.unwrap(), Ok(()));
-        assert!(output_rx.recv().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn partial_tick_response_fails_without_hidden_peer_fallback() {
-        let state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
-        let (peer_1_tx, mut peer_1_rx) = mpsc::channel(2);
-        let (peer_2_tx, mut peer_2_rx) = mpsc::channel(2);
-        let (disconnect_1_tx, _disconnect_1_rx) = watch::channel(false);
-        let (disconnect_2_tx, _disconnect_2_rx) = watch::channel(false);
-        let (peer_1_id, peer_2_id) = {
-            let mut locked = state.lock().await;
-            let peer_1_id = locked
-                .register_session(
-                    SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DEFAULT_PORT),
-                    true,
-                    peer_1_tx,
-                    disconnect_1_tx,
-                    DEFAULT_PORT,
-                )
-                .unwrap();
-            let peer_2_id = locked
-                .register_session(
-                    SocketAddrV4::new(Ipv4Addr::new(2, 2, 2, 2), DEFAULT_PORT),
-                    true,
-                    peer_2_tx,
-                    disconnect_2_tx,
-                    DEFAULT_PORT,
-                )
-                .unwrap();
-            (peer_1_id, peer_2_id)
-        };
-        let pending = Arc::new(PendingRequests::default());
-        let (output_tx, mut output_rx) = mpsc::channel(2);
-        let query = tokio::spawn(stream_tick_transactions(
-            state,
-            Arc::clone(&pending),
-            outbound_budget(),
-            test_config(Duration::from_secs(1)),
-            42,
-            output_tx,
-            Instant::now() + Duration::from_secs(1),
-        ));
-        let (selected_peer_id, request) = tokio::select! {
-            request = peer_1_rx.recv() => (peer_1_id, request.unwrap()),
-            request = peer_2_rx.recv() => (peer_2_id, request.unwrap()),
-        };
-        let dejavu = u32::from_le_bytes(request.bytes[4..8].try_into().unwrap());
-        assert_eq!(
-            pending.deliver(selected_peer_id, dejavu, transaction_frame(dejavu, 22)),
-            crate::pending::DeliveryOutcome::Delivered
-        );
-        pending.peer_disconnected(selected_peer_id);
-
-        assert_eq!(output_rx.recv().await.unwrap().unwrap().amount, 22);
-        assert!(
-            query
-                .await
-                .unwrap()
-                .unwrap_err()
-                .to_string()
-                .contains("disconnected")
-        );
-        assert!(peer_1_rx.try_recv().is_err());
-        assert!(peer_2_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn slow_tick_consumer_is_bounded_by_the_absolute_deadline() {
-        let (state, peer_id, mut peer_rx) = state_with_peer().await;
-        let pending = Arc::new(PendingRequests::default());
-        let (output_tx, _output_rx) = mpsc::channel(1);
-        let timeout_duration = Duration::from_millis(20);
-        let query = tokio::spawn(stream_tick_transactions(
-            state,
-            Arc::clone(&pending),
-            outbound_budget(),
-            test_config(timeout_duration),
-            42,
-            output_tx,
-            Instant::now() + timeout_duration,
-        ));
-        let request = peer_rx.recv().await.unwrap();
-        let dejavu = u32::from_le_bytes(request.bytes[4..8].try_into().unwrap());
-        for amount in [1, 2] {
-            assert_eq!(
-                pending.deliver(peer_id, dejavu, transaction_frame(dejavu, amount)),
-                crate::pending::DeliveryOutcome::Delivered
-            );
-        }
-
-        assert_eq!(
-            query.await.unwrap().unwrap_err().to_string(),
-            "Peer-backed API query timed out after 20 ms"
-        );
-        assert_eq!(pending.active_count(), 0);
     }
 
     #[tokio::test]
@@ -991,6 +733,70 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn absent_entity_is_not_reported_as_a_verified_zero_balance() {
+        let public_key = [9; 32];
+        let mut payload = entity_payload(public_key);
+        payload[68..72].copy_from_slice(&(-1i32).to_le_bytes());
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(pending_frame(Bytes::from(
+            build_request_frame(RESPOND_ENTITY_TYPE, 7, &payload).unwrap(),
+        )))
+        .await
+        .unwrap();
+
+        let error = receive_balance(rx, "wallet", public_key, &TrustedNetworkState::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, PeerQueryError::PeerUnavailable(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot prove that the entity is absent")
+        );
+    }
+
+    #[test]
+    fn balance_proof_changes_when_any_sibling_changes() {
+        let public_key = [9; 32];
+        let mut payload = entity_payload(public_key);
+        payload[68..72].copy_from_slice(&0i32.to_le_bytes());
+        let original = parse_balance_payload("wallet", public_key, &payload)
+            .expect("entity should parse")
+            .proof_root();
+
+        for sibling in 0..SPECTRUM_DEPTH {
+            let mut mutated = payload;
+            mutated[72 + sibling * 32] ^= 1;
+            let root = parse_balance_payload("wallet", public_key, &mutated)
+                .expect("mutated entity should parse")
+                .proof_root();
+            assert_ne!(root, original);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_nonzero_merkle_path_mutation_changes_root(
+            sibling in 0usize..SPECTRUM_DEPTH,
+            byte in 0usize..32,
+            mask in 1u8..=u8::MAX,
+        ) {
+            let public_key = [9; 32];
+            let mut payload = entity_payload(public_key);
+            payload[68..72].copy_from_slice(&0i32.to_le_bytes());
+            let original = parse_balance_payload("wallet", public_key, &payload)
+                .expect("entity should parse")
+                .proof_root();
+            payload[72 + sibling * 32 + byte] ^= mask;
+            let mutated = parse_balance_payload("wallet", public_key, &payload)
+                .expect("mutated entity should parse")
+                .proof_root();
+            prop_assert_ne!(mutated, original);
+        }
+    }
+
     #[test]
     fn local_request_larger_than_configured_ceiling_is_internal_not_peer_fault() {
         let mut config = (*test_config(Duration::from_secs(1))).clone();
@@ -1007,10 +813,12 @@ mod tests {
     async fn first_balance_response_completes_and_cleans_pending_request() {
         let (state, peer_id, mut peer_rx) = state_with_peer().await;
         let pending = Arc::new(PendingRequests::default());
+        let trusted_network = Arc::new(TrustedNetworkState::default());
         let query = tokio::spawn(query_balance(
             state,
             Arc::clone(&pending),
             outbound_budget(),
+            Arc::clone(&trusted_network),
             test_config(Duration::from_secs(1)),
             "wallet",
             [9; 32],
@@ -1022,6 +830,10 @@ mod tests {
         payload[32..40].copy_from_slice(&100i64.to_le_bytes());
         payload[40..48].copy_from_slice(&40i64.to_le_bytes());
         payload[64..68].copy_from_slice(&123u32.to_le_bytes());
+        let root = parse_balance_payload("wallet", [9; 32], &payload)
+            .expect("test entity should parse")
+            .proof_root();
+        trusted_network.set_spectrum_root_for_test(123, root);
         let response = Bytes::from(
             build_request_frame(RESPOND_ENTITY_TYPE, dejavu, &payload)
                 .expect("balance response should build"),
@@ -1044,6 +856,7 @@ mod tests {
             Arc::clone(&state),
             Arc::clone(&pending),
             outbound_budget(),
+            Arc::new(TrustedNetworkState::default()),
             test_config(Duration::from_secs(1)),
             "wallet",
             [9; 32],
@@ -1074,6 +887,7 @@ mod tests {
             state,
             Arc::clone(&pending),
             outbound_budget(),
+            Arc::new(TrustedNetworkState::default()),
             test_config(Duration::from_millis(20)),
             "wallet",
             [9; 32],

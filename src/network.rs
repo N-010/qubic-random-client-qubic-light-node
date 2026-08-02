@@ -3,10 +3,8 @@ use crate::frame::{
     BROADCAST_COMPUTORS_PAYLOAD_SIZE, BROADCAST_COMPUTORS_TYPE, BROADCAST_TICK_PAYLOAD_SIZE,
     BROADCAST_TICK_TYPE, BROADCAST_TRANSACTION_TYPE, END_RESPONSE_TYPE,
     EXCHANGE_PUBLIC_PEERS_FRAME_SIZE, EXCHANGE_PUBLIC_PEERS_TYPE, HEADER_SIZE,
-    OC_MACHINE_INVOCATION_TYPE, ORACLE_MACHINE_QUERY_TYPE, ORACLE_MACHINE_REPLY_TYPE,
     REQUEST_COMPUTORS_TYPE, build_exchange_public_peers_frame, build_request_frame,
     decode_frame_size, frame_meta, frame_payload, message_type_name, parse_exchange_public_peers,
-    parse_transaction_layout,
 };
 use crate::pending::{DeliveryOutcome, PendingEvent, PendingRequests, PendingSpec, ResponseRule};
 use crate::state::{
@@ -18,16 +16,15 @@ use crate::verified::{
     ComputorVerification, TickVerification, TrustedNetworkState, unix_time_millis,
 };
 use bytes::{Bytes, BytesMut};
-use std::collections::HashSet;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddrV4;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 use tokio::time::{Instant as TokioInstant, sleep, timeout, timeout_at};
 
 const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
@@ -37,6 +34,7 @@ const READ_BUFFER_SIZE: usize = 128 * 1024;
 const ACCUMULATED_INITIAL_CAPACITY: usize = 256 * 1024;
 const ACCUMULATED_RETAIN_CAPACITY: usize = 512 * 1024;
 const ACCUMULATED_SHRINK_THRESHOLD: usize = 2 * 1024 * 1024;
+const VERIFICATION_CACHE_CAPACITY: usize = 65_536;
 
 #[cfg(unix)]
 fn configure_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
@@ -92,8 +90,8 @@ fn emergency_dns_needed(
 
 fn log_pool_stats(stats: PeerPoolStats, target: usize) {
     println!(
-        "Peer pool | known={} dialable={} cooldown={} pending={} incoming={} outgoing={} target={target}",
-        stats.known, stats.dialable, stats.cooldown, stats.pending, stats.incoming, stats.outgoing,
+        "Peer pool | known={} dialable={} cooldown={} pending={} outgoing={} target={target}",
+        stats.known, stats.dialable, stats.cooldown, stats.pending, stats.outgoing,
     );
 }
 
@@ -131,7 +129,6 @@ struct DispatchResult {
 #[derive(Clone)]
 pub(crate) struct NetworkResources {
     state: Arc<Mutex<NodeState>>,
-    dedup: Arc<DedupWindow>,
     pending: Arc<PendingRequests>,
     latest_epoch_tick: Arc<AtomicU64>,
     trusted_network: Arc<TrustedNetworkState>,
@@ -145,7 +142,6 @@ pub(crate) struct NetworkResources {
 impl NetworkResources {
     pub(crate) fn new(
         state: Arc<Mutex<NodeState>>,
-        dedup: Arc<DedupWindow>,
         pending: Arc<PendingRequests>,
         latest_epoch_tick: Arc<AtomicU64>,
         trusted_network: Arc<TrustedNetworkState>,
@@ -157,12 +153,11 @@ impl NetworkResources {
             .clamp(2, 8);
         Self {
             state,
-            dedup,
             pending,
             latest_epoch_tick,
             trusted_network,
-            signed_replay: Arc::new(DedupWindow::new(config.max_seen)),
-            signed_invalid: Arc::new(DedupWindow::new(config.max_seen)),
+            signed_replay: Arc::new(DedupWindow::new(VERIFICATION_CACHE_CAPACITY)),
+            signed_invalid: Arc::new(DedupWindow::new(VERIFICATION_CACHE_CAPACITY)),
             verification_slots: Arc::new(Semaphore::new(verification_parallelism)),
             outbound_budget,
             config,
@@ -173,42 +168,7 @@ impl NetworkResources {
 struct ConnectionContext {
     peer_id: u64,
     remote: SocketAddrV4,
-    outbound: bool,
-    _incoming_permit: Option<OwnedSemaphorePermit>,
-    _incoming_ip_reservation: Option<IncomingIpReservation>,
     resources: NetworkResources,
-}
-
-struct IncomingIpReservation {
-    ip: std::net::Ipv4Addr,
-    reserved: Arc<StdMutex<HashSet<std::net::Ipv4Addr>>>,
-}
-
-impl IncomingIpReservation {
-    fn try_new(
-        ip: std::net::Ipv4Addr,
-        reserved: &Arc<StdMutex<HashSet<std::net::Ipv4Addr>>>,
-    ) -> Option<Self> {
-        let mut locked = reserved
-            .lock()
-            .expect("incoming IP reservation mutex should not be poisoned");
-        if !locked.insert(ip) {
-            return None;
-        }
-        Some(Self {
-            ip,
-            reserved: Arc::clone(reserved),
-        })
-    }
-}
-
-impl Drop for IncomingIpReservation {
-    fn drop(&mut self) {
-        self.reserved
-            .lock()
-            .expect("incoming IP reservation mutex should not be poisoned")
-            .remove(&self.ip);
-    }
 }
 
 fn dispatch_frame(
@@ -274,25 +234,15 @@ async fn disconnect_failed_targets(state: &Arc<Mutex<NodeState>>, result: &Dispa
 
 pub(crate) async fn broadcast_transaction_to_network(
     state: Arc<Mutex<NodeState>>,
-    dedup: Arc<DedupWindow>,
     outbound_budget: Arc<Semaphore>,
-    tx_bytes: &[u8],
+    transaction: crate::frame::ValidatedTransaction<'_>,
 ) -> Result<(), String> {
+    let tx_bytes = transaction.bytes();
     if tx_bytes.is_empty() {
         return Err("Transaction payload is empty".to_string());
     }
-    parse_transaction_layout(tx_bytes, None)?;
 
     let frame = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, tx_bytes)?;
-    let digest = *blake3::hash(&frame).as_bytes();
-    let reservation = match dedup.reserve(digest) {
-        Ok(reservation) => reservation,
-        Err(DedupReservationError::AlreadyCommitted) => return Ok(()),
-        Err(DedupReservationError::InFlight) => {
-            return Err("Transaction broadcast is already in progress".to_string());
-        }
-    };
-
     let targets = {
         let locked = state.lock().await;
         let targets = locked.collect_all_targets(DISSEMINATION_MULTIPLIER);
@@ -333,61 +283,7 @@ pub(crate) async fn broadcast_transaction_to_network(
         );
     }
 
-    reservation.commit();
-
     Ok(())
-}
-
-pub(crate) async fn accept_loop(listener: TcpListener, resources: NetworkResources) {
-    let incoming_slots = Arc::new(Semaphore::new(resources.config.max_incoming));
-    let incoming_ips = Arc::new(StdMutex::new(HashSet::new()));
-    loop {
-        match listener.accept().await {
-            Ok((stream, remote_addr)) => {
-                let remote_v4 = match remote_addr {
-                    SocketAddr::V4(addr) => addr,
-                    SocketAddr::V6(_) => {
-                        continue;
-                    }
-                };
-
-                let Some(incoming_ip_reservation) =
-                    IncomingIpReservation::try_new(*remote_v4.ip(), &incoming_ips)
-                else {
-                    println!("Rejecting incoming {remote_v4}: source IP already reserved.");
-                    continue;
-                };
-
-                if let Err(err) = stream.set_nodelay(true) {
-                    eprintln!("Failed to set TCP_NODELAY for {remote_v4}: {err}");
-                }
-                if let Err(err) = configure_tcp_keepalive(&stream) {
-                    eprintln!("Failed to set TCP keepalive for {remote_v4}: {err}");
-                }
-
-                let Ok(incoming_permit) = Arc::clone(&incoming_slots).try_acquire_owned() else {
-                    println!("Rejecting incoming {remote_v4}: incoming limit reached.");
-                    continue;
-                };
-                let connection_resources = resources.clone();
-                tokio::spawn(async move {
-                    establish_connection(
-                        stream,
-                        remote_v4,
-                        false,
-                        Some(incoming_permit),
-                        Some(incoming_ip_reservation),
-                        connection_resources,
-                    )
-                    .await;
-                });
-            }
-            Err(err) => {
-                eprintln!("Accept failed: {err}");
-                sleep(Duration::from_millis(200)).await;
-            }
-        }
-    }
 }
 
 pub(crate) async fn dial_loop(resources: NetworkResources) {
@@ -524,8 +420,7 @@ pub(crate) async fn dial_loop(resources: NetworkResources) {
                         if let Err(err) = configure_tcp_keepalive(&stream) {
                             eprintln!("Failed to set TCP keepalive for {target}: {err}");
                         }
-                        establish_connection(stream, target, true, None, None, resources_for_task)
-                            .await;
+                        establish_connection(stream, target, resources_for_task).await;
                     }
                     Ok(Err(err)) => {
                         {
@@ -561,9 +456,6 @@ pub(crate) async fn dial_loop(resources: NetworkResources) {
 async fn establish_connection(
     mut stream: TcpStream,
     remote: SocketAddrV4,
-    outbound: bool,
-    incoming_permit: Option<OwnedSemaphorePermit>,
-    incoming_ip_reservation: Option<IncomingIpReservation>,
     resources: NetworkResources,
 ) {
     let handshake_payload = {
@@ -580,13 +472,11 @@ async fn establish_connection(
     {
         Ok(frame) => frame,
         Err(err) => {
-            if outbound {
-                resources.state.lock().await.record_peer_failure(
-                    remote,
-                    resources.config.reconnect_interval,
-                    Instant::now(),
-                );
-            }
+            resources.state.lock().await.record_peer_failure(
+                remote,
+                resources.config.reconnect_interval,
+                Instant::now(),
+            );
             eprintln!("Handshake failed {remote}: {err}");
             return;
         }
@@ -602,10 +492,10 @@ async fn establish_connection(
 
     let (tx, rx) = mpsc::channel::<OutboundFrame>(OUTBOUND_QUEUE_CAPACITY);
     let (disconnect_tx, disconnect_rx) = watch::channel(false);
-    let (peer_id, incoming_count, outgoing_count) = {
+    let (peer_id, outgoing_count) = {
         let mut locked = resources.state.lock().await;
 
-        if outbound && locked.outgoing_count() >= resources.config.target_outbound {
+        if locked.outgoing_count() >= resources.config.target_outbound {
             println!("Rejecting outbound {remote}: outbound target already reached.");
             locked.clear_pending_dial(remote);
             return;
@@ -613,7 +503,7 @@ async fn establish_connection(
 
         let Some(peer_id) = locked.register_session(
             remote,
-            outbound,
+            true,
             tx.clone(),
             disconnect_tx,
             resources.config.peer_port,
@@ -622,14 +512,11 @@ async fn establish_connection(
             return;
         };
 
-        (peer_id, locked.incoming_count(), locked.outgoing_count())
+        (peer_id, locked.outgoing_count())
     };
 
     println!(
-        "Connected {} [{}] | in={} out={} | {}",
-        remote,
-        if outbound { "out" } else { "in" },
-        incoming_count,
+        "Connected {remote} [out] | out={} | {}",
         outgoing_count,
         format_epoch_tick_packed(resources.latest_epoch_tick.load(Ordering::Relaxed))
     );
@@ -643,9 +530,6 @@ async fn establish_connection(
         ConnectionContext {
             peer_id,
             remote,
-            outbound,
-            _incoming_permit: incoming_permit,
-            _incoming_ip_reservation: incoming_ip_reservation,
             resources,
         },
     ));
@@ -696,7 +580,7 @@ const COMPUTOR_RESPONSE_RULES: &[ResponseRule] = &[
     ResponseRule {
         message_type: BROADCAST_COMPUTORS_TYPE,
         min_frame_bytes: HEADER_SIZE + BROADCAST_COMPUTORS_PAYLOAD_SIZE,
-        max_frame_bytes: HEADER_SIZE + BROADCAST_COMPUTORS_PAYLOAD_SIZE,
+        max_frame_bytes: HEADER_SIZE + BROADCAST_COMPUTORS_PAYLOAD_SIZE + 4,
         max_frames: 1,
         terminal: true,
     },
@@ -729,7 +613,7 @@ async fn computor_bootstrap(
             PendingSpec {
                 response_rules: COMPUTOR_RESPONSE_RULES,
                 max_response_frames: 1,
-                max_response_bytes: HEADER_SIZE + BROADCAST_COMPUTORS_PAYLOAD_SIZE,
+                max_response_bytes: HEADER_SIZE + BROADCAST_COMPUTORS_PAYLOAD_SIZE + 4,
             },
         );
         let request = Bytes::from(
@@ -792,9 +676,6 @@ async fn connection_worker(
     let ConnectionContext {
         peer_id,
         remote,
-        outbound,
-        _incoming_permit,
-        _incoming_ip_reservation,
         resources,
     } = context;
     let connection_exit = {
@@ -837,15 +718,14 @@ async fn connection_worker(
         exit
     };
 
-    let (in_count, out_count, disconnect_reason) = {
+    let (out_count, disconnect_reason) = {
         let mut locked = resources.state.lock().await;
         let removed_endpoint = locked.unregister_session(peer_id);
         let requested_reason = locked.take_disconnect_reason(peer_id);
         let (disconnect_reason, penalize) = match connection_exit {
-            ConnectionExit::Io(reason) => requested_reason
-                .map_or((reason, outbound), |requested| {
-                    (requested.to_string(), requested.penalizes_peer())
-                }),
+            ConnectionExit::Io(reason) => requested_reason.map_or((reason, true), |requested| {
+                (requested.to_string(), requested.penalizes_peer())
+            }),
             ConnectionExit::Protocol(reason) => requested_reason
                 .map_or((reason, true), |requested| {
                     (requested.to_string(), requested.penalizes_peer())
@@ -863,16 +743,12 @@ async fn connection_worker(
                 Instant::now(),
             );
         }
-        (
-            locked.incoming_count(),
-            locked.outgoing_count(),
-            disconnect_reason,
-        )
+        (locked.outgoing_count(), disconnect_reason)
     };
     resources.pending.peer_disconnected(peer_id);
     eprintln!("Disconnecting {remote}: {disconnect_reason}");
     println!(
-        "Disconnected {remote} | in={in_count} out={out_count} | {}",
+        "Disconnected {remote} | out={out_count} | {}",
         format_epoch_tick_packed(resources.latest_epoch_tick.load(Ordering::Relaxed))
     );
 }
@@ -1270,77 +1146,6 @@ async fn process_incoming_frame(
         return FrameProcessingOutcome::Continue;
     }
 
-    if matches!(
-        message_type,
-        ORACLE_MACHINE_QUERY_TYPE | ORACLE_MACHINE_REPLY_TYPE | OC_MACHINE_INVOCATION_TYPE
-    ) {
-        return FrameProcessingOutcome::Continue;
-    }
-
-    if message_type == BROADCAST_TRANSACTION_TYPE {
-        let Ok(payload) = frame_payload(&frame) else {
-            return FrameProcessingOutcome::Continue;
-        };
-        if parse_transaction_layout(payload, None).is_err() {
-            return FrameProcessingOutcome::Continue;
-        }
-    }
-
-    if !resources.config.relay_all && dejavu != 0 {
-        return FrameProcessingOutcome::Continue;
-    }
-
-    let digest = *blake3::hash(&frame).as_bytes();
-    let Ok(reservation) = resources.dedup.reserve(digest) else {
-        if resources.config.traffic_log {
-            let (size, message_type, dejavu) = frame_meta(&frame);
-            println!(
-                "DROP_DUP peer_id={} size={} type={}({}) dejavu={} | {}",
-                source_peer_id,
-                size,
-                message_type_name(message_type),
-                message_type,
-                dejavu,
-                format_epoch_tick_packed(resources.latest_epoch_tick.load(Ordering::Relaxed))
-            );
-        }
-        return FrameProcessingOutcome::Continue;
-    };
-
-    let locked = resources.state.lock().await;
-    let targets = locked.collect_targets(source_peer_id, DISSEMINATION_MULTIPLIER);
-    drop(locked);
-
-    let result = dispatch_frame(targets, &frame, &resources.outbound_budget);
-    disconnect_failed_targets(&resources.state, &result).await;
-    if result.sent_count > 0 {
-        reservation.commit();
-    }
-
-    if resources.config.traffic_log {
-        let (size, message_type, dejavu) = frame_meta(&frame);
-        println!(
-            "RELAY peer_id={} -> {} peers | size={} type={}({}) dejavu={} | {}",
-            source_peer_id,
-            result.sent_count,
-            size,
-            message_type_name(message_type),
-            message_type,
-            dejavu,
-            format_epoch_tick_packed(resources.latest_epoch_tick.load(Ordering::Relaxed))
-        );
-        if !result.full_peer_ids.is_empty() {
-            println!(
-                "DROP_BACKPRESSURE peer_id={} dropped={} size={} type={}({}) dejavu={}",
-                source_peer_id,
-                result.full_peer_ids.len(),
-                size,
-                message_type_name(message_type),
-                message_type,
-                dejavu
-            );
-        }
-    }
     FrameProcessingOutcome::Continue
 }
 fn update_latest_epoch_tick(latest: &AtomicU64, epoch: u16, tick: u32) {
@@ -1381,6 +1186,7 @@ mod tests {
     use crate::frame::{COMPUTORS_PUBLIC_KEYS_SIZE, REQUEST_ENTITY_TYPE};
     use pretty_assertions::assert_eq;
     use std::net::{Ipv4Addr, SocketAddr};
+    use tokio::net::TcpListener;
 
     fn peer(last_octet: u8) -> SocketAddrV4 {
         SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, last_octet), DEFAULT_PORT)
@@ -1388,14 +1194,10 @@ mod tests {
 
     fn test_config() -> Arc<Config> {
         Arc::new(Config {
-            listen_addr: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, DEFAULT_PORT),
             api_timeout: Duration::from_secs(1),
             grpc_listen_addr: SocketAddr::from(([127, 0, 0, 1], DEFAULT_GRPC_PORT)),
-            grpc_enabled: true,
             peer_port: DEFAULT_PORT,
             target_outbound: 8,
-            max_incoming: 32,
-            max_seen: 1_000,
             max_known_peers: 1_000,
             reconnect_interval: Duration::from_secs(2),
             peer_write_timeout: Duration::from_secs(5),
@@ -1403,7 +1205,6 @@ mod tests {
             peer_handshake_timeout: Duration::from_secs(5),
             peer_frame_timeout: Duration::from_secs(30),
             max_frame_bytes: 1024 * 1024,
-            relay_all: false,
             dns_bootstrap: false,
             dns_lite_peers: 0,
             dns_timeout: Duration::from_secs(1),
@@ -1432,7 +1233,6 @@ mod tests {
     ) -> NetworkResources {
         NetworkResources::new(
             state,
-            Arc::new(DedupWindow::new(1_000)),
             pending,
             latest_epoch_tick,
             trusted_network(),
@@ -1541,20 +1341,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn incoming_ip_reservation_precedes_and_outlives_global_admission() {
-        let reserved = Arc::new(StdMutex::new(HashSet::new()));
-        let ip = Ipv4Addr::new(1, 2, 3, 4);
-        let first = IncomingIpReservation::try_new(ip, &reserved).unwrap();
-
-        assert!(IncomingIpReservation::try_new(ip, &reserved).is_none());
-        assert!(IncomingIpReservation::try_new(Ipv4Addr::new(1, 2, 3, 5), &reserved).is_some());
-        drop(first);
-        assert!(IncomingIpReservation::try_new(ip, &reserved).is_some());
-    }
-
     #[tokio::test]
-    async fn unrelated_non_relay_frame_does_not_wait_for_state_lock() {
+    async fn unrelated_frame_does_not_wait_for_state_lock() {
         let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
         let _guard = state.lock().await;
         let frame = Bytes::from(
@@ -1720,41 +1508,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_api_response_is_not_relayed_in_relay_all_mode() {
-        let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
-        let (target_tx, mut target_rx) = mpsc::channel(1);
-        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
-        state
-            .lock()
-            .await
-            .register_session(peer(20), true, target_tx, disconnect_tx, DEFAULT_PORT)
-            .unwrap();
-        let pending = Arc::new(PendingRequests::default());
-        let (registration, _receivers) = pending.register([999]);
-        let dejavu = registration.dejavu();
-        drop(registration);
-        let mut config = (*test_config()).clone();
-        config.relay_all = true;
-        let frame = Bytes::from(
-            build_request_frame(crate::frame::RESPOND_ENTITY_TYPE, dejavu, &[]).unwrap(),
-        );
-
-        process_incoming_frame(
-            999,
-            frame,
-            network_resources(
-                Arc::clone(&state),
-                pending,
-                Arc::new(AtomicU64::new(0)),
-                Arc::new(config),
-            ),
-        )
-        .await;
-
-        assert!(target_rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
     async fn fatal_frame_stops_processing_later_frames_from_same_read() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1833,85 +1586,6 @@ mod tests {
         assert!(target_rx.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn relay_filters_handshake_internal_channels_and_malformed_transactions() {
-        let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
-        let (target_tx, mut target_rx) = mpsc::channel(1);
-        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
-        state
-            .lock()
-            .await
-            .register_session(peer(20), true, target_tx, disconnect_tx, DEFAULT_PORT)
-            .unwrap();
-        let mut config = (*test_config()).clone();
-        config.relay_all = true;
-        let config = Arc::new(config);
-        let dedup = Arc::new(DedupWindow::new(1_000));
-        let pending = Arc::new(PendingRequests::default());
-        let latest = Arc::new(AtomicU64::new(0));
-        let resources = NetworkResources::new(
-            Arc::clone(&state),
-            Arc::clone(&dedup),
-            Arc::clone(&pending),
-            Arc::clone(&latest),
-            trusted_network(),
-            outbound_budget(),
-            Arc::clone(&config),
-        );
-
-        for message_type in [
-            ORACLE_MACHINE_QUERY_TYPE,
-            ORACLE_MACHINE_REPLY_TYPE,
-            OC_MACHINE_INVOCATION_TYPE,
-        ] {
-            process_incoming_frame(
-                999,
-                Bytes::from(build_request_frame(message_type, 0, &[1]).unwrap()),
-                resources.clone(),
-            )
-            .await;
-        }
-
-        let exchange_frame = build_exchange_public_peers_frame([
-            Ipv4Addr::new(2, 2, 2, 2),
-            Ipv4Addr::UNSPECIFIED,
-            Ipv4Addr::UNSPECIFIED,
-            Ipv4Addr::UNSPECIFIED,
-        ]);
-        let mut locked = state.lock().await;
-        add_discovered_peers(
-            &mut locked,
-            &exchange_frame,
-            DEFAULT_PORT,
-            Ipv4Addr::new(9, 9, 9, 9),
-        );
-        drop(locked);
-
-        process_incoming_frame(
-            999,
-            Bytes::from(build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &[1, 2, 3]).unwrap()),
-            resources,
-        )
-        .await;
-
-        assert!(target_rx.try_recv().is_err());
-        assert_eq!(state.lock().await.pool_stats(Instant::now()).known, 2);
-    }
-
-    #[test]
-    fn incoming_connections_do_not_suppress_emergency_dns() {
-        let mut state = NodeState::new(10, &[]);
-        let (tx, _rx) = mpsc::channel(1);
-        let (disconnect_tx, _disconnect_rx) = watch::channel(false);
-        state
-            .register_session(peer(1), false, tx, disconnect_tx, DEFAULT_PORT)
-            .expect("incoming peer should connect");
-
-        assert_eq!(state.incoming_count(), 1);
-        assert_eq!(state.outgoing_count(), 0);
-        assert!(emergency_dns_needed(state.outgoing_count(), 1, true, true));
-    }
-
     #[test]
     fn empty_and_duplicate_dns_results_back_off_but_new_peer_recovers() {
         let existing = peer(2);
@@ -1986,14 +1660,14 @@ mod tests {
             .await
             .register_session(peer(5), true, tx, disconnect_tx, DEFAULT_PORT)
             .expect("peer should register");
-        let transaction =
-            vec![0; crate::frame::TRANSACTION_BASE_SIZE + crate::frame::SIGNATURE_SIZE];
+        let transaction = crate::frame::signed_transaction_for_test(5);
+        let transaction = crate::frame::validate_transaction(&transaction, None)
+            .expect("test transaction should be valid");
 
         let result = broadcast_transaction_to_network(
             Arc::clone(&state),
-            Arc::new(DedupWindow::new(1_000)),
             Arc::new(Semaphore::new(0)),
-            &transaction,
+            transaction,
         )
         .await;
 
@@ -2098,74 +1772,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_valid_signature_still_obeys_each_frames_relay_header() {
-        let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
-        let (source_tx, _source_rx) = mpsc::channel(2);
-        let (target_tx, mut target_rx) = mpsc::channel(2);
-        let (source_disconnect_tx, _source_disconnect_rx) = watch::channel(false);
-        let (target_disconnect_tx, _target_disconnect_rx) = watch::channel(false);
-        let source_peer_id = {
-            let mut locked = state.lock().await;
-            let source_peer_id = locked
-                .register_session(
-                    peer(30),
-                    true,
-                    source_tx,
-                    source_disconnect_tx,
-                    DEFAULT_PORT,
-                )
-                .expect("source peer should register");
-            locked
-                .register_session(
-                    peer(31),
-                    true,
-                    target_tx,
-                    target_disconnect_tx,
-                    DEFAULT_PORT,
-                )
-                .expect("target peer should register");
-            source_peer_id
-        };
-        let resources = network_resources(
-            state,
-            Arc::new(PendingRequests::default()),
-            Arc::new(AtomicU64::new(0)),
-            test_config(),
-        );
-        let mut payload = vec![0; BROADCAST_COMPUTORS_PAYLOAD_SIZE];
-        payload[2..2 + COMPUTORS_PUBLIC_KEYS_SIZE].fill(1);
-        let digest = computor_verification_digest(&payload);
-        resources
-            .signed_replay
-            .reserve(digest)
-            .expect("test signature cache should be empty")
-            .commit();
-        let non_relayable = Bytes::from(
-            build_request_frame(BROADCAST_COMPUTORS_TYPE, 7, &payload)
-                .expect("test frame should build"),
-        );
-        let relayable = Bytes::from(
-            build_request_frame(BROADCAST_COMPUTORS_TYPE, 0, &payload)
-                .expect("test frame should build"),
-        );
-
-        process_incoming_frame(source_peer_id, non_relayable, resources.clone()).await;
-        assert!(matches!(
-            target_rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
-        process_incoming_frame(source_peer_id, relayable.clone(), resources).await;
-        assert_eq!(
-            target_rx
-                .recv()
-                .await
-                .expect("relayable replay should reach the target")
-                .bytes,
-            relayable
-        );
-    }
-
-    #[tokio::test]
     async fn tcp_reset_unregisters_outbound_session_and_allows_replacement() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2202,9 +1808,6 @@ mod tests {
             ConnectionContext {
                 peer_id,
                 remote,
-                outbound: true,
-                _incoming_permit: None,
-                _incoming_ip_reservation: None,
                 resources: network_resources(
                     Arc::clone(&state),
                     Arc::new(PendingRequests::default()),
@@ -2325,9 +1928,6 @@ mod tests {
             ConnectionContext {
                 peer_id,
                 remote,
-                outbound: true,
-                _incoming_permit: None,
-                _incoming_ip_reservation: None,
                 resources: network_resources(
                     Arc::clone(&state),
                     Arc::new(PendingRequests::default()),
@@ -2391,9 +1991,6 @@ mod tests {
             ConnectionContext {
                 peer_id,
                 remote,
-                outbound: true,
-                _incoming_permit: None,
-                _incoming_ip_reservation: None,
                 resources: network_resources(
                     Arc::clone(&state),
                     Arc::new(PendingRequests::default()),
@@ -2450,9 +2047,6 @@ mod tests {
             ConnectionContext {
                 peer_id,
                 remote,
-                outbound: true,
-                _incoming_permit: None,
-                _incoming_ip_reservation: None,
                 resources: network_resources(
                     Arc::clone(&state),
                     Arc::new(PendingRequests::default()),

@@ -5,7 +5,6 @@ package lightnode;
 service LightNode {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
-  rpc StreamTickTransactions(GetTickTransactionsRequest) returns (stream Transaction);
   rpc QueryContractFunction(QueryContractFunctionRequest) returns (QueryContractFunctionResponse);
   rpc BroadcastTransaction(BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
 }
@@ -52,21 +51,6 @@ message GetBalanceResponse {
   bool ok = 1;
   Balance balance = 2;
   string error = 3;
-}
-
-message GetTickTransactionsRequest {
-  uint32 tick = 1;
-}
-
-message Transaction {
-  string source_public_key_hex = 1;
-  string destination_public_key_hex = 2;
-  int64 amount = 3;
-  uint32 tick = 4;
-  uint32 input_type = 5;
-  uint32 input_size = 6;
-  string input_hex = 7;
-  string signature_hex = 8;
 }
 
 message QueryContractFunctionRequest {

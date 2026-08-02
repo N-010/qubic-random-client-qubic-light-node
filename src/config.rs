@@ -11,8 +11,6 @@ pub(crate) const DEFAULT_GRPC_PORT: u16 = 50051;
 
 const DEFAULT_API_TIMEOUT_MS: u64 = 6_000;
 const DEFAULT_TARGET_OUTBOUND: usize = 8;
-const DEFAULT_MAX_INCOMING: usize = 32;
-const DEFAULT_MAX_SEEN: usize = 65_536;
 const DEFAULT_MAX_KNOWN_PEERS: usize = 500;
 const DEFAULT_RECONNECT_MS: u64 = 2_000;
 const DEFAULT_PEER_WRITE_TIMEOUT_MS: u64 = 5_000;
@@ -32,14 +30,10 @@ const MIN_PEER_FRAME_TIMEOUT_MS: u64 = 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Config {
-    pub(crate) listen_addr: SocketAddrV4,
     pub(crate) api_timeout: Duration,
     pub(crate) grpc_listen_addr: SocketAddr,
-    pub(crate) grpc_enabled: bool,
     pub(crate) peer_port: u16,
     pub(crate) target_outbound: usize,
-    pub(crate) max_incoming: usize,
-    pub(crate) max_seen: usize,
     pub(crate) max_known_peers: usize,
     pub(crate) reconnect_interval: Duration,
     pub(crate) peer_write_timeout: Duration,
@@ -47,7 +41,6 @@ pub(crate) struct Config {
     pub(crate) peer_handshake_timeout: Duration,
     pub(crate) peer_frame_timeout: Duration,
     pub(crate) max_frame_bytes: usize,
-    pub(crate) relay_all: bool,
     pub(crate) dns_bootstrap: bool,
     pub(crate) dns_lite_peers: usize,
     pub(crate) dns_timeout: Duration,
@@ -60,7 +53,7 @@ pub(crate) struct Config {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "QubicLightNode", version, about = "Qubic light relay node")]
+#[command(name = "QubicLightNode", version, about = "Qubic RandomClient backend")]
 struct Cli {
     #[arg(
         long = "peer",
@@ -69,15 +62,6 @@ struct Cli {
         help_heading = "P2P"
     )]
     seed_peer_args: Vec<String>,
-
-    #[arg(
-        long = "port",
-        value_name = "PORT",
-        default_value_t = DEFAULT_PORT,
-        help = "Local TCP listen port for incoming Qubic peers",
-        help_heading = "P2P"
-    )]
-    listen_port: u16,
 
     #[arg(
         long = "peer-port",
@@ -89,15 +73,6 @@ struct Cli {
     peer_port: u16,
 
     #[arg(
-        long = "listen-ip",
-        value_name = "IPV4",
-        default_value = "0.0.0.0",
-        help = "IPv4 address to bind the TCP listener to",
-        help_heading = "P2P"
-    )]
-    listen_ip: Ipv4Addr,
-
-    #[arg(
         long = "target-outbound",
         value_name = "N",
         default_value_t = DEFAULT_TARGET_OUTBOUND,
@@ -105,24 +80,6 @@ struct Cli {
         help_heading = "P2P"
     )]
     target_outbound: usize,
-
-    #[arg(
-        long = "max-incoming",
-        value_name = "N",
-        default_value_t = DEFAULT_MAX_INCOMING,
-        help = "Maximum number of incoming peer sessions",
-        help_heading = "P2P"
-    )]
-    max_incoming: usize,
-
-    #[arg(
-        long = "max-seen",
-        value_name = "N",
-        default_value_t = DEFAULT_MAX_SEEN,
-        help = "Deduplication window size for seen frame hashes",
-        help_heading = "P2P"
-    )]
-    max_seen: usize,
 
     #[arg(
         long = "max-known-peers",
@@ -188,16 +145,9 @@ struct Cli {
     max_frame_bytes: usize,
 
     #[arg(
-        long = "relay-all",
-        help = "Relay frames even when dejavu is non-zero",
-        help_heading = "Relay"
-    )]
-    relay_all: bool,
-
-    #[arg(
         long = "traffic-log",
-        help = "Log RX, TX, and relay activity for network frames",
-        help_heading = "Relay"
+        help = "Log RX and TX activity for network frames",
+        help_heading = "Diagnostics"
     )]
     traffic_log: bool,
 
@@ -277,13 +227,6 @@ struct Cli {
         help_heading = "API"
     )]
     grpc_listen: SocketAddr,
-
-    #[arg(
-        long = "no-grpc",
-        help = "Disable the gRPC API server",
-        help_heading = "API"
-    )]
-    no_grpc: bool,
 }
 
 impl Config {
@@ -328,16 +271,6 @@ impl Config {
                 ),
             ));
         }
-        if cli.max_incoming > tokio::sync::Semaphore::MAX_PERMITS {
-            return Err(Cli::command().error(
-                ErrorKind::ValueValidation,
-                format!(
-                    "--max-incoming ({}) must not exceed {}",
-                    cli.max_incoming,
-                    tokio::sync::Semaphore::MAX_PERMITS
-                ),
-            ));
-        }
         let critical_peer_threshold = if cli.critical_peer_threshold == 0 && cli.target_outbound > 0
         {
             (cli.target_outbound / 2).max(1)
@@ -373,14 +306,10 @@ impl Config {
             .max(emergency_dns_backoff_initial_ms);
 
         Ok(Config {
-            listen_addr: SocketAddrV4::new(cli.listen_ip, cli.listen_port),
             api_timeout: Duration::from_millis(cli.api_timeout_ms.max(MIN_API_TIMEOUT_MS)),
             grpc_listen_addr: cli.grpc_listen,
-            grpc_enabled: !cli.no_grpc,
             peer_port: cli.peer_port,
             target_outbound: cli.target_outbound,
-            max_incoming: cli.max_incoming,
-            max_seen: cli.max_seen,
             max_known_peers: cli.max_known_peers,
             reconnect_interval: Duration::from_millis(cli.reconnect_ms.max(MIN_RECONNECT_MS)),
             peer_write_timeout: Duration::from_millis(cli.peer_write_timeout_ms),
@@ -395,7 +324,6 @@ impl Config {
                 cli.peer_frame_timeout_ms.max(MIN_PEER_FRAME_TIMEOUT_MS),
             ),
             max_frame_bytes: cli.max_frame_bytes,
-            relay_all: cli.relay_all,
             dns_bootstrap: !cli.no_dns_bootstrap,
             dns_lite_peers: cli.dns_lite_peers,
             dns_timeout: Duration::from_millis(cli.dns_timeout_ms.max(MIN_DNS_TIMEOUT_MS)),
@@ -449,7 +377,17 @@ mod tests {
 
         assert!(help.contains("Seed peer; can be repeated, and plain IP uses --peer-port"));
         assert!(help.contains("Desired number of outbound peer connections to keep"));
-        assert!(help.contains("Disable the gRPC API server"));
+        assert!(help.contains("Bind address for the gRPC API server"));
+        assert!(!help.contains("\n      --port "));
+        for removed_option in [
+            "--listen-ip",
+            "--max-incoming",
+            "--max-seen",
+            "--relay-all",
+            "--no-grpc",
+        ] {
+            assert!(!help.contains(removed_option));
+        }
     }
 
     #[test]
@@ -457,14 +395,10 @@ mod tests {
         assert_eq!(
             parse_config(&[]),
             Config {
-                listen_addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), DEFAULT_PORT),
                 api_timeout: Duration::from_millis(6_000),
                 grpc_listen_addr: SocketAddr::from(([127, 0, 0, 1], DEFAULT_GRPC_PORT)),
-                grpc_enabled: true,
                 peer_port: DEFAULT_PORT,
                 target_outbound: 8,
-                max_incoming: 32,
-                max_seen: 65_536,
                 max_known_peers: 500,
                 reconnect_interval: Duration::from_millis(2_000),
                 peer_write_timeout: Duration::from_millis(5_000),
@@ -472,7 +406,6 @@ mod tests {
                 peer_handshake_timeout: Duration::from_millis(5_000),
                 peer_frame_timeout: Duration::from_millis(30_000),
                 max_frame_bytes: 1024 * 1024,
-                relay_all: false,
                 dns_bootstrap: true,
                 dns_lite_peers: 0,
                 dns_timeout: Duration::from_millis(5_000),
@@ -582,19 +515,6 @@ mod tests {
             parse_config(&["--max-frame-bytes", "65551"]).max_frame_bytes,
             65_551
         );
-    }
-
-    #[test]
-    fn validates_max_incoming_against_tokio_semaphore_capacity() {
-        let maximum = tokio::sync::Semaphore::MAX_PERMITS.to_string();
-        assert_eq!(
-            parse_config(&["--max-incoming", &maximum]).max_incoming,
-            tokio::sync::Semaphore::MAX_PERMITS
-        );
-        let too_large = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
-        let err = Config::from_args(["QubicLightNode", "--max-incoming", &too_large])
-            .expect_err("semaphore capacity must be validated during CLI parsing");
-        assert_eq!(err.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]
