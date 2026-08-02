@@ -16,12 +16,19 @@ const DEFAULT_MAX_SEEN: usize = 65_536;
 const DEFAULT_MAX_KNOWN_PEERS: usize = 500;
 const DEFAULT_RECONNECT_MS: u64 = 2_000;
 const DEFAULT_PEER_WRITE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_PEER_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_PEER_HANDSHAKE_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_PEER_FRAME_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_MAX_FRAME_BYTES: usize = 1024 * 1024;
 const DEFAULT_DNS_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_EMERGENCY_DNS_BACKOFF_INITIAL_MS: u64 = 10_000; // 10с
 const DEFAULT_EMERGENCY_DNS_BACKOFF_MAX_MS: u64 = 300_000; // 5мин
 const MIN_API_TIMEOUT_MS: u64 = 1_000;
 const MIN_RECONNECT_MS: u64 = 200;
 const MIN_DNS_TIMEOUT_MS: u64 = 500;
+const MIN_PEER_CONNECT_TIMEOUT_MS: u64 = 500;
+const MIN_PEER_HANDSHAKE_TIMEOUT_MS: u64 = 500;
+const MIN_PEER_FRAME_TIMEOUT_MS: u64 = 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Config {
@@ -36,6 +43,10 @@ pub(crate) struct Config {
     pub(crate) max_known_peers: usize,
     pub(crate) reconnect_interval: Duration,
     pub(crate) peer_write_timeout: Duration,
+    pub(crate) peer_connect_timeout: Duration,
+    pub(crate) peer_handshake_timeout: Duration,
+    pub(crate) peer_frame_timeout: Duration,
+    pub(crate) max_frame_bytes: usize,
     pub(crate) relay_all: bool,
     pub(crate) dns_bootstrap: bool,
     pub(crate) dns_lite_peers: usize,
@@ -139,6 +150,42 @@ struct Cli {
         help_heading = "P2P"
     )]
     peer_write_timeout_ms: u64,
+
+    #[arg(
+        long = "peer-connect-timeout-ms",
+        value_name = "MS",
+        default_value_t = DEFAULT_PEER_CONNECT_TIMEOUT_MS,
+        help = "Abort an outbound TCP connect attempt after this duration",
+        help_heading = "P2P"
+    )]
+    peer_connect_timeout_ms: u64,
+
+    #[arg(
+        long = "peer-handshake-timeout-ms",
+        value_name = "MS",
+        default_value_t = DEFAULT_PEER_HANDSHAKE_TIMEOUT_MS,
+        help = "Require a valid Qubic peer exchange within this duration",
+        help_heading = "P2P"
+    )]
+    peer_handshake_timeout_ms: u64,
+
+    #[arg(
+        long = "peer-frame-timeout-ms",
+        value_name = "MS",
+        default_value_t = DEFAULT_PEER_FRAME_TIMEOUT_MS,
+        help = "Disconnect a peer that does not finish an announced frame",
+        help_heading = "P2P"
+    )]
+    peer_frame_timeout_ms: u64,
+
+    #[arg(
+        long = "max-frame-bytes",
+        value_name = "BYTES",
+        default_value_t = DEFAULT_MAX_FRAME_BYTES,
+        help = "Maximum accepted Qubic frame size (minimum 65551; maximum 16777215 bytes)",
+        help_heading = "P2P"
+    )]
+    max_frame_bytes: usize,
 
     #[arg(
         long = "relay-all",
@@ -262,6 +309,69 @@ impl Config {
         seed_peers.sort_unstable();
         seed_peers.dedup();
 
+        if seed_peers.len() > cli.max_known_peers {
+            return Err(Cli::command().error(
+                ErrorKind::ValueValidation,
+                format!(
+                    "--max-known-peers ({}) must be at least the number of unique --peer values ({})",
+                    cli.max_known_peers,
+                    seed_peers.len()
+                ),
+            ));
+        }
+        if cli.target_outbound > cli.max_known_peers {
+            return Err(Cli::command().error(
+                ErrorKind::ValueValidation,
+                format!(
+                    "--target-outbound ({}) must not exceed --max-known-peers ({})",
+                    cli.target_outbound, cli.max_known_peers
+                ),
+            ));
+        }
+        if cli.max_incoming > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(Cli::command().error(
+                ErrorKind::ValueValidation,
+                format!(
+                    "--max-incoming ({}) must not exceed {}",
+                    cli.max_incoming,
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
+            ));
+        }
+        let critical_peer_threshold = if cli.critical_peer_threshold == 0 && cli.target_outbound > 0
+        {
+            (cli.target_outbound / 2).max(1)
+        } else {
+            cli.critical_peer_threshold
+        };
+        if critical_peer_threshold > cli.target_outbound {
+            return Err(Cli::command().error(
+                ErrorKind::ValueValidation,
+                format!(
+                    "--critical-peer-threshold ({critical_peer_threshold}) must not exceed --target-outbound ({})",
+                    cli.target_outbound
+                ),
+            ));
+        }
+        if !(crate::frame::MIN_OPERATIONAL_FRAME_BYTES..=crate::frame::MAX_FRAME_SIZE)
+            .contains(&cli.max_frame_bytes)
+        {
+            return Err(Cli::command().error(
+                ErrorKind::ValueValidation,
+                format!(
+                    "--max-frame-bytes must be between {} and {}",
+                    crate::frame::MIN_OPERATIONAL_FRAME_BYTES,
+                    crate::frame::MAX_FRAME_SIZE
+                ),
+            ));
+        }
+
+        let emergency_dns_backoff_initial_ms =
+            cli.emergency_dns_backoff_initial_ms.max(MIN_DNS_TIMEOUT_MS);
+        let emergency_dns_backoff_max_ms = cli
+            .emergency_dns_backoff_max_ms
+            .max(emergency_dns_backoff_initial_ms);
+
         Ok(Config {
             listen_addr: SocketAddrV4::new(cli.listen_ip, cli.listen_port),
             api_timeout: Duration::from_millis(cli.api_timeout_ms.max(MIN_API_TIMEOUT_MS)),
@@ -274,25 +384,27 @@ impl Config {
             max_known_peers: cli.max_known_peers,
             reconnect_interval: Duration::from_millis(cli.reconnect_ms.max(MIN_RECONNECT_MS)),
             peer_write_timeout: Duration::from_millis(cli.peer_write_timeout_ms),
+            peer_connect_timeout: Duration::from_millis(
+                cli.peer_connect_timeout_ms.max(MIN_PEER_CONNECT_TIMEOUT_MS),
+            ),
+            peer_handshake_timeout: Duration::from_millis(
+                cli.peer_handshake_timeout_ms
+                    .max(MIN_PEER_HANDSHAKE_TIMEOUT_MS),
+            ),
+            peer_frame_timeout: Duration::from_millis(
+                cli.peer_frame_timeout_ms.max(MIN_PEER_FRAME_TIMEOUT_MS),
+            ),
+            max_frame_bytes: cli.max_frame_bytes,
             relay_all: cli.relay_all,
             dns_bootstrap: !cli.no_dns_bootstrap,
             dns_lite_peers: cli.dns_lite_peers,
             dns_timeout: Duration::from_millis(cli.dns_timeout_ms.max(MIN_DNS_TIMEOUT_MS)),
             traffic_log: cli.traffic_log,
             seed_peers,
-            critical_peer_threshold: if cli.critical_peer_threshold == 0 && cli.target_outbound > 0
-            {
-                (cli.target_outbound / 2).max(1)
-            } else {
-                cli.critical_peer_threshold
-            },
+            critical_peer_threshold,
             emergency_dns_bootstrap: !cli.no_emergency_dns,
-            emergency_dns_backoff_initial_ms: cli
-                .emergency_dns_backoff_initial_ms
-                .max(MIN_DNS_TIMEOUT_MS),
-            emergency_dns_backoff_max_ms: cli
-                .emergency_dns_backoff_max_ms
-                .max(cli.emergency_dns_backoff_initial_ms),
+            emergency_dns_backoff_initial_ms,
+            emergency_dns_backoff_max_ms,
         })
     }
 }
@@ -356,6 +468,10 @@ mod tests {
                 max_known_peers: 500,
                 reconnect_interval: Duration::from_millis(2_000),
                 peer_write_timeout: Duration::from_millis(5_000),
+                peer_connect_timeout: Duration::from_millis(5_000),
+                peer_handshake_timeout: Duration::from_millis(5_000),
+                peer_frame_timeout: Duration::from_millis(30_000),
+                max_frame_bytes: 1024 * 1024,
                 relay_all: false,
                 dns_bootstrap: true,
                 dns_lite_peers: 0,
@@ -395,11 +511,33 @@ mod tests {
             "2",
             "--dns-timeout-ms",
             "3",
+            "--peer-connect-timeout-ms",
+            "4",
+            "--peer-handshake-timeout-ms",
+            "5",
+            "--peer-frame-timeout-ms",
+            "6",
         ]);
 
         assert_eq!(config.api_timeout, Duration::from_millis(1_000));
         assert_eq!(config.reconnect_interval, Duration::from_millis(200));
         assert_eq!(config.dns_timeout, Duration::from_millis(500));
+        assert_eq!(config.peer_connect_timeout, Duration::from_millis(500));
+        assert_eq!(config.peer_handshake_timeout, Duration::from_millis(500));
+        assert_eq!(config.peer_frame_timeout, Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn normalizes_emergency_dns_max_after_initial() {
+        let config = parse_config(&[
+            "--emergency-dns-backoff-initial-ms",
+            "100",
+            "--emergency-dns-backoff-max-ms",
+            "1",
+        ]);
+
+        assert_eq!(config.emergency_dns_backoff_initial_ms, 500);
+        assert_eq!(config.emergency_dns_backoff_max_ms, 500);
     }
 
     #[test]
@@ -431,5 +569,79 @@ mod tests {
             err.to_string(),
             "error: Invalid peer value: bad-value. Expected ip or ip:port\n\nUsage: QubicLightNode [OPTIONS]\n\nFor more information, try '--help'.\n"
         );
+    }
+
+    #[test]
+    fn rejects_frame_limit_outside_protocol_range() {
+        for value in ["65550", "16777216"] {
+            let err = Config::from_args(["QubicLightNode", "--max-frame-bytes", value])
+                .expect_err("invalid frame limit should be rejected");
+            assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        }
+        assert_eq!(
+            parse_config(&["--max-frame-bytes", "65551"]).max_frame_bytes,
+            65_551
+        );
+    }
+
+    #[test]
+    fn validates_max_incoming_against_tokio_semaphore_capacity() {
+        let maximum = tokio::sync::Semaphore::MAX_PERMITS.to_string();
+        assert_eq!(
+            parse_config(&["--max-incoming", &maximum]).max_incoming,
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        let too_large = (tokio::sync::Semaphore::MAX_PERMITS + 1).to_string();
+        let err = Config::from_args(["QubicLightNode", "--max-incoming", &too_large])
+            .expect_err("semaphore capacity must be validated during CLI parsing");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn rejects_more_manual_peers_than_pool_capacity() {
+        let err = Config::from_args([
+            "QubicLightNode",
+            "--max-known-peers",
+            "1",
+            "--peer",
+            "1.1.1.1",
+            "--peer",
+            "2.2.2.2",
+        ])
+        .expect_err("manual peers must fit into the configured pool");
+
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("must be at least"));
+    }
+
+    #[test]
+    fn rejects_outbound_target_larger_than_known_peer_pool() {
+        let err = Config::from_args([
+            "QubicLightNode",
+            "--target-outbound",
+            "33",
+            "--max-known-peers",
+            "32",
+        ])
+        .expect_err("outbound target must fit in the known peer pool");
+
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("must not exceed"));
+    }
+
+    #[test]
+    fn rejects_unreachable_critical_peer_threshold() {
+        for args in [
+            ["--target-outbound", "2", "--critical-peer-threshold", "3"],
+            ["--target-outbound", "0", "--critical-peer-threshold", "1"],
+        ] {
+            let err = Config::from_args(std::iter::once("QubicLightNode").chain(args))
+                .expect_err("critical threshold must be reachable");
+            assert_eq!(err.kind(), ErrorKind::ValueValidation);
+            assert!(
+                err.to_string()
+                    .contains("must not exceed --target-outbound")
+            );
+        }
     }
 }

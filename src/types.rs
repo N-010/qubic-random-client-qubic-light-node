@@ -1,10 +1,10 @@
 use crate::config::Config;
 use crate::pending::PendingRequests;
 use crate::state::{DedupWindow, NodeState};
+use crate::verified::TrustedNetworkState;
 use serde::Serialize;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct TickStatus {
@@ -35,23 +35,13 @@ pub(crate) fn format_epoch_tick_packed(packed: u64) -> String {
     }
 }
 
-pub(crate) fn tick_status_from_packed(packed: u64) -> Option<TickStatus> {
-    unpack_epoch_tick(packed).map(|(epoch, tick)| TickStatus {
-        epoch,
-        tick,
-        initial_tick: 0,
-        tick_duration_ms: 0,
-        aligned_votes: 0,
-        misaligned_votes: 0,
-    })
-}
-
 #[derive(Clone)]
 pub(crate) struct ApiState {
     pub(crate) node_state: Arc<Mutex<NodeState>>,
     pub(crate) dedup: Arc<DedupWindow>,
-    pub(crate) latest_epoch_tick: Arc<AtomicU64>,
     pub(crate) pending_requests: Arc<PendingRequests>,
+    pub(crate) trusted_network: Arc<TrustedNetworkState>,
+    pub(crate) outbound_budget: Arc<Semaphore>,
     pub(crate) config: Arc<Config>,
 }
 

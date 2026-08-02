@@ -1,14 +1,15 @@
 use crate::config::Config;
 use crate::dns::fetch_seed_peers_from_dns;
 use crate::grpc_api::run_grpc_server;
-use crate::network::{accept_loop, dial_loop};
+use crate::network::{NetworkResources, accept_loop, dial_loop};
 use crate::pending::PendingRequests;
 use crate::state::{DedupWindow, NodeState};
 use crate::types::ApiState;
+use crate::verified::TrustedNetworkState;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 pub(crate) async fn run() -> std::io::Result<()> {
     let mut config = match Config::from_env() {
@@ -52,11 +53,16 @@ pub(crate) async fn run() -> std::io::Result<()> {
     let pending_requests = Arc::new(PendingRequests::default());
     {
         let mut locked = state.lock().await;
+        locked.set_reconnect_interval(config.reconnect_interval);
         for peer in &config.seed_peers {
-            let _ = locked.add_discovered_peer(*peer);
+            if !configured_seed_peers.contains(peer) {
+                let _ = locked.add_dns_peer(*peer);
+            }
         }
     }
     let latest_epoch_tick = Arc::new(AtomicU64::new(0));
+    let trusted_network = Arc::new(TrustedNetworkState::default());
+    let outbound_budget = Arc::new(Semaphore::new(crate::network::GLOBAL_OUTBOUND_QUEUE_BYTES));
     let listener = TcpListener::bind(config.listen_addr).await?;
 
     println!(
@@ -80,53 +86,46 @@ pub(crate) async fn run() -> std::io::Result<()> {
 
     let shared_config = Arc::new(config);
 
-    if shared_config.grpc_enabled {
+    let grpc_state = if shared_config.grpc_enabled {
         let grpc_state = ApiState {
             node_state: Arc::clone(&state),
             dedup: Arc::clone(&dedup),
-            latest_epoch_tick: Arc::clone(&latest_epoch_tick),
             pending_requests: Arc::clone(&pending_requests),
+            trusted_network: Arc::clone(&trusted_network),
+            outbound_budget: Arc::clone(&outbound_budget),
             config: Arc::clone(&shared_config),
         };
-        tokio::spawn(async move {
-            if let Err(err) = run_grpc_server(grpc_state).await {
-                eprintln!("gRPC server stopped: {err}");
-            }
-        });
+        Some(grpc_state)
+    } else {
+        None
+    };
+
+    let network_resources = NetworkResources::new(
+        Arc::clone(&state),
+        Arc::clone(&dedup),
+        Arc::clone(&pending_requests),
+        Arc::clone(&latest_epoch_tick),
+        Arc::clone(&trusted_network),
+        Arc::clone(&outbound_budget),
+        Arc::clone(&shared_config),
+    );
+    let accept_resources = network_resources.clone();
+    tokio::spawn(async move {
+        accept_loop(listener, accept_resources).await;
+    });
+
+    tokio::spawn(async move {
+        dial_loop(network_resources).await;
+    });
+
+    if let Some(grpc_state) = grpc_state {
+        tokio::select! {
+            result = run_grpc_server(grpc_state) => return result,
+            result = tokio::signal::ctrl_c() => result?,
+        }
+    } else {
+        tokio::signal::ctrl_c().await?;
     }
-
-    let accept_state = Arc::clone(&state);
-    let accept_dedup = Arc::clone(&dedup);
-    let accept_pending = Arc::clone(&pending_requests);
-    let accept_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
-    let accept_config = Arc::clone(&shared_config);
-    tokio::spawn(async move {
-        accept_loop(
-            listener,
-            accept_state,
-            accept_dedup,
-            accept_pending,
-            accept_latest_epoch_tick,
-            accept_config,
-        )
-        .await;
-    });
-
-    let dial_state = Arc::clone(&state);
-    let dial_latest_epoch_tick = Arc::clone(&latest_epoch_tick);
-    let dial_config = Arc::clone(&shared_config);
-    tokio::spawn(async move {
-        dial_loop(
-            dial_state,
-            dedup,
-            pending_requests,
-            dial_latest_epoch_tick,
-            dial_config,
-        )
-        .await;
-    });
-
-    tokio::signal::ctrl_c().await?;
     println!("Shutdown signal received, stopping.");
     Ok(())
 }

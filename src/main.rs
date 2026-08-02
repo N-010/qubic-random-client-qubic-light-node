@@ -22,6 +22,7 @@ mod peer_api;
 mod pending;
 mod state;
 mod types;
+mod verified;
 
 pub(crate) mod lightnodepb {
     tonic::include_proto!("lightnode");

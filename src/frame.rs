@@ -1,4 +1,5 @@
 use crate::codec::{read_i64, read_u16, read_u32};
+#[cfg(test)]
 use crate::types::TickStatus;
 use rand::Rng;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -10,8 +11,11 @@ pub(crate) const NUMBER_OF_EXCHANGED_PEERS: usize = 4;
 pub(crate) const EXCHANGE_PUBLIC_PEERS_FRAME_SIZE: usize =
     HEADER_SIZE + NUMBER_OF_EXCHANGED_PEERS * 4;
 
+pub(crate) const BROADCAST_COMPUTORS_TYPE: u8 = 2;
 pub(crate) const BROADCAST_TICK_TYPE: u8 = 3;
+pub(crate) const REQUEST_COMPUTORS_TYPE: u8 = 11;
 pub(crate) const BROADCAST_TRANSACTION_TYPE: u8 = 24;
+#[cfg(test)]
 pub(crate) const RESPOND_CURRENT_TICK_INFO_TYPE: u8 = 28;
 pub(crate) const REQUEST_TICK_TRANSACTIONS_TYPE: u8 = 29;
 pub(crate) const REQUEST_ENTITY_TYPE: u8 = 31;
@@ -28,18 +32,26 @@ pub(crate) const NUMBER_OF_TRANSACTIONS_PER_TICK: usize = 4096;
 pub(crate) const NUMBER_OF_COMPUTORS: usize = 676;
 pub(crate) const MAX_NUMBER_OF_CONTRACTS: u32 = 1024;
 pub(crate) const MAX_INPUT_SIZE: usize = 1024;
-pub(crate) const MAX_CONTRACT_FUNCTION_INPUT_SIZE: usize = MAX_INPUT_SIZE;
+pub(crate) const MAX_CONTRACT_FUNCTION_INPUT_SIZE: usize = u16::MAX as usize;
 pub(crate) const MAX_CONTRACT_FUNCTION_OUTPUT_SIZE: usize = u16::MAX as usize;
 pub(crate) const MAX_AMOUNT: i64 = 1_000_000_000_000_000;
 pub(crate) const TRANSACTION_BASE_SIZE: usize = 80;
 pub(crate) const SIGNATURE_SIZE: usize = 64;
+pub(crate) const MAX_TRANSACTION_FRAME_BYTES: usize =
+    HEADER_SIZE + TRANSACTION_BASE_SIZE + MAX_INPUT_SIZE + SIGNATURE_SIZE;
 pub(crate) const SPECTRUM_DEPTH: usize = 24;
 pub(crate) const SPECTRUM_CAPACITY: i32 = 1 << SPECTRUM_DEPTH;
 pub(crate) const RESPOND_ENTITY_PAYLOAD_SIZE: usize = 64 + 8 + 32 * SPECTRUM_DEPTH;
-pub(crate) const BROADCAST_TICK_PAYLOAD_SIZE: usize = 344;
+pub(crate) const BROADCAST_TICK_PAYLOAD_SIZE: usize = 352;
+pub(crate) const COMPUTORS_PUBLIC_KEYS_SIZE: usize = NUMBER_OF_COMPUTORS * 32;
+pub(crate) const BROADCAST_COMPUTORS_PAYLOAD_SIZE: usize =
+    2 + COMPUTORS_PUBLIC_KEYS_SIZE + SIGNATURE_SIZE;
+pub(crate) const MIN_OPERATIONAL_FRAME_BYTES: usize =
+    HEADER_SIZE + 8 + MAX_CONTRACT_FUNCTION_INPUT_SIZE;
 pub(crate) const REQUEST_TICK_TRANSACTION_FLAGS_SIZE: usize = NUMBER_OF_TRANSACTIONS_PER_TICK / 8;
 pub(crate) const REQUEST_TICK_TRANSACTIONS_PAYLOAD_SIZE: usize =
     4 + REQUEST_TICK_TRANSACTION_FLAGS_SIZE;
+#[cfg(test)]
 pub(crate) const RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE: usize = 16;
 
 pub(crate) fn frame_meta(frame: &[u8]) -> (usize, u8, u32) {
@@ -223,6 +235,7 @@ pub(crate) fn frame_payload(frame: &[u8]) -> Result<&[u8], String> {
     Ok(&frame[HEADER_SIZE..])
 }
 
+#[cfg(test)]
 pub(crate) fn parse_tick_status_from_frame(frame: &[u8]) -> Option<TickStatus> {
     if frame.len() < HEADER_SIZE {
         return None;
@@ -263,9 +276,18 @@ pub(crate) fn is_bogon(ip: &Ipv4Addr) -> bool {
     let octets = ip.octets();
     octets[0] == 0
         || octets[0] == 10
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
         || octets[0] == 127
+        || (octets[0] == 169 && octets[1] == 254)
         || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+        || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
         || (octets[0] == 192 && octets[1] == 168)
+        || (octets[0] == 198 && (18..=19).contains(&octets[1]))
+        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+        || octets[0] >= 224
         || octets[0] == 255
 }
 
@@ -279,6 +301,7 @@ pub(crate) fn random_non_zero_u32() -> u32 {
     }
 }
 
+#[cfg(test)]
 fn parse_current_tick_info_payload(payload: &[u8]) -> Result<TickStatus, String> {
     if payload.len() != RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE {
         return Err(format!(
@@ -409,6 +432,19 @@ mod tests {
     }
 
     #[test]
+    fn maximum_contract_request_fits_minimum_operational_frame_limit() {
+        let frame = build_request_contract_function_frame(
+            1,
+            1,
+            0,
+            &vec![0; MAX_CONTRACT_FUNCTION_INPUT_SIZE],
+        )
+        .unwrap();
+
+        assert_eq!(frame.len(), MIN_OPERATIONAL_FRAME_BYTES);
+    }
+
+    #[test]
     fn rejects_invalid_contract_function_requests() {
         assert_eq!(
             build_request_contract_function_frame(1, 0, 2, &[]).unwrap_err(),
@@ -426,7 +462,7 @@ mod tests {
                 &vec![0; MAX_CONTRACT_FUNCTION_INPUT_SIZE + 1],
             )
             .unwrap_err(),
-            "Contract function input is too large: maximum 1024, got 1025"
+            "Contract function input is too large: maximum 65535, got 65536"
         );
     }
 

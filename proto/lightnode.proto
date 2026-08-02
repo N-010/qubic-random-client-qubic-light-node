@@ -5,7 +5,7 @@ package lightnode;
 service LightNode {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
-  rpc GetTickTransactions(GetTickTransactionsRequest) returns (GetTickTransactionsResponse);
+  rpc StreamTickTransactions(GetTickTransactionsRequest) returns (stream Transaction);
   rpc QueryContractFunction(QueryContractFunctionRequest) returns (QueryContractFunctionResponse);
   rpc BroadcastTransaction(BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
 }
@@ -15,7 +15,7 @@ message GetStatusRequest {}
 message TickStatus {
   uint32 epoch = 1;
   uint32 tick = 2;
-  // These fields are zero when status comes only from a BROADCAST_TICK cache entry.
+  // The quorum vote format does not provide initial_tick or tick_duration_ms.
   uint32 initial_tick = 3;
   uint32 tick_duration_ms = 4;
   uint32 aligned_votes = 5;
@@ -67,13 +67,6 @@ message Transaction {
   uint32 input_size = 6;
   string input_hex = 7;
   string signature_hex = 8;
-}
-
-message GetTickTransactionsResponse {
-  bool ok = 1;
-  uint32 tick = 2;
-  repeated Transaction transactions = 3;
-  string error = 4;
 }
 
 message QueryContractFunctionRequest {

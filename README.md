@@ -8,7 +8,7 @@ It currently does four things:
 
 - connects to the public Qubic network over TCP
 - relays Qubic frames between peers
-- keeps the latest known tick in local memory
+- keeps the latest tick confirmed by a signed computor quorum in local memory
 - exposes a local `gRPC` API for status, balance, tick transactions, contract function queries, and transaction broadcast
 
 There is no web UI and no HTTP REST API in the current codebase.
@@ -79,22 +79,27 @@ After launch, the node:
 2. binds the local TCP listener for incoming Qubic peers
 3. starts the outbound reconnect loop and tries to maintain the configured number of outbound peer sessions
 4. starts the local gRPC API unless you used `--no-grpc`
-5. updates the in-memory latest tick cache from network traffic
+5. requests the signed computor list and updates the in-memory tick cache only after a valid computor quorum
 
 Important notes:
 
-- right after start, `GetStatus` can return no local tick data yet; this is normal until the node receives network frames
+- right after start, `GetStatus` can return no local tick data yet; this is normal until the node receives and verifies a signed computor list and 451 matching tick votes
 - the process can still start even if DNS bootstrap fails; in that case you can wait for incoming peers or pass `--peer` manually
 - by default, relay is limited to frames with `dejavu == 0`; use `--relay-all` to also relay frames with non-zero `dejavu`
 - peer exchange frames are consumed locally and are never relayed; Oracle Machine and Outsourced Computation channel-only message types (`190`-`192`) are also never forwarded to ordinary Qubic peers
-- known broadcast transaction and tick layouts are checked against the current Core constants before they update local state or enter relay fanout; this is structural validation, not FourQ signature verification
+- computor lists are authenticated with the Qubic arbitrator identity and FourQ and must use the exact canonical payload size without unsigned padding; tick votes are checked for the exact 352-byte Core layout, Gregorian UTC calendar bounds, a timestamp no older than two minutes and no more than 30 seconds in the future, score threshold, computor signature, and a quorum of 451 distinct computors
+- signed-frame verification uses a small non-queueing global CPU gate; when it is saturated the frame remains retryable, while exact valid and invalid cryptographic replays reuse a bounded domain-separated result cache
+- each registered session runs at most one computor bootstrap attempt at a time; an exact empty eight-byte `END_RESPONSE` means that the list is temporarily unavailable and is retried with exponential delay up to 30 seconds
+- broadcast transactions are structurally checked against current Core limits before relay fanout; balance Merkle proofs and transaction membership in signed tick data are not verified
 - each relayed frame is queued to at most six randomly selected peers, matching the Qubic Core dissemination multiplier
 - TCP input is accumulated in reusable buffers and complete frames are split into immutable, reference-counted byte views; relay fanout shares the same frame storage across all selected peer queues without copying the payload per peer
 - peer/session state and the rolling deduplication window use separate lock domains, while the latest epoch/tick is kept in an atomic cache for lock-free status reads
-- a peer is disconnected when its bounded outbound queue is full, allowing the reconnect loop to replace a slow session
+- a peer is disconnected when its own bounded outbound queue or byte budget is full, allowing the reconnect loop to replace a slow session; exhaustion of the shared global outbound byte budget is treated as local overload and does not disconnect healthy peers
+- incoming sessions, incomplete handshakes, frame assembly, pending API responses, and gRPC streams all have explicit count, byte, and/or time limits
 - every peer write has a deadline controlled by `--peer-write-timeout-ms`; a peer that stops reading is disconnected and replaced instead of retaining a stalled writer
 - console logs use a bounded non-blocking queue and a dedicated writer thread, so a slow Docker log consumer cannot block the Tokio runtime; log messages are dropped if that queue is full
-- failed dial attempts put that address into an exponential cooldown, starting at `--reconnect-ms` and capped at five minutes; a successful connection clears its failure history
+- failed dial attempts, peer-specific queue failures, and protocol violations put the canonical dial address into an exponential cooldown, starting at `--reconnect-ms` and capped at five minutes; administrative shutdown and local global-memory/frame policy limits do not penalize peers
+- completing a handshake does not erase failure history: sessions shorter than 60 seconds continue the previous cooldown exponent, while a session lasting at least 60 seconds resets old history before the next failure
 - configured `--peer` addresses are retained even when the discovered-peer cache is full; active and pending connection addresses are protected from eviction as well
 - emergency DNS recovery is based only on the outbound connection count, so incoming connections cannot hide a depleted outbound pool
 - peer-pool changes are logged as `known`, `dialable`, `cooldown`, `pending`, `incoming`, `outgoing`, and `target` counts
@@ -112,15 +117,23 @@ Important notes:
 - `--listen-ip <ipv4>`
   IPv4 address for the peer listener. Default: `0.0.0.0`.
 - `--target-outbound <n>`
-  Desired number of outbound peer connections to keep. Default: `8`.
+  Desired number of outbound peer connections to keep. Default: `8`. It must not exceed `--max-known-peers`.
 - `--max-incoming <n>`
-  Maximum number of incoming peer sessions. Default: `32`.
+  Maximum number of incoming peer sessions. Default: `32`; values above Tokio's semaphore capacity are rejected during startup.
 - `--max-known-peers <n>`
   Maximum number of discovered peers kept in memory. Default: `500`. Evictable addresses use LRU order; configured seeds, active peers, and pending dials are never evicted, so protected entries can temporarily keep the pool above the limit.
 - `--reconnect-ms <ms>`
   Delay between outbound reconnect attempts. Default: `2000`. Values below `200` are currently clamped to `200` internally.
 - `--peer-write-timeout-ms <ms>`
   Maximum time allowed for one TCP frame write before the peer is disconnected. Default: `5000`.
+- `--peer-connect-timeout-ms <ms>`
+  Maximum duration of an outbound TCP connect attempt. Default: `5000`; values below `500` are clamped to `500`.
+- `--peer-handshake-timeout-ms <ms>`
+  Time allowed for the first exact 24-byte `EXCHANGE_PUBLIC_PEERS` frame before registration as a session. Default: `5000`; values below `500` are clamped to `500`.
+- `--peer-frame-timeout-ms <ms>`
+  Time allowed to finish an announced frame after its header arrives. Default: `30000`; values below `1000` are clamped to `1000`.
+- `--max-frame-bytes <bytes>`
+  Maximum accepted frame size, including its eight-byte header. Default: `1048576`; valid range: `65551..16777215`. The minimum guarantees that a contract request or response carrying the full 65535-byte Core payload fits. A larger wire-valid frame is closed as a local policy limit without peer cooldown.
 
 ### Relay
 
@@ -142,7 +155,9 @@ Important notes:
 
 Auto mode for `--dns-lite-peers` currently requests `max(target_outbound * 3, 8)`.
 
-Emergency DNS bootstrap runs when outbound connections fall below `--critical-peer-threshold`. The automatic threshold is half of `--target-outbound`, with a minimum of `1` whenever the target is positive. Empty responses and responses containing only already-known addresses count as failures and increase the DNS retry backoff. A successful refresh resets the backoff, while still enforcing the configured initial interval before another DNS request.
+Emergency DNS bootstrap runs when outbound connections fall below `--critical-peer-threshold`. The automatic threshold is half of `--target-outbound`, with a minimum of `1` whenever the target is positive. Empty responses and responses containing only already-known addresses count as failures and increase the DNS retry backoff. A newly discovered address or retained promotion of a gossip address to DNS provenance resets the backoff. DNS provenance is exempt from the per-gossip-source quota, but an inactive DNS peer remains subject to the overall `--max-known-peers` LRU limit. Only manual, active, and pending endpoints are protected from overall eviction.
+
+An explicit `--critical-peer-threshold` must not exceed `--target-outbound`; when the outbound target is zero, the threshold must also be zero. Emergency DNS backoff starts after the DNS request completes, so request latency never consumes the configured retry delay.
 
 ### API
 
@@ -151,7 +166,7 @@ Emergency DNS bootstrap runs when outbound connections fall below `--critical-pe
 - `--no-grpc`
   Disable the gRPC server.
 - `--api-timeout-ms <ms>`
-  End-to-end deadline for a balance or tick-transactions query over existing peer sessions. Default: `6000`. Values below `1000` are currently clamped to `1000` internally.
+  End-to-end deadline for a balance or tick-transactions query over existing peer sessions, including delivery to a slow gRPC client. Default: `6000`. Values below `1000` are currently clamped to `1000` internally.
 
 To see the parser-generated help text:
 
@@ -166,11 +181,11 @@ Service name: `lightnode.LightNode`
 Methods:
 
 - `GetStatus`
-  Returns the latest epoch and tick observed in the node's local broadcast cache. The response warning states that peer broadcasts are unverified and that fields unavailable from `BROADCAST_TICK` are returned as zero.
+  Returns the latest tick confirmed by at least 451 valid signatures from distinct members of an arbitrator-signed computor list.
 - `GetBalance`
   Queries peers for wallet balance data and returns the first structurally valid response whose public key matches the request.
-- `GetTickTransactions`
-  Queries peers for transactions from the requested tick and returns the first structurally valid response. Transactions must satisfy the Core wire-size, tick, amount, input-size, and per-tick count limits.
+- `StreamTickTransactions`
+  Selects one random healthy peer, matching Qubic Core request semantics, and streams that peer's transactions in wire order. Only `END_RESPONSE` completes the RPC successfully, including an empty response. If the peer disconnects or sends malformed data after partial output, the stream ends with an error and the client must start a new RPC to select another peer. Transactions must satisfy the Core wire-size, tick, amount, input-size, and per-tick count limits.
 - `QueryContractFunction`
   Calls a read-only smart-contract function and returns its raw output bytes. An empty Core response is treated as invocation failure, while `TRY_AGAIN` lets another queried peer win the race.
 - `BroadcastTransaction`
@@ -180,11 +195,23 @@ Protocol file: `proto/lightnode.proto`
 
 The gRPC server also enables reflection, so tools like `grpcurl` can inspect the service without a separate generated client.
 
-At most 64 peer-backed gRPC calls run at once. Each call sends its request over at most three existing persistent peer sessions and returns the first successful response. No temporary query connections are opened. Additional `GetBalance`, `GetTickTransactions`, or `QueryContractFunction` calls are rejected immediately with `ok=false` and an overload message; `GetStatus` and `BroadcastTransaction` remain available.
+At most 64 small peer-backed gRPC calls, 8 tick transaction streams, and 32 transaction broadcasts run at once. Balance and contract queries race at most three existing persistent peer sessions; a tick transaction stream uses exactly one. No temporary query connections are opened. The API also applies global and per-client token buckets to broadcasts and coalesces concurrent submissions of the same transaction into one network fanout. Sequential duplicate broadcasts are idempotent while their digest remains in the deduplication window.
 
-`QueryContractFunction` accepts a contract index, a function input type, and up to 1024 raw input bytes. Contract-specific encoding and output decoding remain the caller's responsibility.
+### Migration from 0.1.x
 
-Peer-backed responses are not cryptographically trustless in this release. The node does not yet verify FourQ signatures, the `RespondEntity` Merkle proof, or transaction membership in signed `TickData`; it races up to three peers and accepts the first response that passes strict structural and request-binding validation.
+Version `0.2.0` intentionally removes the unary `GetTickTransactions` RPC. Regenerate clients from `proto/lightnode.proto` and call the server-streaming `StreamTickTransactions` method instead. For example:
+
+```bash
+grpcurl -plaintext -d '{"tick":123456}' 127.0.0.1:50051 lightnode.LightNode/StreamTickTransactions
+```
+
+The stream can yield transactions before its final status is known. `END_RESPONSE` is the only successful completion marker; after a partial-result error, discard or retain those partial results according to your application policy and issue a new RPC if you want to retry with another peer.
+
+Tick-stream terminal failures are delivered after any already-buffered partial transactions. Deadlines use `DEADLINE_EXCEEDED`, missing or disconnected peers use `UNAVAILABLE`, local outbound pressure uses `RESOURCE_EXHAUSTED`, malformed peer responses use `DATA_LOSS`, and internal task failures use `INTERNAL`.
+
+`QueryContractFunction` accepts a contract index, a function input type, and up to 65535 raw input bytes, matching the Core `u16` input-size field. Contract-specific encoding and output decoding remain the caller's responsibility.
+
+Tick status is based on FourQ-verified quorum votes. Other peer-backed responses do not yet provide cryptographic trust: the node does not verify the `RespondEntity` Merkle proof or transaction membership in signed `TickData`. Balance and contract queries race up to three peers and accept the first response that passes strict structural and request-binding validation.
 
 `BroadcastTransaction.ok=true` means that the transaction passed the locally available subset of Core's `Transaction::checkValidity()` and was queued to at least one connected peer. It does not mean that a Core node accepted the signature or that the network confirmed the transaction.
 
@@ -225,7 +252,9 @@ Peer-backed responses are not cryptographically trustless in this release. The n
 - Peer connections use TCP.
 - The peer listener is IPv4-based.
 - The node exchanges peer lists through the Qubic handshake and keeps a bounded in-memory peer cache.
+- A peer is registered only after completing the Qubic peer-exchange handshake. Gossip discoveries are tagged with their source and capped per source; DNS peers retain provenance but, unlike configured manual peers, are still evictable from the overall LRU pool while inactive.
 - Duplicate frames are filtered in memory with a rolling deduplication window.
-- Locally submitted transactions enter the deduplication window only after at least one peer accepts the frame, so a failed submission can be retried.
+- Deduplication reservations are committed only after at least one peer accepts a frame, so failed relay and local submissions can be retried.
 - Relay and locally submitted transactions share the same FIFO peer queues; neither traffic class has priority.
-- Peer-backed API requests race several peers in parallel and return the first successful answer.
+- Pending response routing is bounded by per-frame size and by protocol-specific total frame/byte limits. A valid tick response can contain 4096 maximum-size transaction frames plus `END_RESPONSE`; exceeding that limit is a peer protocol violation, while a closed or locally saturated receiver does not disconnect the peer.
+- Small peer-backed API requests race several peers in parallel and return the first successful answer; tick transactions use one peer and bounded end-to-end streaming.

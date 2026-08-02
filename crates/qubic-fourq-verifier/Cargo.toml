@@ -1,0 +1,9 @@
+[package]
+name = "qubic-fourq-verifier"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+tiny-keccak = { version = "2.0.2", features = ["k12"] }
