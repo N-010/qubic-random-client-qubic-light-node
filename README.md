@@ -57,8 +57,10 @@ Service: `lightnode.LightNode`
   FourQ signatures from an arbitrator-signed computor list.
 - `GetBalance` validates the exact Core `RespondEntity` layout, request public
   key, arithmetic, spectrum index, and 24-level K12 Merkle path against a
-  verified spectrum root. An absent entity (`spectrumIndex == -1`), an unknown
-  root, or a proof mismatch fails closed.
+  verified spectrum root for the reported tick or its immediate successor.
+  The two-tick window mirrors Core's concurrent entity-response and tick-state
+  transition. An absent entity (`spectrumIndex == -1`), an incomplete root
+  window, or a proof mismatch fails closed.
 - `QueryContractFunction` races up to three existing public-peer sessions and
   returns the first valid non-empty Core response. This response is not
   cryptographically authenticated. The accepted risk and revisit criteria are

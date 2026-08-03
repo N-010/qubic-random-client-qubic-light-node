@@ -9,7 +9,7 @@ use crate::frame::{
 use crate::pending::{DeliveryOutcome, PendingEvent, PendingRequests, PendingSpec, ResponseRule};
 use crate::state::{
     DedupReservationError, DedupWindow, DisconnectReason, NodeState, OutboundAdmissionError,
-    OutboundFrame, PeerPoolStats, RelayTarget,
+    OutboundFrame, PeerPoolStats, ProtocolViolationReason, RelayTarget,
 };
 use crate::types::{format_epoch_tick_packed, pack_epoch_tick};
 use crate::verified::{
@@ -849,12 +849,12 @@ async fn read_peer_frames(
                         );
                     }
 
-                    if process_incoming_frame(peer_id, frame, resources.clone()).await
-                        == FrameProcessingOutcome::ConnectionFatal
+                    if let FrameProcessingOutcome::ConnectionFatal(reason) =
+                        process_incoming_frame(peer_id, frame, resources.clone()).await
                     {
-                        return Err(PeerReadError::Protocol(
-                            "peer protocol violation".to_string(),
-                        ));
+                        return Err(PeerReadError::Protocol(format!(
+                            "peer protocol violation: {reason}"
+                        )));
                     }
                 }
 
@@ -925,7 +925,7 @@ fn extract_frame(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FrameProcessingOutcome {
     Continue,
-    ConnectionFatal,
+    ConnectionFatal(ProtocolViolationReason),
 }
 
 fn computor_verification_digest(payload: &[u8]) -> [u8; 32] {
@@ -952,13 +952,13 @@ fn commit_dedup(dedup: &Arc<DedupWindow>, digest: [u8; 32]) {
 async fn protocol_violation(
     source_peer_id: u64,
     resources: &NetworkResources,
+    reason: ProtocolViolationReason,
 ) -> FrameProcessingOutcome {
-    let _ = resources
-        .state
-        .lock()
-        .await
-        .disconnect_session_with_reason(source_peer_id, DisconnectReason::ProtocolViolation);
-    FrameProcessingOutcome::ConnectionFatal
+    let _ = resources.state.lock().await.disconnect_session_with_reason(
+        source_peer_id,
+        DisconnectReason::ProtocolViolation(reason),
+    );
+    FrameProcessingOutcome::ConnectionFatal(reason)
 }
 
 async fn process_incoming_frame(
@@ -967,7 +967,12 @@ async fn process_incoming_frame(
     resources: NetworkResources,
 ) -> FrameProcessingOutcome {
     if frame.len() < HEADER_SIZE {
-        return protocol_violation(source_peer_id, &resources).await;
+        return protocol_violation(
+            source_peer_id,
+            &resources,
+            ProtocolViolationReason::FrameTooShort,
+        )
+        .await;
     }
 
     let message_type = frame[3];
@@ -986,7 +991,12 @@ async fn process_incoming_frame(
                 return FrameProcessingOutcome::Continue;
             }
             DeliveryOutcome::ProtocolViolation => {
-                return protocol_violation(source_peer_id, &resources).await;
+                return protocol_violation(
+                    source_peer_id,
+                    &resources,
+                    ProtocolViolationReason::InvalidPendingResponse,
+                )
+                .await;
             }
             DeliveryOutcome::NotPending => {}
         }
@@ -994,12 +1004,22 @@ async fn process_incoming_frame(
 
     if message_type == BROADCAST_COMPUTORS_TYPE {
         let Ok(payload) = frame_payload(&frame) else {
-            return protocol_violation(source_peer_id, &resources).await;
+            return protocol_violation(
+                source_peer_id,
+                &resources,
+                ProtocolViolationReason::MalformedComputors,
+            )
+            .await;
         };
         let computors = match resources.trusted_network.parse_computors(payload) {
             Ok(computors) => computors,
             Err(ComputorVerification::Malformed) => {
-                return protocol_violation(source_peer_id, &resources).await;
+                return protocol_violation(
+                    source_peer_id,
+                    &resources,
+                    ProtocolViolationReason::MalformedComputors,
+                )
+                .await;
             }
             Err(
                 ComputorVerification::BadSignature
@@ -1011,7 +1031,12 @@ async fn process_incoming_frame(
         };
         let digest = computor_verification_digest(payload);
         if resources.signed_invalid.contains(&digest) {
-            return protocol_violation(source_peer_id, &resources).await;
+            return protocol_violation(
+                source_peer_id,
+                &resources,
+                ProtocolViolationReason::InvalidComputorSignature,
+            )
+            .await;
         }
         let outcome = match resources.signed_replay.reserve(digest) {
             Err(DedupReservationError::AlreadyCommitted) => {
@@ -1049,22 +1074,49 @@ async fn process_incoming_frame(
             outcome,
             ComputorVerification::Malformed | ComputorVerification::BadSignature
         ) {
-            return protocol_violation(source_peer_id, &resources).await;
+            let reason = match outcome {
+                ComputorVerification::Malformed => ProtocolViolationReason::MalformedComputors,
+                ComputorVerification::BadSignature => {
+                    ProtocolViolationReason::InvalidComputorSignature
+                }
+                ComputorVerification::AuthenticatedStale
+                | ComputorVerification::AuthenticatedConflict
+                | ComputorVerification::Duplicate
+                | ComputorVerification::Accepted => {
+                    unreachable!("only malformed and bad-signature outcomes enter this branch")
+                }
+            };
+            return protocol_violation(source_peer_id, &resources, reason).await;
         }
     }
 
     if message_type == BROADCAST_TICK_TYPE {
         let Ok(payload) = frame_payload(&frame) else {
-            return protocol_violation(source_peer_id, &resources).await;
+            return protocol_violation(
+                source_peer_id,
+                &resources,
+                ProtocolViolationReason::MalformedTick,
+            )
+            .await;
         };
         if payload.len() != BROADCAST_TICK_PAYLOAD_SIZE {
-            return protocol_violation(source_peer_id, &resources).await;
+            return protocol_violation(
+                source_peer_id,
+                &resources,
+                ProtocolViolationReason::MalformedTick,
+            )
+            .await;
         }
         let received_at = unix_time_millis();
         let context = match resources.trusted_network.tick_context(payload, received_at) {
             Ok(context) => context,
             Err(TickVerification::Malformed) => {
-                return protocol_violation(source_peer_id, &resources).await;
+                return protocol_violation(
+                    source_peer_id,
+                    &resources,
+                    ProtocolViolationReason::MalformedTick,
+                )
+                .await;
             }
             Err(TickVerification::Deferred | TickVerification::AuthenticatedStale) => {
                 return FrameProcessingOutcome::Continue;
@@ -1079,7 +1131,12 @@ async fn process_incoming_frame(
         };
         let digest = tick_verification_digest(payload, context.generation());
         if resources.signed_invalid.contains(&digest) {
-            return protocol_violation(source_peer_id, &resources).await;
+            return protocol_violation(
+                source_peer_id,
+                &resources,
+                ProtocolViolationReason::InvalidTickSignature,
+            )
+            .await;
         }
         let verification = match resources.signed_replay.reserve(digest) {
             Err(DedupReservationError::AlreadyCommitted) => {
@@ -1114,10 +1171,29 @@ async fn process_incoming_frame(
             }
         };
         match verification {
-            TickVerification::Malformed
-            | TickVerification::BadSignature
-            | TickVerification::Equivocation => {
-                return protocol_violation(source_peer_id, &resources).await;
+            TickVerification::Malformed => {
+                return protocol_violation(
+                    source_peer_id,
+                    &resources,
+                    ProtocolViolationReason::MalformedTick,
+                )
+                .await;
+            }
+            TickVerification::BadSignature => {
+                return protocol_violation(
+                    source_peer_id,
+                    &resources,
+                    ProtocolViolationReason::InvalidTickSignature,
+                )
+                .await;
+            }
+            TickVerification::Equivocation => {
+                return protocol_violation(
+                    source_peer_id,
+                    &resources,
+                    ProtocolViolationReason::TickEquivocation,
+                )
+                .await;
             }
             TickVerification::Quorum(status) => {
                 update_latest_epoch_tick(&resources.latest_epoch_tick, status.epoch, status.tick);
@@ -1582,7 +1658,15 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(matches!(error, PeerReadError::Protocol(_)));
+        match error {
+            PeerReadError::Protocol(message) => assert_eq!(
+                message,
+                "peer protocol violation: response violates the pending request contract"
+            ),
+            PeerReadError::Io(_) | PeerReadError::LocalPolicy(_) => {
+                panic!("malformed response must be reported as a protocol violation")
+            }
+        }
         assert!(target_rx.try_recv().is_err());
     }
 
@@ -2055,10 +2139,10 @@ mod tests {
                 ),
             },
         ));
-        state
-            .lock()
-            .await
-            .disconnect_session_with_reason(peer_id, DisconnectReason::ProtocolViolation);
+        state.lock().await.disconnect_session_with_reason(
+            peer_id,
+            DisconnectReason::ProtocolViolation(ProtocolViolationReason::MalformedTick),
+        );
         tokio::time::timeout(Duration::from_secs(1), worker)
             .await
             .expect("worker should observe the disconnect")

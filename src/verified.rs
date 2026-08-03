@@ -40,6 +40,13 @@ pub(crate) enum TickVerification {
     Quorum(TickStatus),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpectrumProofVerification {
+    Verified { root_tick: u32 },
+    Unavailable,
+    Mismatch,
+}
+
 #[derive(Debug)]
 struct VoteCandidate {
     signers: HashSet<u16>,
@@ -105,13 +112,33 @@ impl TrustedNetworkState {
             .is_some()
     }
 
-    pub(crate) fn spectrum_root(&self, tick: u32) -> Option<[u8; 32]> {
-        self.inner
+    pub(crate) fn verify_entity_spectrum_root(
+        &self,
+        entity_tick: u32,
+        proof_root: [u8; 32],
+    ) -> SpectrumProofVerification {
+        let inner = self
+            .inner
             .lock()
-            .expect("trusted network mutex should not be poisoned")
-            .spectrum_roots
-            .get(&tick)
-            .copied()
+            .expect("trusted network mutex should not be poisoned");
+        let candidate_ticks = [Some(entity_tick), entity_tick.checked_add(1)];
+        let expected_roots = candidate_ticks.iter().flatten().count();
+        let mut available_roots = 0;
+
+        for root_tick in candidate_ticks.into_iter().flatten() {
+            if let Some(root) = inner.spectrum_roots.get(&root_tick) {
+                available_roots += 1;
+                if *root == proof_root {
+                    return SpectrumProofVerification::Verified { root_tick };
+                }
+            }
+        }
+
+        if available_roots == expected_roots {
+            SpectrumProofVerification::Mismatch
+        } else {
+            SpectrumProofVerification::Unavailable
+        }
     }
 
     #[cfg(test)]
@@ -412,13 +439,7 @@ impl ParsedTick {
         if payload.len() != BROADCAST_TICK_PAYLOAD_SIZE {
             return None;
         }
-        let wire_computor_index = u16::from_le_bytes(payload[0..2].try_into().ok()?);
-        if wire_computor_index as usize >= NUMBER_OF_COMPUTORS {
-            return None;
-        }
-        // Qubic Core XORs the index with the message type after signing and
-        // restores it before hashing and selecting the computor public key.
-        let computor_index = wire_computor_index ^ u16::from(BROADCAST_TICK_TYPE);
+        let computor_index = u16::from_le_bytes(payload[0..2].try_into().ok()?);
         if computor_index as usize >= NUMBER_OF_COMPUTORS {
             return None;
         }
@@ -554,6 +575,59 @@ mod tests {
     }
 
     #[test]
+    fn entity_proof_accepts_same_or_successor_tick_root() {
+        let trusted = TrustedNetworkState::default();
+        trusted.set_spectrum_root_for_test(100, [1; 32]);
+        trusted.set_spectrum_root_for_test(101, [2; 32]);
+
+        assert_eq!(
+            trusted.verify_entity_spectrum_root(100, [1; 32]),
+            SpectrumProofVerification::Verified { root_tick: 100 }
+        );
+        assert_eq!(
+            trusted.verify_entity_spectrum_root(100, [2; 32]),
+            SpectrumProofVerification::Verified { root_tick: 101 }
+        );
+        assert_eq!(
+            trusted.verify_entity_spectrum_root(100, [3; 32]),
+            SpectrumProofVerification::Mismatch
+        );
+    }
+
+    #[test]
+    fn entity_proof_is_unavailable_until_the_complete_tick_window_is_known() {
+        let trusted = TrustedNetworkState::default();
+        trusted.set_spectrum_root_for_test(100, [1; 32]);
+
+        assert_eq!(
+            trusted.verify_entity_spectrum_root(100, [2; 32]),
+            SpectrumProofVerification::Unavailable
+        );
+        assert_eq!(
+            TrustedNetworkState::default().verify_entity_spectrum_root(100, [2; 32]),
+            SpectrumProofVerification::Unavailable
+        );
+    }
+
+    #[test]
+    fn maximum_entity_tick_does_not_wrap_successor_lookup() {
+        let trusted = TrustedNetworkState::default();
+        trusted.set_spectrum_root_for_test(u32::MAX, [1; 32]);
+        trusted.set_spectrum_root_for_test(0, [2; 32]);
+
+        assert_eq!(
+            trusted.verify_entity_spectrum_root(u32::MAX, [1; 32]),
+            SpectrumProofVerification::Verified {
+                root_tick: u32::MAX
+            }
+        );
+        assert_eq!(
+            trusted.verify_entity_spectrum_root(u32::MAX, [2; 32]),
+            SpectrumProofVerification::Mismatch
+        );
+    }
+
+    #[test]
     fn rejects_old_tick_payload_size() {
         assert_eq!(
             ParsedTick::parse(&[0; 344]).is_none(),
@@ -575,14 +649,31 @@ mod tests {
         assert!(ParsedTick::parse(&payload).is_some());
     }
 
+    proptest::proptest! {
+        #[test]
+        fn preserves_core_wire_computor_index(
+            computor_index in 0u16..NUMBER_OF_COMPUTORS as u16,
+        ) {
+            let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
+            payload[0..2].copy_from_slice(&computor_index.to_le_bytes());
+            payload[13] = 1;
+            payload[14] = 1;
+
+            proptest::prop_assert_eq!(
+                ParsedTick::parse(&payload).unwrap().computor_index,
+                computor_index
+            );
+        }
+    }
+
     #[test]
-    fn decodes_wire_computor_index_xor() {
+    fn rejects_computor_index_outside_core_range() {
         let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[0..2].copy_from_slice(&(42u16 ^ u16::from(BROADCAST_TICK_TYPE)).to_le_bytes());
+        payload[0..2].copy_from_slice(&(NUMBER_OF_COMPUTORS as u16).to_le_bytes());
         payload[13] = 1;
         payload[14] = 1;
 
-        assert_eq!(ParsedTick::parse(&payload).unwrap().computor_index, 42);
+        assert!(ParsedTick::parse(&payload).is_none());
     }
 
     #[test]
@@ -618,8 +709,18 @@ mod tests {
         payload[0..2].copy_from_slice(&u16::from(BROADCAST_TICK_TYPE).to_le_bytes());
         payload[13] = 1;
         payload[14] = 1;
+        let parsed = ParsedTick::parse(&payload).unwrap();
+        assert_eq!(parsed.computor_index, u16::from(BROADCAST_TICK_TYPE));
+
+        let mut public_keys = vec![[0u8; 32]; NUMBER_OF_COMPUTORS];
+        public_keys[usize::from(BROADCAST_TICK_TYPE)] = PUBLIC_KEY;
         assert!(verify_digest(
-            &PUBLIC_KEY,
+            &public_keys[usize::from(parsed.computor_index)],
+            &tick_signature_digest(&payload),
+            &SIGNATURE,
+        ));
+        assert!(!verify_digest(
+            &public_keys[0],
             &tick_signature_digest(&payload),
             &SIGNATURE,
         ));

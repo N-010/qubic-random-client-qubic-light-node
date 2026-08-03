@@ -8,9 +8,11 @@ use crate::frame::{
 };
 use crate::pending::{PendingEvent, PendingRequests};
 use crate::pending::{PendingSpec, ResponseRule};
-use crate::state::{DisconnectReason, NodeState, OutboundAdmissionError, OutboundFrame};
+use crate::state::{
+    DisconnectReason, NodeState, OutboundAdmissionError, OutboundFrame, ProtocolViolationReason,
+};
 use crate::types::BalanceResponse;
-use crate::verified::TrustedNetworkState;
+use crate::verified::{SpectrumProofVerification, TrustedNetworkState};
 use bytes::Bytes;
 use std::collections::HashSet;
 use std::fmt;
@@ -296,17 +298,20 @@ async fn receive_balance(
                             "RespondEntity cannot prove that the entity is absent".to_string(),
                         ));
                     }
-                    let Some(root) = trusted_network.spectrum_root(parsed.response.tick) else {
-                        return Err(PeerQueryError::PeerUnavailable(format!(
-                            "no verified spectrum root for entity tick {}",
-                            parsed.response.tick
-                        )));
-                    };
-                    if parsed.proof_root() != root {
-                        return Err(PeerQueryError::Protocol(
-                            "RespondEntity Merkle proof does not match the verified spectrum root"
-                                .to_string(),
-                        ));
+                    match trusted_network
+                        .verify_entity_spectrum_root(parsed.response.tick, parsed.proof_root())
+                    {
+                        SpectrumProofVerification::Verified { .. } => {}
+                        SpectrumProofVerification::Unavailable => {
+                            return Err(PeerQueryError::PeerUnavailable(format!(
+                                "verified spectrum roots are incomplete for entity tick {}",
+                                parsed.response.tick
+                            )));
+                        }
+                        SpectrumProofVerification::Mismatch => {
+                            let message = "RespondEntity Merkle proof does not match the verified spectrum root";
+                            return Err(PeerQueryError::Protocol(message.to_string()));
+                        }
                     }
                     return Ok(parsed.response);
                 }
@@ -461,10 +466,10 @@ fn ensure_local_request_size(frame: &[u8], config: &Config) -> Result<(), PeerQu
 }
 
 async fn penalize_protocol_peer(state: &Arc<Mutex<NodeState>>, peer_id: u64) {
-    let _ = state
-        .lock()
-        .await
-        .disconnect_session_with_reason(peer_id, DisconnectReason::ProtocolViolation);
+    let _ = state.lock().await.disconnect_session_with_reason(
+        peer_id,
+        DisconnectReason::ProtocolViolation(ProtocolViolationReason::InvalidApiResponse),
+    );
 }
 
 #[derive(Debug)]
@@ -810,7 +815,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_balance_response_completes_and_cleans_pending_request() {
+    async fn successor_tick_balance_response_completes_and_cleans_pending_request() {
         let (state, peer_id, mut peer_rx) = state_with_peer().await;
         let pending = Arc::new(PendingRequests::default());
         let trusted_network = Arc::new(TrustedNetworkState::default());
@@ -833,7 +838,7 @@ mod tests {
         let root = parse_balance_payload("wallet", [9; 32], &payload)
             .expect("test entity should parse")
             .proof_root();
-        trusted_network.set_spectrum_root_for_test(123, root);
+        trusted_network.set_spectrum_root_for_test(124, root);
         let response = Bytes::from(
             build_request_frame(RESPOND_ENTITY_TYPE, dejavu, &payload)
                 .expect("balance response should build"),
@@ -846,6 +851,41 @@ mod tests {
         assert_eq!(balance.tick, 123);
         assert_eq!(pending.active_count(), 0);
         assert!(pending.deliver(peer_id, dejavu, Bytes::new()));
+    }
+
+    #[tokio::test]
+    async fn mismatched_balance_proof_with_complete_root_window_penalizes_peer() {
+        let (state, peer_id, mut peer_rx) = state_with_peer().await;
+        let pending = Arc::new(PendingRequests::default());
+        let trusted_network = Arc::new(TrustedNetworkState::default());
+        trusted_network.set_spectrum_root_for_test(123, [1; 32]);
+        trusted_network.set_spectrum_root_for_test(124, [2; 32]);
+        let query = tokio::spawn(query_balance(
+            Arc::clone(&state),
+            Arc::clone(&pending),
+            outbound_budget(),
+            trusted_network,
+            test_config(Duration::from_secs(1)),
+            "wallet",
+            [9; 32],
+        ));
+        let request = peer_rx.recv().await.unwrap().bytes;
+        let dejavu = u32::from_le_bytes(request[4..8].try_into().unwrap());
+        let mut payload = entity_payload([9; 32]);
+        payload[64..68].copy_from_slice(&123u32.to_le_bytes());
+        let response =
+            Bytes::from(build_request_frame(RESPOND_ENTITY_TYPE, dejavu, &payload).unwrap());
+
+        assert_eq!(
+            pending.deliver(peer_id, dejavu, response),
+            crate::pending::DeliveryOutcome::Delivered
+        );
+        let error = query.await.unwrap().unwrap_err();
+
+        assert!(error.to_string().contains("Merkle proof does not match"));
+        let locked = state.lock().await;
+        assert_eq!(locked.outgoing_count(), 0);
+        assert_eq!(locked.pool_stats(std::time::Instant::now()).cooldown, 1);
     }
 
     #[tokio::test]

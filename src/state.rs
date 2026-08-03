@@ -33,18 +33,47 @@ pub(crate) enum OutboundAdmissionError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProtocolViolationReason {
+    FrameTooShort,
+    InvalidPendingResponse,
+    MalformedComputors,
+    InvalidComputorSignature,
+    MalformedTick,
+    InvalidTickSignature,
+    TickEquivocation,
+    InvalidApiResponse,
+}
+
+impl std::fmt::Display for ProtocolViolationReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FrameTooShort => formatter.write_str("frame is shorter than the Core header"),
+            Self::InvalidPendingResponse => {
+                formatter.write_str("response violates the pending request contract")
+            }
+            Self::MalformedComputors => formatter.write_str("malformed computor broadcast"),
+            Self::InvalidComputorSignature => formatter.write_str("invalid computor signature"),
+            Self::MalformedTick => formatter.write_str("malformed tick broadcast"),
+            Self::InvalidTickSignature => formatter.write_str("invalid tick signature"),
+            Self::TickEquivocation => formatter.write_str("tick equivocation"),
+            Self::InvalidApiResponse => formatter.write_str("invalid peer API response"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisconnectReason {
     Administrative,
     PeerQueueFull,
     PeerQueueClosed,
-    ProtocolViolation,
+    ProtocolViolation(ProtocolViolationReason),
 }
 
 impl DisconnectReason {
     pub(crate) fn penalizes_peer(self) -> bool {
         match self {
             Self::Administrative => false,
-            Self::PeerQueueFull | Self::PeerQueueClosed | Self::ProtocolViolation => true,
+            Self::PeerQueueFull | Self::PeerQueueClosed | Self::ProtocolViolation(_) => true,
         }
     }
 }
@@ -55,7 +84,9 @@ impl std::fmt::Display for DisconnectReason {
             Self::Administrative => formatter.write_str("administrative disconnect"),
             Self::PeerQueueFull => formatter.write_str("peer outbound queue is full"),
             Self::PeerQueueClosed => formatter.write_str("peer outbound queue is closed"),
-            Self::ProtocolViolation => formatter.write_str("peer protocol violation"),
+            Self::ProtocolViolation(reason) => {
+                write!(formatter, "peer protocol violation: {reason}")
+            }
         }
     }
 }
@@ -669,6 +700,34 @@ mod tests {
 
     fn peer(a: u8, b: u8, c: u8, d: u8) -> SocketAddrV4 {
         SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), DEFAULT_PORT)
+    }
+
+    #[test]
+    fn protocol_violation_reasons_are_specific_and_safe_to_log() {
+        let reasons = [
+            ProtocolViolationReason::FrameTooShort,
+            ProtocolViolationReason::InvalidPendingResponse,
+            ProtocolViolationReason::MalformedComputors,
+            ProtocolViolationReason::InvalidComputorSignature,
+            ProtocolViolationReason::MalformedTick,
+            ProtocolViolationReason::InvalidTickSignature,
+            ProtocolViolationReason::TickEquivocation,
+            ProtocolViolationReason::InvalidApiResponse,
+        ];
+
+        assert_eq!(
+            reasons.map(|reason| reason.to_string()),
+            [
+                "frame is shorter than the Core header",
+                "response violates the pending request contract",
+                "malformed computor broadcast",
+                "invalid computor signature",
+                "malformed tick broadcast",
+                "invalid tick signature",
+                "tick equivocation",
+                "invalid peer API response",
+            ]
+        );
     }
 
     #[test]

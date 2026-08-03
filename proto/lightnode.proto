@@ -36,6 +36,8 @@ message GetBalanceRequest {
 message Balance {
   string wallet = 1;
   string public_key_hex = 2;
+  // Core's reported system tick. The authenticated spectrum root may be
+  // committed by this tick's vote or its immediate successor during a tick transition.
   uint32 tick = 3;
   int32 spectrum_index = 4;
   int64 incoming_amount = 5;

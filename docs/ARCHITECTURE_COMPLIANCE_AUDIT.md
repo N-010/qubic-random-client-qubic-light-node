@@ -6,6 +6,104 @@ Remediation implemented and re-verified: 2026-08-02
 
 ---
 
+## Balance Spectrum-Root Tick-Window Correction (2026-08-02)
+
+This task used the following point-in-time sources before implementation:
+
+| Repository | Revision / worktree state used |
+| --- | --- |
+| QubicLightNode | `d92d821f960c2ef0afd178a0d49a456963092b9e` on `main`; pre-existing modifications in `Dockerfile`, this audit, `src/network.rs`, `src/peer_api.rs`, `src/state.rs`, and `src/verified.rs` were preserved |
+| RandomClient | `33d217eab16da287b6b9ce5389be009227492abf`; dirty `AGENTS.md`, `README.md`, `compose.yaml`, `docs/ARCHITECTURE.md`, `docs/ARCHITECTURE.ru.md`, and `proto/lightnode.proto` were inspected as the current production-consumer worktree |
+| QThirtyFour Core | `f55b46126c99a1c3f3266164c744b3d0cd694d9c` on `develop`; relevant `src/` files were clean, while the unrelated tracked `test/test.vcxproj` modification and untracked artifacts were left untouched |
+
+The balance failure was a tick-to-state association defect. Core writes
+`RespondEntity.tick` from `system.tick`, while request processors run
+concurrently with tick processing. `Tick T.prevSpectrumDigest` authenticates
+the state before tick T; after processing T, Core recomputes the spectrum root,
+which becomes `Tick T+1.prevSpectrumDigest`. An entity response reporting T
+can therefore contain a proof for the verified root committed by either T or
+T+1. QubicLightNode previously checked only T, producing the observed failure
+when an entity response at `71510919` arrived alongside verified tick
+`71510920`.
+
+Traceability for the correction:
+
+| RandomClient requirement and caller | Core source and invariant | QubicLightNode implementation | Status and parity evidence |
+| --- | --- | --- | --- |
+| Authenticated balance consumed by `src/backend.rs::QlnBackend::balance` and used by `src/engine.rs::ensure_balance_query` before enrollment | `core/src/qubic.cpp::processRequestEntity`, `processTick`, and `tickProcessor`: the reported system tick may straddle the transition from the same-tick previous root to the successor-tick previous root | `src/verified.rs::verify_entity_spectrum_root` and `src/peer_api.rs::receive_balance` | Core-compatible runtime adaptation: accept only a K12 proof matching a verified root for T or T+1; no arbitrary cached-root or peer-quorum fallback |
+| Invalid peer data must fail closed without penalizing a peer merely because authenticated state is not available yet | Core supplies proof material but no reduced-node availability policy; the Tokio adapter must distinguish unavailable trust data from a definitive mismatch | `SpectrumProofVerification::{Verified, Unavailable, Mismatch}` | A mismatch is a protocol fault only when the complete candidate window is known; an incomplete window remains retryable and does not disconnect the peer |
+
+The gRPC field numbers and response shape are unchanged. README and protobuf
+comments now document the Core-compatible two-tick verification window.
+
+Correction verification:
+
+- `cargo fmt --all`: passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  passed.
+- QubicLightNode: **129 passed, 0 failed**; FourQ verifier: **5 passed,
+  0 failed**.
+- Current RandomClient worktree against the unchanged wire schema: **47 passed,
+  0 failed**.
+- Regression coverage includes same-tick and successor-tick acceptance,
+  incomplete-root availability, definitive proof mismatch with peer penalty,
+  and `u32::MAX` without successor wraparound.
+- GitNexus `detect_changes`: **CRITICAL**, with 22 affected indexed processes.
+  The balance-related processes are the expected response-success,
+  invalid-response, cooldown, pending-request, and resource-limit test flows;
+  the remaining reported processes belong to the pre-existing tick-parity and
+  protocol-disconnect changes. The index follows committed `d92d821` and could
+  not resolve the new `verify_entity_spectrum_root` symbol, so direct source
+  review and the complete test results above are authoritative for this helper.
+
+## Runtime Tick-Parity Correction (2026-08-02)
+
+This task used the following point-in-time sources before the implementation
+was changed:
+
+| Repository | Revision / worktree state used |
+| --- | --- |
+| QubicLightNode | `d92d821f960c2ef0afd178a0d49a456963092b9e` on `main`; the pre-existing `Dockerfile` modification was outside this task and was preserved |
+| RandomClient | `33d217eab16da287b6b9ce5389be009227492abf`; dirty `AGENTS.md`, `README.md`, `compose.yaml`, `docs/ARCHITECTURE.md`, `docs/ARCHITECTURE.ru.md`, and `proto/lightnode.proto` were inspected as the current consumer worktree |
+| QThirtyFour Core | `f55b46126c99a1c3f3266164c744b3d0cd694d9c` on `develop`; no tracked `src/` changes, with the unrelated tracked `test/test.vcxproj` modification and local untracked artifacts left untouched |
+
+The failure was a protocol-parity defect in tick authentication. Core keeps
+`Tick::computorIndex` literal on the wire, temporarily XORs that field with
+`BroadcastTick::type()` only while computing the KangarooTwelve digest, then
+restores the field before selecting the computor public key. QubicLightNode
+previously applied the XOR while parsing and therefore verified a valid vote
+against a different key. It rejected live votes as protocol violations, never
+formed a 451-computor quorum, and consequently left epoch and tick unknown.
+
+Traceability for the correction:
+
+| RandomClient requirement and caller | Core source and invariant | QubicLightNode implementation | Status and parity evidence |
+| --- | --- | --- | --- |
+| Authenticated current epoch/tick consumed by `src/backend.rs::QlnBackend::tick_info` through `GetStatus` | `core/src/qubic.cpp::processBroadcastTick`: validate the literal wire index; XOR it only for the signed-body digest; restore it before `publicKeys[computorIndex]` lookup | `src/verified.rs::ParsedTick::parse`, `tick_signature_digest`, and `TrustedNetworkState::tick_context` | Exact protocol meaning restored. A property test covers every valid computor index, and a Core-compatible signature vector proves that the parsed wire index selects the authenticating public key. |
+| Reject and penalize invalid peer traffic without leaking packet data | Core handlers reject malformed or unauthenticated messages; the reduced Tokio runtime additionally terminates the faulty peer session | `src/state.rs::ProtocolViolationReason`, `DisconnectReason`, `src/network.rs::process_incoming_frame`, and `src/peer_api.rs::penalize_protocol_peer` | Runtime adaptation only. Disconnect logs now identify the validation class while omitting payloads, keys, signatures, and request data. Tests assert the pending-response reason and the complete stable reason vocabulary. |
+
+This correction changes neither the public gRPC schema nor the four-operation
+product boundary, so `README.md` and protobuf documentation require no change.
+
+Correction verification:
+
+- `cargo fmt --all`: passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  passed.
+- QubicLightNode: **125 passed, 0 failed**; FourQ verifier: **5 passed,
+  0 failed**.
+- Current RandomClient worktree against the generated schema: **47 passed,
+  0 failed**.
+- Live public-peer smoke test: `GetStatus` returned epoch `224`, tick
+  `71509542`, `452` aligned votes, and `0` misaligned votes. The same verified
+  epoch/tick remained visible while outbound peers were replaced.
+- GitNexus `detect_changes`: **HIGH**, with 10 affected indexed processes. All
+  reported processes are expected inbound-frame, session-replacement,
+  deduplication, or their direct network tests; no additional product RPC or
+  relay flow was introduced. The index was stale enough to report the removed
+  `decodes_wire_computor_index_xor` test and pre-change line numbers, so direct
+  source inspection and the live/test evidence above are authoritative.
+
 ## Remediation Verification
 
 The findings below preserve the original pre-remediation evidence. The current
