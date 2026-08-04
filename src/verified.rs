@@ -1,22 +1,17 @@
 use crate::codec::parse_wallet_public_key;
 use crate::frame::{
-    BROADCAST_COMPUTORS_PAYLOAD_SIZE, BROADCAST_TICK_PAYLOAD_SIZE, BROADCAST_TICK_TYPE,
-    COMPUTORS_PUBLIC_KEYS_SIZE, NUMBER_OF_COMPUTORS, SIGNATURE_SIZE,
+    BROADCAST_COMPUTORS_PAYLOAD_SIZE, BROADCAST_FUTURE_TICK_DATA_TYPE, COMPUTORS_PUBLIC_KEYS_SIZE,
+    NUMBER_OF_COMPUTORS, NUMBER_OF_TRANSACTIONS_PER_TICK, SIGNATURE_SIZE, TICK_DATA_PAYLOAD_SIZE,
+    TICK_DATA_TRANSACTION_DIGESTS_OFFSET, TICK_DATA_UNSIGNED_SIZE,
 };
-use crate::types::TickStatus;
 use qubic_fourq_verifier::verify_digest;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_keccak::{Hasher, IntoXof, KangarooTwelve, Xof};
 
 const ARBITRATOR_IDENTITY: &str = "AFZPUAIYVPNUYGJRQVLUKOPPVLHAZQTGLYAAUUNBXFTVTAMSBKQBLEIEPCVJ";
-const TARGET_TICK_VOTE_SIGNATURE: u32 = 0x0002_42EC;
-const QUORUM: usize = 451;
-const TICK_UNSIGNED_SIZE: usize = BROADCAST_TICK_PAYLOAD_SIZE - SIGNATURE_SIZE;
-const MAX_TICK_AGE_MILLIS: i64 = 120_000;
-const MAX_TICK_FUTURE_SKEW_MILLIS: i64 = 30_000;
-const MAX_UNCONFIRMED_TICKS: usize = 8;
+const MAX_TICK_DATA_FUTURE_SKEW_MILLIS: i64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ComputorVerification {
@@ -29,34 +24,11 @@ pub(crate) enum ComputorVerification {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TickVerification {
+pub(crate) enum TickDataVerification {
     Malformed,
-    BadSignature,
-    Deferred,
-    AuthenticatedStale,
-    Duplicate,
-    Equivocation,
-    Accepted,
-    Quorum(TickStatus),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SpectrumProofVerification {
-    Verified { root_tick: u32 },
     Unavailable,
-    Mismatch,
-}
-
-#[derive(Debug)]
-struct VoteCandidate {
-    signers: HashSet<u16>,
-}
-
-#[derive(Debug, Default)]
-struct TickVotes {
-    candidates: HashMap<[u8; 32], VoteCandidate>,
-    computor_votes: HashMap<u16, [u8; 32]>,
-    last_updated: u64,
+    BadSignature,
+    Authenticated { has_transactions: bool },
 }
 
 #[derive(Debug)]
@@ -65,30 +37,10 @@ pub(crate) struct AuthenticatedComputors {
     keys: Box<[[u8; 32]]>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TickContext {
-    parsed: ParsedTick,
-    public_key: [u8; 32],
-    generation: u64,
-    time_stale: bool,
-}
-
-impl TickContext {
-    pub(crate) fn generation(self) -> u64 {
-        self.generation
-    }
-}
-
 #[derive(Debug, Default)]
 struct TrustedState {
     computor_epoch: Option<u16>,
     computor_keys: Box<[[u8; 32]]>,
-    computor_generation: u64,
-    votes: BTreeMap<u32, TickVotes>,
-    vote_clock: u64,
-    status: Option<TickStatus>,
-    status_digest: Option<[u8; 32]>,
-    spectrum_roots: BTreeMap<u32, [u8; 32]>,
 }
 
 #[derive(Debug, Default)]
@@ -97,13 +49,6 @@ pub(crate) struct TrustedNetworkState {
 }
 
 impl TrustedNetworkState {
-    pub(crate) fn status(&self) -> Option<TickStatus> {
-        self.inner
-            .lock()
-            .expect("trusted network mutex should not be poisoned")
-            .status
-    }
-
     pub(crate) fn has_computors(&self) -> bool {
         self.inner
             .lock()
@@ -112,42 +57,121 @@ impl TrustedNetworkState {
             .is_some()
     }
 
-    pub(crate) fn verify_entity_spectrum_root(
+    pub(crate) fn verify_tick_data(
         &self,
-        entity_tick: u32,
-        proof_root: [u8; 32],
-    ) -> SpectrumProofVerification {
-        let inner = self
-            .inner
-            .lock()
-            .expect("trusted network mutex should not be poisoned");
-        let candidate_ticks = [Some(entity_tick), entity_tick.checked_add(1)];
-        let expected_roots = candidate_ticks.iter().flatten().count();
-        let mut available_roots = 0;
+        payload: &[u8],
+        requested_tick: u32,
+    ) -> TickDataVerification {
+        if payload.len() != TICK_DATA_PAYLOAD_SIZE {
+            return TickDataVerification::Malformed;
+        }
 
-        for root_tick in candidate_ticks.into_iter().flatten() {
-            if let Some(root) = inner.spectrum_roots.get(&root_tick) {
-                available_roots += 1;
-                if *root == proof_root {
-                    return SpectrumProofVerification::Verified { root_tick };
-                }
+        let computor_index = u16::from_le_bytes(
+            payload[0..2]
+                .try_into()
+                .expect("validated TickData has a computor index"),
+        );
+        let epoch = u16::from_le_bytes(
+            payload[2..4]
+                .try_into()
+                .expect("validated TickData has an epoch"),
+        );
+        let tick = u32::from_le_bytes(
+            payload[4..8]
+                .try_into()
+                .expect("validated TickData has a tick"),
+        );
+        let millisecond = u16::from_le_bytes(
+            payload[8..10]
+                .try_into()
+                .expect("validated TickData has milliseconds"),
+        );
+        let second = payload[10];
+        let minute = payload[11];
+        let hour = payload[12];
+        let day = payload[13];
+        let month = payload[14];
+        let wire_year = payload[15];
+        if tick != requested_tick
+            || usize::from(computor_index) >= NUMBER_OF_COMPUTORS
+            || tick % NUMBER_OF_COMPUTORS as u32 != u32::from(computor_index)
+            || millisecond > 999
+            || second > 59
+            || minute > 59
+            || hour > 23
+            || !(1..=12).contains(&month)
+            || day == 0
+            || day > days_in_month(wire_year, month)
+        {
+            return TickDataVerification::Malformed;
+        }
+        let timestamp_millis = utc_millis(
+            2000 + u16::from(wire_year),
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            millisecond,
+        );
+        if timestamp_millis > unix_time_millis().saturating_add(MAX_TICK_DATA_FUTURE_SKEW_MILLIS) {
+            return TickDataVerification::Malformed;
+        }
+
+        let digests_end =
+            TICK_DATA_TRANSACTION_DIGESTS_OFFSET + NUMBER_OF_TRANSACTIONS_PER_TICK * 32;
+        let zero_digest = [0u8; 32];
+        let mut non_zero_digests = HashSet::new();
+        for digest in payload[TICK_DATA_TRANSACTION_DIGESTS_OFFSET..digests_end].chunks_exact(32) {
+            let digest: [u8; 32] = digest
+                .try_into()
+                .expect("TickData transaction digest has an exact size");
+            if digest != zero_digest && !non_zero_digests.insert(digest) {
+                return TickDataVerification::Malformed;
             }
         }
 
-        if available_roots == expected_roots {
-            SpectrumProofVerification::Mismatch
-        } else {
-            SpectrumProofVerification::Unavailable
+        let signature = signature_from_slice(&payload[TICK_DATA_UNSIGNED_SIZE..])
+            .expect("validated TickData has an exact-size signature");
+        let public_key = {
+            let inner = self
+                .inner
+                .lock()
+                .expect("trusted network mutex should not be poisoned");
+            if inner.computor_epoch != Some(epoch) {
+                return TickDataVerification::Unavailable;
+            }
+            let Some(public_key) = inner.computor_keys.get(usize::from(computor_index)) else {
+                return TickDataVerification::Unavailable;
+            };
+            *public_key
+        };
+
+        let mut signed_body = payload[..TICK_DATA_UNSIGNED_SIZE].to_vec();
+        signed_body[0] ^= BROADCAST_FUTURE_TICK_DATA_TYPE;
+        if !verify_digest(&public_key, &k12(&signed_body), &signature) {
+            return TickDataVerification::BadSignature;
+        }
+
+        TickDataVerification::Authenticated {
+            has_transactions: !non_zero_digests.is_empty(),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn set_spectrum_root_for_test(&self, tick: u32, root: [u8; 32]) {
-        self.inner
+    pub(crate) fn set_computor_key_for_test(
+        &self,
+        epoch: u16,
+        computor_index: u16,
+        public_key: [u8; 32],
+    ) {
+        let mut inner = self
+            .inner
             .lock()
-            .expect("trusted network mutex should not be poisoned")
-            .spectrum_roots
-            .insert(tick, root);
+            .expect("trusted network mutex should not be poisoned");
+        inner.computor_epoch = Some(epoch);
+        inner.computor_keys = vec![[0; 32]; NUMBER_OF_COMPUTORS].into_boxed_slice();
+        inner.computor_keys[usize::from(computor_index)] = public_key;
     }
 
     pub(crate) fn parse_computors(
@@ -218,275 +242,8 @@ impl TrustedNetworkState {
 
         inner.computor_epoch = Some(computors.epoch);
         inner.computor_keys = computors.keys;
-        inner.computor_generation = inner.computor_generation.wrapping_add(1);
-        inner.votes.clear();
-        inner.vote_clock = 0;
-        inner.status = None;
-        inner.status_digest = None;
-        inner.spectrum_roots.clear();
         ComputorVerification::Accepted
     }
-
-    pub(crate) fn tick_context(
-        &self,
-        payload: &[u8],
-        now_millis: i64,
-    ) -> Result<TickContext, TickVerification> {
-        let Some(parsed) = ParsedTick::parse(payload) else {
-            return Err(TickVerification::Malformed);
-        };
-        if !has_acceptable_signature_score(&parsed.signature) {
-            return Err(TickVerification::Malformed);
-        }
-        if parsed.timestamp_millis > now_millis.saturating_add(MAX_TICK_FUTURE_SKEW_MILLIS) {
-            return Err(TickVerification::Deferred);
-        }
-
-        let inner = self
-            .inner
-            .lock()
-            .expect("trusted network mutex should not be poisoned");
-        match inner.computor_epoch {
-            Some(epoch) if epoch == parsed.epoch => {}
-            Some(epoch) if epoch > parsed.epoch => {
-                return Err(TickVerification::AuthenticatedStale);
-            }
-            Some(_) | None => return Err(TickVerification::Deferred),
-        }
-        let Some(public_key) = inner.computor_keys.get(parsed.computor_index as usize) else {
-            return Err(TickVerification::Malformed);
-        };
-        Ok(TickContext {
-            parsed,
-            public_key: *public_key,
-            generation: inner.computor_generation,
-            time_stale: parsed.timestamp_millis < now_millis.saturating_sub(MAX_TICK_AGE_MILLIS),
-        })
-    }
-
-    pub(crate) fn tick_signature_is_valid(&self, payload: &[u8], context: TickContext) -> bool {
-        verify_digest(
-            &context.public_key,
-            &tick_signature_digest(payload),
-            &context.parsed.signature,
-        )
-    }
-
-    pub(crate) fn apply_tick(&self, context: TickContext, payload: &[u8]) -> TickVerification {
-        self.record_vote(context, payload)
-    }
-
-    fn record_vote(&self, context: TickContext, payload: &[u8]) -> TickVerification {
-        let parsed = context.parsed;
-        let body_digest = consensus_digest(payload);
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("trusted network mutex should not be poisoned");
-        if inner.computor_epoch != Some(parsed.epoch)
-            || inner.computor_generation != context.generation
-            || context.time_stale
-            || inner.status.is_some_and(|status| parsed.tick < status.tick)
-        {
-            return TickVerification::AuthenticatedStale;
-        }
-
-        if let Some(previous) = inner
-            .votes
-            .get(&parsed.tick)
-            .and_then(|votes| votes.computor_votes.get(&parsed.computor_index))
-        {
-            return if *previous == body_digest {
-                TickVerification::Duplicate
-            } else {
-                TickVerification::Equivocation
-            };
-        }
-
-        if !inner.votes.contains_key(&parsed.tick) && inner.votes.len() >= MAX_UNCONFIRMED_TICKS {
-            let confirmed_tick = inner.status.map(|status| status.tick);
-            let evict = inner
-                .votes
-                .iter()
-                .filter(|(tick, _)| Some(**tick) != confirmed_tick)
-                .min_by_key(|(tick, votes)| {
-                    (votes.computor_votes.len(), votes.last_updated, **tick)
-                })
-                .map(|(tick, _)| *tick);
-            if let Some(evict) = evict {
-                inner.votes.remove(&evict);
-            }
-        }
-
-        inner.vote_clock = inner.vote_clock.wrapping_add(1);
-        let updated_at = inner.vote_clock;
-        let (aligned, total) = {
-            let tick_votes = inner.votes.entry(parsed.tick).or_default();
-            tick_votes.last_updated = updated_at;
-            tick_votes
-                .computor_votes
-                .insert(parsed.computor_index, body_digest);
-            let candidate =
-                tick_votes
-                    .candidates
-                    .entry(body_digest)
-                    .or_insert_with(|| VoteCandidate {
-                        signers: HashSet::with_capacity(QUORUM),
-                    });
-            candidate.signers.insert(parsed.computor_index);
-            (candidate.signers.len(), tick_votes.computor_votes.len())
-        };
-
-        let establishes_quorum = aligned >= QUORUM
-            && inner
-                .status
-                .is_none_or(|current| (parsed.epoch, parsed.tick) > (current.epoch, current.tick));
-        if establishes_quorum {
-            let status = tick_status(parsed.epoch, parsed.tick, aligned, total);
-            inner.status = Some(status);
-            inner.status_digest = Some(body_digest);
-            inner
-                .spectrum_roots
-                .insert(parsed.tick, parsed.prev_spectrum_digest);
-            while inner.spectrum_roots.len() > MAX_UNCONFIRMED_TICKS {
-                inner.spectrum_roots.pop_first();
-            }
-            inner.votes.retain(|tick, _| *tick >= status.tick);
-            return TickVerification::Quorum(status);
-        }
-
-        if inner
-            .status
-            .is_some_and(|status| status.tick == parsed.tick)
-            && let Some(status_digest) = inner.status_digest
-            && let Some(tick_votes) = inner.votes.get(&parsed.tick)
-        {
-            let aligned = tick_votes
-                .candidates
-                .get(&status_digest)
-                .map_or(0, |candidate| candidate.signers.len());
-            let total = tick_votes.computor_votes.len();
-            inner.status = Some(tick_status(parsed.epoch, parsed.tick, aligned, total));
-        }
-
-        TickVerification::Accepted
-    }
-
-    #[cfg(test)]
-    pub(crate) fn verify_tick_at(&self, payload: &[u8], now_millis: i64) -> TickVerification {
-        let context = match self.tick_context(payload, now_millis) {
-            Ok(context) => context,
-            Err(outcome) => return outcome,
-        };
-        if !self.tick_signature_is_valid(payload, context) {
-            return TickVerification::BadSignature;
-        }
-        self.apply_tick(context, payload)
-    }
-
-    #[cfg(test)]
-    fn record_vote_for_test(
-        &self,
-        parsed: ParsedTick,
-        payload: &[u8],
-        generation: u64,
-    ) -> TickVerification {
-        self.record_vote(
-            TickContext {
-                parsed,
-                public_key: [0; 32],
-                generation,
-                time_stale: false,
-            },
-            payload,
-        )
-    }
-}
-
-fn tick_status(epoch: u16, tick: u32, aligned: usize, total: usize) -> TickStatus {
-    TickStatus {
-        epoch,
-        tick,
-        initial_tick: 0,
-        tick_duration_ms: 0,
-        aligned_votes: u16::try_from(aligned).expect("aligned votes fit into u16"),
-        misaligned_votes: u16::try_from(total.saturating_sub(aligned))
-            .expect("misaligned votes fit into u16"),
-    }
-}
-
-fn has_acceptable_signature_score(signature: &[u8; SIGNATURE_SIZE]) -> bool {
-    let signature_score = u32::from_be_bytes(
-        signature[..4]
-            .try_into()
-            .expect("signature score has exact size"),
-    );
-    signature_score <= TARGET_TICK_VOTE_SIGNATURE
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ParsedTick {
-    computor_index: u16,
-    epoch: u16,
-    tick: u32,
-    timestamp_millis: i64,
-    prev_spectrum_digest: [u8; 32],
-    signature: [u8; SIGNATURE_SIZE],
-}
-
-impl ParsedTick {
-    fn parse(payload: &[u8]) -> Option<Self> {
-        if payload.len() != BROADCAST_TICK_PAYLOAD_SIZE {
-            return None;
-        }
-        let computor_index = u16::from_le_bytes(payload[0..2].try_into().ok()?);
-        if computor_index as usize >= NUMBER_OF_COMPUTORS {
-            return None;
-        }
-        let millisecond = u16::from_le_bytes(payload[8..10].try_into().ok()?);
-        let second = payload[10];
-        let minute = payload[11];
-        let hour = payload[12];
-        let day = payload[13];
-        let month = payload[14];
-        let wire_year = payload[15];
-        let year = 2000 + u16::from(wire_year);
-        if millisecond > 999
-            || second > 59
-            || minute > 59
-            || hour > 23
-            || !(1..=12).contains(&month)
-            || day == 0
-            || day > days_in_month(wire_year, month)
-        {
-            return None;
-        }
-        Some(Self {
-            computor_index,
-            epoch: u16::from_le_bytes(payload[2..4].try_into().ok()?),
-            tick: u32::from_le_bytes(payload[4..8].try_into().ok()?),
-            timestamp_millis: utc_millis(year, month, day, hour, minute, second, millisecond),
-            prev_spectrum_digest: payload[32..64].try_into().ok()?,
-            signature: signature_from_slice(&payload[TICK_UNSIGNED_SIZE..])?,
-        })
-    }
-}
-
-fn consensus_digest(payload: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    // These are the fields Qubic Core compares for aligned current-tick
-    // votes. Salted fields are computor-specific and must not split quorum.
-    hasher.update(&payload[8..16]);
-    hasher.update(&payload[32..128]);
-    hasher.update(&payload[224..256]);
-    *hasher.finalize().as_bytes()
-}
-
-fn tick_signature_digest(payload: &[u8]) -> [u8; 32] {
-    let mut signed_body = [0u8; TICK_UNSIGNED_SIZE];
-    signed_body.copy_from_slice(&payload[..TICK_UNSIGNED_SIZE]);
-    signed_body[0] ^= BROADCAST_TICK_TYPE;
-    k12(&signed_body)
 }
 
 fn days_in_month(wire_year: u8, month: u8) -> u8 {
@@ -549,198 +306,98 @@ fn k12(bytes: &[u8]) -> [u8; 32] {
 }
 
 #[cfg(test)]
+pub(crate) fn signed_tick_data_for_test(
+    epoch: u16,
+    tick: u32,
+    has_transactions: bool,
+) -> (Vec<u8>, u16, [u8; 32]) {
+    let computor_index = (tick % NUMBER_OF_COMPUTORS as u32) as u16;
+    let subseed = [7; 32];
+    let (public_key, _) = qubic_fourq_verifier::test_signing::sign_digest(&subseed, &[0; 32]);
+    let mut payload = vec![0; TICK_DATA_PAYLOAD_SIZE];
+    payload[0..2].copy_from_slice(&computor_index.to_le_bytes());
+    payload[2..4].copy_from_slice(&epoch.to_le_bytes());
+    payload[4..8].copy_from_slice(&tick.to_le_bytes());
+    payload[8..10].copy_from_slice(&123u16.to_le_bytes());
+    payload[10..16].copy_from_slice(&[4, 3, 2, 1, 8, 26]);
+    if has_transactions {
+        payload[TICK_DATA_TRANSACTION_DIGESTS_OFFSET..TICK_DATA_TRANSACTION_DIGESTS_OFFSET + 32]
+            .fill(9);
+    }
+    let mut signed_body = payload[..TICK_DATA_UNSIGNED_SIZE].to_vec();
+    signed_body[0] ^= BROADCAST_FUTURE_TICK_DATA_TYPE;
+    let (_, signature) =
+        qubic_fourq_verifier::test_signing::sign_digest(&subseed, &k12(&signed_body));
+    payload[TICK_DATA_UNSIGNED_SIZE..].copy_from_slice(&signature);
+    (payload, computor_index, public_key)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
-    fn trusted_for_votes(epoch: u16) -> TrustedNetworkState {
-        let trusted = TrustedNetworkState::default();
-        {
-            let mut inner = trusted.inner.lock().unwrap();
-            inner.computor_epoch = Some(epoch);
-            inner.computor_generation = 1;
-        }
-        trusted
-    }
-
-    fn parsed_tick(computor_index: u16, epoch: u16, tick: u32) -> ParsedTick {
-        ParsedTick {
-            computor_index,
-            epoch,
-            tick,
-            timestamp_millis: 0,
-            prev_spectrum_digest: [0; 32],
-            signature: [0; SIGNATURE_SIZE],
-        }
-    }
-
     #[test]
-    fn entity_proof_accepts_same_or_successor_tick_root() {
-        let trusted = TrustedNetworkState::default();
-        trusted.set_spectrum_root_for_test(100, [1; 32]);
-        trusted.set_spectrum_root_for_test(101, [2; 32]);
+    fn tick_data_verification_distinguishes_empty_and_non_empty_ticks() {
+        let epoch = 301;
+        let tick = 12_345;
+        for (has_transactions, expected) in [(false, false), (true, true)] {
+            let (payload, computor_index, public_key) =
+                signed_tick_data_for_test(epoch, tick, has_transactions);
+            let trusted = TrustedNetworkState::default();
+            trusted.set_computor_key_for_test(epoch, computor_index, public_key);
 
-        assert_eq!(
-            trusted.verify_entity_spectrum_root(100, [1; 32]),
-            SpectrumProofVerification::Verified { root_tick: 100 }
-        );
-        assert_eq!(
-            trusted.verify_entity_spectrum_root(100, [2; 32]),
-            SpectrumProofVerification::Verified { root_tick: 101 }
-        );
-        assert_eq!(
-            trusted.verify_entity_spectrum_root(100, [3; 32]),
-            SpectrumProofVerification::Mismatch
-        );
-    }
-
-    #[test]
-    fn entity_proof_is_unavailable_until_the_complete_tick_window_is_known() {
-        let trusted = TrustedNetworkState::default();
-        trusted.set_spectrum_root_for_test(100, [1; 32]);
-
-        assert_eq!(
-            trusted.verify_entity_spectrum_root(100, [2; 32]),
-            SpectrumProofVerification::Unavailable
-        );
-        assert_eq!(
-            TrustedNetworkState::default().verify_entity_spectrum_root(100, [2; 32]),
-            SpectrumProofVerification::Unavailable
-        );
-    }
-
-    #[test]
-    fn maximum_entity_tick_does_not_wrap_successor_lookup() {
-        let trusted = TrustedNetworkState::default();
-        trusted.set_spectrum_root_for_test(u32::MAX, [1; 32]);
-        trusted.set_spectrum_root_for_test(0, [2; 32]);
-
-        assert_eq!(
-            trusted.verify_entity_spectrum_root(u32::MAX, [1; 32]),
-            SpectrumProofVerification::Verified {
-                root_tick: u32::MAX
-            }
-        );
-        assert_eq!(
-            trusted.verify_entity_spectrum_root(u32::MAX, [2; 32]),
-            SpectrumProofVerification::Mismatch
-        );
-    }
-
-    #[test]
-    fn rejects_old_tick_payload_size() {
-        assert_eq!(
-            ParsedTick::parse(&[0; 344]).is_none(),
-            true,
-            "the obsolete 344-byte layout must not be accepted"
-        );
-    }
-
-    #[test]
-    fn validates_calendar_bounds() {
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[13] = 29;
-        payload[14] = 2;
-        payload[15] = 4;
-        assert!(ParsedTick::parse(&payload).is_some());
-        payload[15] = 3;
-        assert!(ParsedTick::parse(&payload).is_none());
-        payload[15] = 100;
-        assert!(ParsedTick::parse(&payload).is_some());
-    }
-
-    proptest::proptest! {
-        #[test]
-        fn preserves_core_wire_computor_index(
-            computor_index in 0u16..NUMBER_OF_COMPUTORS as u16,
-        ) {
-            let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-            payload[0..2].copy_from_slice(&computor_index.to_le_bytes());
-            payload[13] = 1;
-            payload[14] = 1;
-
-            proptest::prop_assert_eq!(
-                ParsedTick::parse(&payload).unwrap().computor_index,
-                computor_index
+            assert_eq!(
+                trusted.verify_tick_data(&payload, tick),
+                TickDataVerification::Authenticated {
+                    has_transactions: expected
+                }
             );
         }
     }
 
     #[test]
-    fn rejects_computor_index_outside_core_range() {
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[0..2].copy_from_slice(&(NUMBER_OF_COMPUTORS as u16).to_le_bytes());
-        payload[13] = 1;
-        payload[14] = 1;
+    fn tick_data_verification_rejects_wrong_tick_duplicate_digest_and_signature() {
+        let epoch = 301;
+        let tick = 12_345;
+        let (payload, computor_index, public_key) = signed_tick_data_for_test(epoch, tick, true);
+        let trusted = TrustedNetworkState::default();
+        trusted.set_computor_key_for_test(epoch, computor_index, public_key);
 
-        assert!(ParsedTick::parse(&payload).is_none());
-    }
+        assert_eq!(
+            trusted.verify_tick_data(&payload, tick + 1),
+            TickDataVerification::Malformed
+        );
 
-    #[test]
-    fn consensus_digest_ignores_computor_specific_fields() {
-        let mut first = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        first[8..16].fill(1);
-        first[32..128].fill(2);
-        first[224..256].fill(3);
-        let mut second = first;
-        second[0..2].copy_from_slice(&99u16.to_le_bytes());
-        second[20..24].fill(4);
-        second[28..32].fill(5);
-        second[128..224].fill(6);
+        let mut duplicate = payload.clone();
+        let first_digest = duplicate
+            [TICK_DATA_TRANSACTION_DIGESTS_OFFSET..TICK_DATA_TRANSACTION_DIGESTS_OFFSET + 32]
+            .to_vec();
+        duplicate
+            [TICK_DATA_TRANSACTION_DIGESTS_OFFSET + 32..TICK_DATA_TRANSACTION_DIGESTS_OFFSET + 64]
+            .copy_from_slice(&first_digest);
+        assert_eq!(
+            trusted.verify_tick_data(&duplicate, tick),
+            TickDataVerification::Malformed
+        );
 
-        assert_eq!(consensus_digest(&first), consensus_digest(&second));
-        second[224] ^= 1;
-        assert_ne!(consensus_digest(&first), consensus_digest(&second));
-    }
+        let mut future_timestamp = payload.clone();
+        future_timestamp[15] = u8::MAX;
+        assert_eq!(
+            trusted.verify_tick_data(&future_timestamp, tick),
+            TickDataVerification::Malformed
+        );
 
-    #[test]
-    fn verifies_core_wire_index_signature_digest() {
-        const PUBLIC_KEY: [u8; 32] = [
-            31, 89, 13, 3, 230, 19, 189, 222, 211, 139, 76, 8, 32, 172, 68, 97, 95, 145, 175, 18,
-            67, 89, 128, 179, 237, 227, 192, 140, 49, 90, 37, 68,
-        ];
-        const SIGNATURE: [u8; 64] = [
-            116, 16, 247, 173, 230, 4, 114, 33, 228, 85, 163, 207, 187, 152, 221, 26, 73, 119, 136,
-            33, 32, 4, 74, 137, 126, 239, 31, 114, 192, 131, 185, 67, 153, 83, 82, 98, 171, 19, 40,
-            107, 91, 158, 204, 242, 98, 106, 171, 3, 122, 212, 11, 206, 20, 229, 129, 244, 29, 66,
-            148, 213, 202, 220, 21, 0,
-        ];
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[0..2].copy_from_slice(&u16::from(BROADCAST_TICK_TYPE).to_le_bytes());
-        payload[13] = 1;
-        payload[14] = 1;
-        let parsed = ParsedTick::parse(&payload).unwrap();
-        assert_eq!(parsed.computor_index, u16::from(BROADCAST_TICK_TYPE));
-
-        let mut public_keys = vec![[0u8; 32]; NUMBER_OF_COMPUTORS];
-        public_keys[usize::from(BROADCAST_TICK_TYPE)] = PUBLIC_KEY;
-        assert!(verify_digest(
-            &public_keys[usize::from(parsed.computor_index)],
-            &tick_signature_digest(&payload),
-            &SIGNATURE,
-        ));
-        assert!(!verify_digest(
-            &public_keys[0],
-            &tick_signature_digest(&payload),
-            &SIGNATURE,
-        ));
-        payload[224] ^= 1;
-        assert!(!verify_digest(
-            &PUBLIC_KEY,
-            &tick_signature_digest(&payload),
-            &SIGNATURE,
-        ));
-    }
-
-    #[test]
-    fn signature_score_prefix_is_big_endian_like_core() {
-        let mut accepted = [0; SIGNATURE_SIZE];
-        accepted[..4].copy_from_slice(&TARGET_TICK_VOTE_SIGNATURE.to_be_bytes());
-        assert!(has_acceptable_signature_score(&accepted));
-
-        let mut rejected = [0; SIGNATURE_SIZE];
-        rejected[..4].copy_from_slice(&TARGET_TICK_VOTE_SIGNATURE.saturating_add(1).to_be_bytes());
-        assert!(!has_acceptable_signature_score(&rejected));
+        let mut bad_signature = payload;
+        bad_signature[TICK_DATA_UNSIGNED_SIZE] ^= 1;
+        assert_eq!(
+            trusted.verify_tick_data(&bad_signature, tick),
+            TickDataVerification::BadSignature
+        );
+        assert_eq!(
+            TrustedNetworkState::default().verify_tick_data(&bad_signature, tick),
+            TickDataVerification::Unavailable
+        );
     }
 
     #[test]
@@ -757,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn same_epoch_conflict_does_not_replace_verified_state() {
+    fn same_epoch_conflict_does_not_replace_verified_keys() {
         let trusted = TrustedNetworkState::default();
         let first_keys = vec![[1; 32]; NUMBER_OF_COMPUTORS].into_boxed_slice();
         assert_eq!(
@@ -767,12 +424,6 @@ mod tests {
             }),
             ComputorVerification::Accepted
         );
-        {
-            let mut inner = trusted.inner.lock().unwrap();
-            inner.status = Some(tick_status(7, 50, QUORUM, QUORUM));
-        }
-        let generation = trusted.inner.lock().unwrap().computor_generation;
-
         assert_eq!(
             trusted.apply_computors(AuthenticatedComputors {
                 epoch: 7,
@@ -780,186 +431,8 @@ mod tests {
             }),
             ComputorVerification::AuthenticatedConflict
         );
+
         let inner = trusted.inner.lock().unwrap();
         assert_eq!(inner.computor_keys, first_keys);
-        assert_eq!(inner.computor_generation, generation);
-        assert_eq!(inner.status.map(|status| status.tick), Some(50));
-    }
-
-    #[test]
-    fn signer_can_vote_in_multiple_ticks_but_not_equivocate_within_one_tick() {
-        let trusted = trusted_for_votes(7);
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[13] = 1;
-        payload[14] = 1;
-
-        assert_eq!(
-            trusted.record_vote_for_test(parsed_tick(10, 7, 101), &payload, 1),
-            TickVerification::Accepted
-        );
-        assert_eq!(
-            trusted.record_vote_for_test(parsed_tick(10, 7, 100), &payload, 1),
-            TickVerification::Accepted
-        );
-        payload[224] = 1;
-        assert_eq!(
-            trusted.record_vote_for_test(parsed_tick(10, 7, 100), &payload, 1),
-            TickVerification::Equivocation
-        );
-    }
-
-    #[test]
-    fn ninth_unconfirmed_tick_evicts_the_weakest_oldest_bucket() {
-        let trusted = trusted_for_votes(7);
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[13] = 1;
-        payload[14] = 1;
-        for tick in 1..=MAX_UNCONFIRMED_TICKS as u32 {
-            for signer in 0..tick {
-                let _ =
-                    trusted.record_vote_for_test(parsed_tick(signer as u16, 7, tick), &payload, 1);
-            }
-        }
-        let _ = trusted.record_vote_for_test(parsed_tick(500, 7, 99), &payload, 1);
-
-        let inner = trusted.inner.lock().unwrap();
-        assert_eq!(inner.votes.len(), MAX_UNCONFIRMED_TICKS);
-        assert!(!inner.votes.contains_key(&1));
-        assert!(inner.votes.contains_key(&99));
-    }
-
-    #[test]
-    fn quorum_requires_distinct_computors_on_same_consensus_fields() {
-        let trusted = trusted_for_votes(7);
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[13] = 1;
-        payload[14] = 1;
-
-        for computor_index in 0..10u16 {
-            payload[224] = computor_index as u8 + 1;
-            assert_eq!(
-                trusted.record_vote_for_test(parsed_tick(computor_index, 7, 123), &payload, 1,),
-                TickVerification::Accepted
-            );
-        }
-
-        payload[224] = 0;
-        let mut result = TickVerification::Accepted;
-        for computor_index in 10..10 + QUORUM as u16 {
-            result = trusted.record_vote_for_test(parsed_tick(computor_index, 7, 123), &payload, 1);
-        }
-
-        let TickVerification::Quorum(status) = result else {
-            panic!("451 matching distinct computors should establish quorum");
-        };
-        assert_eq!(status.aligned_votes, QUORUM as u16);
-        assert_eq!(status.misaligned_votes, 10);
-        assert_eq!(trusted.status(), Some(status));
-    }
-
-    #[test]
-    fn signer_churn_cannot_evict_other_computors_votes() {
-        let trusted = trusted_for_votes(7);
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[13] = 1;
-        payload[14] = 1;
-
-        for computor_index in 1..QUORUM as u16 {
-            assert_eq!(
-                trusted.record_vote_for_test(parsed_tick(computor_index, 7, 9), &payload, 1),
-                TickVerification::Accepted
-            );
-        }
-        for tick in 10..=1_000 {
-            let _ = trusted.record_vote_for_test(parsed_tick(0, 7, tick), &payload, 1);
-        }
-        let result = trusted.record_vote_for_test(parsed_tick(500, 7, 9), &payload, 1);
-
-        assert!(matches!(result, TickVerification::Quorum(_)));
-        let inner = trusted.inner.lock().unwrap();
-        assert!(inner.votes.contains_key(&9));
-        assert!(inner.votes.len() <= MAX_UNCONFIRMED_TICKS);
-    }
-
-    #[test]
-    fn distant_quorum_catches_up_but_one_future_vote_does_not() {
-        let trusted = trusted_for_votes(7);
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[13] = 1;
-        payload[14] = 1;
-        for computor_index in 0..QUORUM as u16 {
-            let _ = trusted.record_vote_for_test(parsed_tick(computor_index, 7, 10), &payload, 1);
-        }
-        assert_eq!(trusted.status().map(|status| status.tick), Some(10));
-
-        assert_eq!(
-            trusted.record_vote_for_test(parsed_tick(500, 7, 1_000), &payload, 1),
-            TickVerification::Accepted
-        );
-        assert_eq!(trusted.status().map(|status| status.tick), Some(10));
-
-        for computor_index in 0..QUORUM as u16 {
-            let _ =
-                trusted.record_vote_for_test(parsed_tick(computor_index, 7, 1_000), &payload, 1);
-        }
-        assert_eq!(trusted.status().map(|status| status.tick), Some(1_000));
-    }
-
-    #[test]
-    fn misaligned_votes_refresh_after_quorum() {
-        let trusted = trusted_for_votes(7);
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[13] = 1;
-        payload[14] = 1;
-        for computor_index in 0..QUORUM as u16 {
-            let _ = trusted.record_vote_for_test(parsed_tick(computor_index, 7, 50), &payload, 1);
-        }
-        assert_eq!(trusted.status().unwrap().misaligned_votes, 0);
-
-        payload[224] = 1;
-        assert_eq!(
-            trusted.record_vote_for_test(parsed_tick(500, 7, 50), &payload, 1),
-            TickVerification::Accepted
-        );
-        assert_eq!(trusted.status().unwrap().misaligned_votes, 1);
-    }
-
-    #[test]
-    fn stale_generation_cannot_record_a_verified_vote() {
-        let trusted = trusted_for_votes(7);
-        trusted.inner.lock().unwrap().computor_generation = 2;
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[13] = 1;
-        payload[14] = 1;
-
-        assert_eq!(
-            trusted.record_vote_for_test(parsed_tick(0, 7, 50), &payload, 1),
-            TickVerification::AuthenticatedStale
-        );
-        assert!(trusted.inner.lock().unwrap().votes.is_empty());
-    }
-
-    #[test]
-    fn tick_timestamp_window_is_enforced_at_millisecond_boundaries() {
-        let trusted = TrustedNetworkState::default();
-        let mut payload = [0u8; BROADCAST_TICK_PAYLOAD_SIZE];
-        payload[13] = 1;
-        payload[14] = 1;
-        payload[15] = 25;
-        let timestamp = ParsedTick::parse(&payload).unwrap().timestamp_millis;
-
-        assert_eq!(
-            trusted.verify_tick_at(&payload, timestamp + MAX_TICK_AGE_MILLIS + 1),
-            TickVerification::Deferred
-        );
-        assert_eq!(
-            trusted.verify_tick_at(&payload, timestamp - MAX_TICK_FUTURE_SKEW_MILLIS - 1),
-            TickVerification::Deferred
-        );
-        assert_eq!(
-            trusted.verify_tick_at(&payload, timestamp + MAX_TICK_AGE_MILLIS),
-            TickVerification::Deferred,
-            "the boundary passes freshness and then defers because no computor list is installed"
-        );
     }
 }

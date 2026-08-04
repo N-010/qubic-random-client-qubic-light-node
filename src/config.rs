@@ -506,14 +506,17 @@ mod tests {
 
     #[test]
     fn rejects_frame_limit_outside_protocol_range() {
-        for value in ["65550", "16777216"] {
+        let minimum = crate::frame::MIN_OPERATIONAL_FRAME_BYTES;
+        let below_minimum = (minimum - 1).to_string();
+        for value in [below_minimum.as_str(), "16777216"] {
             let err = Config::from_args(["QubicLightNode", "--max-frame-bytes", value])
                 .expect_err("invalid frame limit should be rejected");
             assert_eq!(err.kind(), ErrorKind::ValueValidation);
         }
+        let minimum = minimum.to_string();
         assert_eq!(
-            parse_config(&["--max-frame-bytes", "65551"]).max_frame_bytes,
-            65_551
+            parse_config(&["--max-frame-bytes", &minimum]).max_frame_bytes,
+            crate::frame::MIN_OPERATIONAL_FRAME_BYTES
         );
     }
 

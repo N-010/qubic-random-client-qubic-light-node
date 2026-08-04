@@ -1,8 +1,110 @@
 # QubicLightNode Architecture Compliance Audit
 
-Audit date: 2026-08-02  
-Status: **COMPLIANT WITH ONE EXPLICITLY ACCEPTED HIGH-RISK TRUST EXCEPTION**  
-Remediation implemented and re-verified: 2026-08-02
+Audit date: 2026-08-04
+Status: **PARTIALLY COMPLIANT: TWO EXPLICITLY ACCEPTED UNAUTHENTICATED PUBLIC-PEER TRUST EXCEPTIONS**
+Latest implementation re-verified: 2026-08-04
+
+---
+
+## Non-blocking Tick Status and Legacy RPC Removal (2026-08-04)
+
+This change used the following point-in-time sources before implementation:
+
+| Repository | Revision / worktree state used |
+| --- | --- |
+| QubicLightNode | `8f035b4171103647c3cdaeb8cf8c48036a8f15c8`; the existing TickData/product-boundary work and unrelated dirty files were preserved |
+| RandomClient | `ea02475916536036fa69ce8c89354568c4c42c1b`; existing modifications in `README.md`, both architecture documents, and `src/engine.rs` were preserved |
+| QThirtyFour Core | `f55b46126c99a1c3f3266164c744b3d0cd694d9c`; relevant production sources were unchanged while unrelated tracked and untracked changes were preserved |
+
+Traceability for the changed status boundary:
+
+| RandomClient requirement and caller | Core source and invariant | QubicLightNode implementation | Status and parity evidence |
+| --- | --- | --- | --- |
+| Continuously advancing scheduling input through `src/backend.rs::QlnBackend::tick_info` and tonic `GetStatus` | `core/src/network_messages/tick.h::{BroadcastTick,RespondCurrentTickInfo}` defines the exact layouts; `core/src/qubic.cpp::{processBroadcastTick,processResponseCurrentTickInfo}` rejects wrong sizes and constrains the literal computor index or current-epoch range before any use | `src/frame.rs::parse_tick_status_from_frame`, `src/network.rs::process_incoming_frame`, `src/types.rs::ApiState::latest_epoch_tick`, and `src/grpc_api::GrpcService::get_status` | Deliberate trust adaptation governed by ADR-0002: the greatest structurally valid epoch/tick from one peer is published before routing, locks, or crypto admission. Unit tests cover both message types, malformed BroadcastTick rejection, and lock-free cache publication. This restores availability but is not Core-equivalent authentication. |
+| Keep malformed framing from reaching the status cache | Core request/response headers carry the exact 24-bit frame size and message type | `src/frame::{extract_frames,parse_tick_status_from_frame}` | Exact-size structural parity is retained; delayed lower packed values cannot regress the atomic cache. |
+
+The previous 451-vote `BroadcastTick` signature/quorum state was supporting an
+older locally strengthened status policy, not a current RandomClient
+requirement. It has been removed from the runtime status path. Signed computor
+lists remain required to authenticate current-epoch TickData, and transaction
+signatures remain verified before broadcast. QubicLightNode emits a startup
+warning and `GetStatus` explicitly reports zero for unavailable initial-tick,
+duration, and vote metadata.
+
+The separately authorized breaking change in ADR-0003 removes legacy
+`GetBalance` from the protobuf, service, peer query path, proof state, and
+tests. Current RandomClient already exposes and calls exactly the remaining
+four RPCs, so its production call paths are unchanged. Older audit sections
+below are retained as historical evidence and are superseded where they claim
+authenticated quorum status or a retained balance RPC.
+
+Verification completed for this implementation:
+
+- `cargo fmt --all`: passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  passed.
+- `cargo test --workspace --all-targets --all-features`: passed, with 110
+  QubicLightNode tests and 5 FourQ verifier tests.
+- Current RandomClient
+  `cargo test --all-targets --all-features`: passed, with 47 library tests; its
+  generated client compiled against the same four-RPC boundary.
+- `git diff --check`: passed for both worktrees.
+
+GitNexus `detect_changes` reported CRITICAL impact across 32 indexed processes,
+centered on `process_incoming_frame`, service startup, and removed balance/tick
+verification paths. Every live affected production path was reviewed directly
+and is covered by the checks above. The index is stale relative to this
+worktree: its context still names removed symbols such as
+`tick_verification_digest`, `query_balance`, and the old
+`unverified_tick_does_not_update_atomic_cache` test. Those graph-only references
+were treated as historical rather than authoritative.
+
+---
+
+## Authenticated Tick-Transaction Presence API (2026-08-03)
+
+This task used the following point-in-time sources before implementation:
+
+| Repository | Revision / worktree state used |
+| --- | --- |
+| QubicLightNode | `8f035b4171103647c3cdaeb8cf8c48036a8f15c8` on `main`; clean before this task |
+| RandomClient | `0b180b6deaec7a491c3cba1e58fe4337fbe2043e` on `main`; the current counter/empty-check changes in `README.md`, both architecture documents, `proto/lightnode.proto`, and `src/{app,backend,config,console,engine}.rs` are the production-consumer worktree |
+| QThirtyFour Core | `f55b46126c99a1c3f3266164c744b3d0cd694d9c`; relevant `src/` files were unchanged, while the unrelated tracked `test/test.vcxproj` modification and untracked local artifacts were left untouched |
+
+Traceability for the new required operation:
+
+| RandomClient requirement and caller | Core source and invariant | QubicLightNode implementation | Status and parity evidence |
+| --- | --- | --- | --- |
+| Delayed empty-tick monitoring through `src/backend.rs::NetworkBackend::tick_has_transactions` and `QlnBackend::tick_has_transactions` | `core/src/network_messages/tick.h::{RequestTickData, TickData}` and message IDs 16/8; `core/src/qubic.cpp::{processRequestTickData, processBroadcastFutureTickData}` require exact layout, requested-tick response correlation, designated leader, calendar bounds, unique non-zero transaction digests, K12 over the unsigned body with type XOR, and a valid FourQ signature | `src/frame.rs::{build_request_tick_data_frame,TICK_DATA_PAYLOAD_SIZE}`, `src/peer_api::{query_tick_data,receive_tick_data}`, `src/verified.rs::TrustedNetworkState::verify_tick_data`, and `src/grpc_api::GrpcService::get_tick_transactions` | Core-compatible adaptation: the gRPC response exposes only whether the authenticated digest array contains a non-zero entry. A `HashSet` implements Core's duplicate-digest rejection with the same result and bounded memory. Unit and peer-routing tests cover exact wire bytes, empty/non-empty results, wrong tick, duplicate digest, bad signature, cleanup, and peer penalty. |
+
+Only current-epoch TickData can be authenticated because this reduced node keeps
+the active arbitrator-authenticated computor list. Calendar validation includes
+Core's five-second future-time ceiling, and the minimum configurable frame size
+is now the 139,384-byte TickData response frame. Missing prior-epoch keys,
+`END_RESPONSE`, `TRY_AGAIN`, timeout, and local overload fail closed and let
+RandomClient retry without changing counters. FourQ/K12 verification runs on a
+blocking worker, outside Tokio state locks.
+
+The service schema now contains the four current RandomClient RPCs plus legacy
+`GetBalance`. Removing that existing public method was intentionally not folded
+into this counter task because it is a separately authorized breaking change;
+the older audit sections below remain point-in-time evidence for its proof
+path.
+
+Verification completed for the implementation before the final documentation
+pass:
+
+- `cargo fmt --all`: passed.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  passed.
+- `cargo test --workspace --all-targets --all-features`: QubicLightNode **134
+  passed, 0 failed**; FourQ verifier **5 passed, 0 failed**.
+- GitNexus `detect_changes` against `main`: **HIGH**, with 57 mapped changed
+  symbols and 7 affected indexed flows. The flows are the expected frame-size,
+  pending-response, and adjacent network/balance tests; the committed index
+  attributes new inserted ranges to neighboring old symbols and an older ADR
+  heading, so the reviewed source diff and full test suite are authoritative
+  for the new TickData symbols.
 
 ---
 

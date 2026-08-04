@@ -1,13 +1,14 @@
-use crate::codec::{parse_wallet_public_key, tx_id_from_bytes};
+use crate::codec::tx_id_from_bytes;
 use crate::frame::{
     MAX_CONTRACT_FUNCTION_INPUT_SIZE, MAX_NUMBER_OF_CONTRACTS, validate_transaction,
 };
 use crate::lightnodepb;
 use crate::network::broadcast_transaction_to_network;
-use crate::peer_api::{query_balance, query_contract_function};
-use crate::types::{ApiState, BalanceResponse, TickStatus};
+use crate::peer_api::{query_contract_function, query_tick_data};
+use crate::types::{ApiState, TickStatus, unpack_epoch_tick};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -53,13 +54,20 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
         &self,
         _request: Request<lightnodepb::GetStatusRequest>,
     ) -> Result<Response<lightnodepb::GetStatusResponse>, Status> {
-        let cached = self.api.trusted_network.status();
-        if let Some(status) = cached {
+        let cached = unpack_epoch_tick(self.api.latest_epoch_tick.load(Ordering::Relaxed));
+        if let Some((epoch, tick)) = cached {
             Ok(Response::new(lightnodepb::GetStatusResponse {
                 ok: true,
-                source: "verified_tick_quorum".to_string(),
-                status: Some(map_tick_status(status)),
-                warning: "Epoch and tick are backed by a verified 451-computor quorum; initial_tick and tick_duration_ms are unavailable and returned as zero."
+                source: "structural_tick_cache".to_string(),
+                status: Some(map_tick_status(TickStatus {
+                    epoch,
+                    tick,
+                    initial_tick: 0,
+                    tick_duration_ms: 0,
+                    aligned_votes: 0,
+                    misaligned_votes: 0,
+                })),
+                warning: "Epoch and tick come from one structurally valid but unauthenticated peer message; initial_tick, tick_duration_ms, aligned_votes, and misaligned_votes are unavailable and returned as zero."
                     .to_string(),
                 error: String::new(),
             }))
@@ -72,44 +80,6 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
                 error: "No tick data in local cache yet. Wait for incoming network messages."
                     .to_string(),
             }))
-        }
-    }
-
-    async fn get_balance(
-        &self,
-        request: Request<lightnodepb::GetBalanceRequest>,
-    ) -> Result<Response<lightnodepb::GetBalanceResponse>, Status> {
-        let wallet = request.into_inner().wallet;
-        let public_key = parse_wallet_public_key(&wallet).map_err(Status::invalid_argument)?;
-        let Some(_permit) = self.try_acquire_peer_query_slot() else {
-            return Ok(Response::new(lightnodepb::GetBalanceResponse {
-                ok: false,
-                balance: None,
-                error: PEER_QUERY_OVERLOADED_ERROR.to_string(),
-            }));
-        };
-
-        match query_balance(
-            Arc::clone(&self.api.node_state),
-            Arc::clone(&self.api.pending_requests),
-            Arc::clone(&self.api.outbound_budget),
-            Arc::clone(&self.api.trusted_network),
-            Arc::clone(&self.api.config),
-            &wallet,
-            public_key,
-        )
-        .await
-        {
-            Ok(balance) => Ok(Response::new(lightnodepb::GetBalanceResponse {
-                ok: true,
-                balance: Some(map_balance(balance)),
-                error: String::new(),
-            })),
-            Err(err) => Ok(Response::new(lightnodepb::GetBalanceResponse {
-                ok: false,
-                balance: None,
-                error: err.to_string(),
-            })),
         }
     }
 
@@ -157,6 +127,45 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
             Err(err) => Ok(Response::new(lightnodepb::QueryContractFunctionResponse {
                 ok: false,
                 output: Vec::new(),
+                error: err.to_string(),
+            })),
+        }
+    }
+
+    async fn get_tick_transactions(
+        &self,
+        request: Request<lightnodepb::GetTickTransactionsRequest>,
+    ) -> Result<Response<lightnodepb::GetTickTransactionsResponse>, Status> {
+        let tick = request.into_inner().tick;
+        let Some(_permit) = self.try_acquire_peer_query_slot() else {
+            return Ok(Response::new(lightnodepb::GetTickTransactionsResponse {
+                ok: false,
+                tick,
+                has_transactions: false,
+                error: PEER_QUERY_OVERLOADED_ERROR.to_string(),
+            }));
+        };
+
+        match query_tick_data(
+            Arc::clone(&self.api.node_state),
+            Arc::clone(&self.api.pending_requests),
+            Arc::clone(&self.api.outbound_budget),
+            Arc::clone(&self.api.trusted_network),
+            Arc::clone(&self.api.config),
+            tick,
+        )
+        .await
+        {
+            Ok(has_transactions) => Ok(Response::new(lightnodepb::GetTickTransactionsResponse {
+                ok: true,
+                tick,
+                has_transactions,
+                error: String::new(),
+            })),
+            Err(err) => Ok(Response::new(lightnodepb::GetTickTransactionsResponse {
+                ok: false,
+                tick,
+                has_transactions: false,
                 error: err.to_string(),
             })),
         }
@@ -391,22 +400,6 @@ fn map_tick_status(status: TickStatus) -> lightnodepb::TickStatus {
     }
 }
 
-fn map_balance(balance: BalanceResponse) -> lightnodepb::Balance {
-    lightnodepb::Balance {
-        wallet: balance.wallet,
-        public_key_hex: balance.public_key_hex,
-        tick: balance.tick,
-        spectrum_index: balance.spectrum_index,
-        incoming_amount: balance.incoming_amount,
-        outgoing_amount: balance.outgoing_amount,
-        balance: balance.balance,
-        number_of_incoming_transfers: balance.number_of_incoming_transfers,
-        number_of_outgoing_transfers: balance.number_of_outgoing_transfers,
-        latest_incoming_transfer_tick: balance.latest_incoming_transfer_tick,
-        latest_outgoing_transfer_tick: balance.latest_outgoing_transfer_tick,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +444,7 @@ mod tests {
             api: ApiState {
                 node_state,
                 pending_requests: Arc::new(crate::pending::PendingRequests::default()),
+                latest_epoch_tick: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 trusted_network: Arc::new(crate::verified::TrustedNetworkState::default()),
                 outbound_budget,
                 config: test_config(),
@@ -472,13 +466,12 @@ mod tests {
         assert_eq!(proto.matches("  rpc ").count(), 4);
         for method in [
             "GetStatus",
-            "GetBalance",
+            "GetTickTransactions",
             "QueryContractFunction",
             "BroadcastTransaction",
         ] {
             assert!(proto.contains(&format!("rpc {method}(")));
         }
-        assert!(!proto.contains("TickTransactions"));
     }
 
     #[tokio::test]
@@ -648,10 +641,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let overloaded = LightNode::get_balance(
+        let overloaded = LightNode::query_contract_function(
             &service,
-            Request::new(lightnodepb::GetBalanceRequest {
-                wallet: format!("0x{}", "00".repeat(32)),
+            Request::new(lightnodepb::QueryContractFunctionRequest {
+                contract_index: 3,
+                input_type: 2,
+                input: vec![1],
             }),
         )
         .await
@@ -780,7 +775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_status_without_quorum_does_not_wait_for_node_state_lock() {
+    async fn get_status_without_cached_tick_does_not_wait_for_node_state_lock() {
         let node_state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
         let service = test_service(Arc::clone(&node_state));
         let _guard = node_state.lock().await;
@@ -796,6 +791,37 @@ mod tests {
 
         assert_eq!(response.ok, false);
         assert!(response.error.contains("No tick data"));
+    }
+
+    #[tokio::test]
+    async fn get_status_returns_unauthenticated_atomic_cache() {
+        let node_state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
+        let service = test_service(node_state);
+        service
+            .api
+            .latest_epoch_tick
+            .store(crate::types::pack_epoch_tick(7, 123), Ordering::Relaxed);
+
+        let response =
+            LightNode::get_status(&service, Request::new(lightnodepb::GetStatusRequest {}))
+                .await
+                .expect("status should return")
+                .into_inner();
+
+        assert_eq!(response.ok, true);
+        assert_eq!(response.source, "structural_tick_cache");
+        assert!(response.warning.contains("unauthenticated peer message"));
+        assert_eq!(
+            response.status,
+            Some(lightnodepb::TickStatus {
+                epoch: 7,
+                tick: 123,
+                initial_tick: 0,
+                tick_duration_ms: 0,
+                aligned_votes: 0,
+                misaligned_votes: 0,
+            })
+        );
     }
 
     #[tokio::test]

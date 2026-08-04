@@ -39,8 +39,6 @@ pub(crate) enum ProtocolViolationReason {
     MalformedComputors,
     InvalidComputorSignature,
     MalformedTick,
-    InvalidTickSignature,
-    TickEquivocation,
     InvalidApiResponse,
 }
 
@@ -54,8 +52,6 @@ impl std::fmt::Display for ProtocolViolationReason {
             Self::MalformedComputors => formatter.write_str("malformed computor broadcast"),
             Self::InvalidComputorSignature => formatter.write_str("invalid computor signature"),
             Self::MalformedTick => formatter.write_str("malformed tick broadcast"),
-            Self::InvalidTickSignature => formatter.write_str("invalid tick signature"),
-            Self::TickEquivocation => formatter.write_str("tick equivocation"),
             Self::InvalidApiResponse => formatter.write_str("invalid peer API response"),
         }
     }
@@ -710,8 +706,6 @@ mod tests {
             ProtocolViolationReason::MalformedComputors,
             ProtocolViolationReason::InvalidComputorSignature,
             ProtocolViolationReason::MalformedTick,
-            ProtocolViolationReason::InvalidTickSignature,
-            ProtocolViolationReason::TickEquivocation,
             ProtocolViolationReason::InvalidApiResponse,
         ];
 
@@ -723,8 +717,6 @@ mod tests {
                 "malformed computor broadcast",
                 "invalid computor signature",
                 "malformed tick broadcast",
-                "invalid tick signature",
-                "tick equivocation",
                 "invalid peer API response",
             ]
         );

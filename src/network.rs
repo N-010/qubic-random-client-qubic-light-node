@@ -1,10 +1,10 @@
 use crate::config::Config;
 use crate::frame::{
-    BROADCAST_COMPUTORS_PAYLOAD_SIZE, BROADCAST_COMPUTORS_TYPE, BROADCAST_TICK_PAYLOAD_SIZE,
-    BROADCAST_TICK_TYPE, BROADCAST_TRANSACTION_TYPE, END_RESPONSE_TYPE,
-    EXCHANGE_PUBLIC_PEERS_FRAME_SIZE, EXCHANGE_PUBLIC_PEERS_TYPE, HEADER_SIZE,
-    REQUEST_COMPUTORS_TYPE, build_exchange_public_peers_frame, build_request_frame,
-    decode_frame_size, frame_meta, frame_payload, message_type_name, parse_exchange_public_peers,
+    BROADCAST_COMPUTORS_PAYLOAD_SIZE, BROADCAST_COMPUTORS_TYPE, BROADCAST_TICK_TYPE,
+    BROADCAST_TRANSACTION_TYPE, END_RESPONSE_TYPE, EXCHANGE_PUBLIC_PEERS_FRAME_SIZE,
+    EXCHANGE_PUBLIC_PEERS_TYPE, HEADER_SIZE, REQUEST_COMPUTORS_TYPE,
+    build_exchange_public_peers_frame, build_request_frame, decode_frame_size, frame_meta,
+    frame_payload, message_type_name, parse_exchange_public_peers, parse_tick_status_from_frame,
 };
 use crate::pending::{DeliveryOutcome, PendingEvent, PendingRequests, PendingSpec, ResponseRule};
 use crate::state::{
@@ -12,9 +12,7 @@ use crate::state::{
     OutboundFrame, PeerPoolStats, ProtocolViolationReason, RelayTarget,
 };
 use crate::types::{format_epoch_tick_packed, pack_epoch_tick};
-use crate::verified::{
-    ComputorVerification, TickVerification, TrustedNetworkState, unix_time_millis,
-};
+use crate::verified::{ComputorVerification, TrustedNetworkState};
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddrV4;
 use std::sync::Arc;
@@ -935,14 +933,6 @@ fn computor_verification_digest(payload: &[u8]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-fn tick_verification_digest(payload: &[u8], generation: u64) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"qubic-tick\0");
-    hasher.update(payload);
-    hasher.update(&generation.to_le_bytes());
-    *hasher.finalize().as_bytes()
-}
-
 fn commit_dedup(dedup: &Arc<DedupWindow>, digest: [u8; 32]) {
     if let Ok(reservation) = dedup.reserve(digest) {
         reservation.commit();
@@ -977,6 +967,19 @@ async fn process_incoming_frame(
 
     let message_type = frame[3];
     let dejavu = u32::from_le_bytes([frame[4], frame[5], frame[6], frame[7]]);
+
+    let tick_update = parse_tick_status_from_frame(&frame);
+    if message_type == BROADCAST_TICK_TYPE && tick_update.is_none() {
+        return protocol_violation(
+            source_peer_id,
+            &resources,
+            ProtocolViolationReason::MalformedTick,
+        )
+        .await;
+    }
+    if let Some(status) = tick_update {
+        update_latest_epoch_tick(&resources.latest_epoch_tick, status.epoch, status.tick);
+    }
 
     if dejavu != 0 {
         match resources
@@ -1090,121 +1093,6 @@ async fn process_incoming_frame(
         }
     }
 
-    if message_type == BROADCAST_TICK_TYPE {
-        let Ok(payload) = frame_payload(&frame) else {
-            return protocol_violation(
-                source_peer_id,
-                &resources,
-                ProtocolViolationReason::MalformedTick,
-            )
-            .await;
-        };
-        if payload.len() != BROADCAST_TICK_PAYLOAD_SIZE {
-            return protocol_violation(
-                source_peer_id,
-                &resources,
-                ProtocolViolationReason::MalformedTick,
-            )
-            .await;
-        }
-        let received_at = unix_time_millis();
-        let context = match resources.trusted_network.tick_context(payload, received_at) {
-            Ok(context) => context,
-            Err(TickVerification::Malformed) => {
-                return protocol_violation(
-                    source_peer_id,
-                    &resources,
-                    ProtocolViolationReason::MalformedTick,
-                )
-                .await;
-            }
-            Err(TickVerification::Deferred | TickVerification::AuthenticatedStale) => {
-                return FrameProcessingOutcome::Continue;
-            }
-            Err(
-                TickVerification::BadSignature
-                | TickVerification::Duplicate
-                | TickVerification::Equivocation
-                | TickVerification::Accepted
-                | TickVerification::Quorum(_),
-            ) => unreachable!("tick context cannot report a post-authentication outcome"),
-        };
-        let digest = tick_verification_digest(payload, context.generation());
-        if resources.signed_invalid.contains(&digest) {
-            return protocol_violation(
-                source_peer_id,
-                &resources,
-                ProtocolViolationReason::InvalidTickSignature,
-            )
-            .await;
-        }
-        let verification = match resources.signed_replay.reserve(digest) {
-            Err(DedupReservationError::AlreadyCommitted) => {
-                resources.trusted_network.apply_tick(context, payload)
-            }
-            Err(DedupReservationError::InFlight) => return FrameProcessingOutcome::Continue,
-            Ok(replay_reservation) => {
-                let Ok(verification_permit) =
-                    Arc::clone(&resources.verification_slots).try_acquire_owned()
-                else {
-                    return FrameProcessingOutcome::Continue;
-                };
-                let trusted = Arc::clone(&resources.trusted_network);
-                let invalid = Arc::clone(&resources.signed_invalid);
-                let payload = payload.to_vec();
-                let Ok(verification) = tokio::task::spawn_blocking(move || {
-                    let _verification_permit = verification_permit;
-                    if trusted.tick_signature_is_valid(&payload, context) {
-                        replay_reservation.commit();
-                        trusted.apply_tick(context, &payload)
-                    } else {
-                        drop(replay_reservation);
-                        commit_dedup(&invalid, digest);
-                        TickVerification::BadSignature
-                    }
-                })
-                .await
-                else {
-                    return FrameProcessingOutcome::Continue;
-                };
-                verification
-            }
-        };
-        match verification {
-            TickVerification::Malformed => {
-                return protocol_violation(
-                    source_peer_id,
-                    &resources,
-                    ProtocolViolationReason::MalformedTick,
-                )
-                .await;
-            }
-            TickVerification::BadSignature => {
-                return protocol_violation(
-                    source_peer_id,
-                    &resources,
-                    ProtocolViolationReason::InvalidTickSignature,
-                )
-                .await;
-            }
-            TickVerification::Equivocation => {
-                return protocol_violation(
-                    source_peer_id,
-                    &resources,
-                    ProtocolViolationReason::TickEquivocation,
-                )
-                .await;
-            }
-            TickVerification::Quorum(status) => {
-                update_latest_epoch_tick(&resources.latest_epoch_tick, status.epoch, status.tick);
-            }
-            TickVerification::Deferred
-            | TickVerification::AuthenticatedStale
-            | TickVerification::Duplicate
-            | TickVerification::Accepted => {}
-        }
-    }
-
     if message_type == EXCHANGE_PUBLIC_PEERS_TYPE {
         let source_ip = {
             let locked = resources.state.lock().await;
@@ -1227,7 +1115,7 @@ async fn process_incoming_frame(
 fn update_latest_epoch_tick(latest: &AtomicU64, epoch: u16, tick: u32) {
     let candidate = pack_epoch_tick(epoch, tick);
     let _ = latest.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        (candidate >= current).then_some(candidate)
+        (candidate > current).then_some(candidate)
     });
 }
 
@@ -1259,7 +1147,7 @@ fn add_discovered_peers(
 mod tests {
     use super::*;
     use crate::config::{Config, DEFAULT_GRPC_PORT, DEFAULT_PORT};
-    use crate::frame::{COMPUTORS_PUBLIC_KEYS_SIZE, REQUEST_ENTITY_TYPE};
+    use crate::frame::{COMPUTORS_PUBLIC_KEYS_SIZE, RESPOND_CURRENT_TICK_INFO_TYPE};
     use pretty_assertions::assert_eq;
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::net::TcpListener;
@@ -1319,7 +1207,7 @@ mod tests {
 
     #[test]
     fn frame_extraction_waits_for_partial_header_and_payload() {
-        let expected = build_request_frame(REQUEST_ENTITY_TYPE, 7, &[1, 2, 3, 4])
+        let expected = build_request_frame(REQUEST_COMPUTORS_TYPE, 7, &[1, 2, 3, 4])
             .expect("test frame should build");
         let mut buffered = BytesMut::new();
         buffered.extend_from_slice(&expected[..4]);
@@ -1338,7 +1226,7 @@ mod tests {
 
     #[test]
     fn frame_extraction_returns_multiple_frames_from_one_read() {
-        let first = build_request_frame(REQUEST_ENTITY_TYPE, 1, &[1])
+        let first = build_request_frame(REQUEST_COMPUTORS_TYPE, 1, &[1])
             .expect("first test frame should build");
         let second = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &[2, 3])
             .expect("second test frame should build");
@@ -1422,7 +1310,7 @@ mod tests {
         let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
         let _guard = state.lock().await;
         let frame = Bytes::from(
-            build_request_frame(REQUEST_ENTITY_TYPE, 1, &[]).expect("test frame should build"),
+            build_request_frame(REQUEST_COMPUTORS_TYPE, 1, &[]).expect("test frame should build"),
         );
 
         tokio::time::timeout(
@@ -1531,7 +1419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unverified_tick_does_not_update_atomic_cache() {
+    async fn structurally_valid_broadcast_tick_updates_atomic_cache_without_state_lock() {
         let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
         let _guard = state.lock().await;
         let latest = Arc::new(AtomicU64::new(0));
@@ -1562,7 +1450,43 @@ mod tests {
         .await
         .expect("tick response must not wait for NodeState");
 
-        assert_eq!(latest.load(Ordering::Relaxed), 0);
+        assert_eq!(latest.load(Ordering::Relaxed), pack_epoch_tick(7, 123));
+    }
+
+    #[tokio::test]
+    async fn structurally_valid_current_tick_info_updates_atomic_cache() {
+        let latest = Arc::new(AtomicU64::new(0));
+        let mut payload = [0; crate::frame::RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE];
+        payload[2..4].copy_from_slice(&8u16.to_le_bytes());
+        payload[4..8].copy_from_slice(&456u32.to_le_bytes());
+        let frame = Bytes::from(
+            build_request_frame(RESPOND_CURRENT_TICK_INFO_TYPE, 0, &payload)
+                .expect("current tick frame should build"),
+        );
+
+        process_incoming_frame(
+            1,
+            frame,
+            network_resources(
+                Arc::new(Mutex::new(NodeState::new(10, &[]))),
+                Arc::new(PendingRequests::default()),
+                Arc::clone(&latest),
+                test_config(),
+            ),
+        )
+        .await;
+
+        assert_eq!(latest.load(Ordering::Relaxed), pack_epoch_tick(8, 456));
+    }
+
+    #[test]
+    fn atomic_tick_cache_never_regresses() {
+        let latest = AtomicU64::new(pack_epoch_tick(8, 456));
+
+        update_latest_epoch_tick(&latest, 8, 455);
+        update_latest_epoch_tick(&latest, 7, u32::MAX);
+
+        assert_eq!(latest.load(Ordering::Relaxed), pack_epoch_tick(8, 456));
     }
 
     #[tokio::test]
@@ -1764,7 +1688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saturated_signature_gate_defers_without_queueing_blocking_work() {
+    async fn saturated_computor_signature_gate_skips_without_blocking_peer_reader() {
         let resources = network_resources(
             Arc::new(Mutex::new(NodeState::new(10, &[]))),
             Arc::new(PendingRequests::default()),
@@ -1772,7 +1696,7 @@ mod tests {
             test_config(),
         );
         let permit_count = resources.verification_slots.available_permits() as u32;
-        let _all_permits = Arc::clone(&resources.verification_slots)
+        let all_permits = Arc::clone(&resources.verification_slots)
             .try_acquire_many_owned(permit_count)
             .expect("test should saturate the verification gate");
         let mut payload = vec![0; BROADCAST_COMPUTORS_PAYLOAD_SIZE];
@@ -1783,13 +1707,14 @@ mod tests {
                 .expect("test computor frame should build"),
         );
 
-        let verification = tokio::spawn(process_incoming_frame(1, frame, resources.clone()));
-        tokio::task::yield_now().await;
-        assert!(verification.is_finished());
-        drop(_all_permits);
-        verification.await.expect("verification task should finish");
-
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            process_incoming_frame(1, frame, resources.clone()),
+        )
+        .await
+        .expect("saturated verification must not block the peer reader");
         assert!(!resources.signed_invalid.contains(&digest));
+        drop(all_permits);
     }
 
     #[tokio::test]

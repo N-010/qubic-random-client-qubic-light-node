@@ -110,14 +110,6 @@ fn qubic_identity(public_key: &[u8; 32], lowercase: bool) -> String {
     String::from_utf8(identity.to_vec()).expect("Qubic identity contains only ASCII letters")
 }
 
-pub(crate) fn bytes_to_hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
 pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let chunk = bytes.get(offset..offset + 2)?;
     Some(u16::from_le_bytes([chunk[0], chunk[1]]))
@@ -126,11 +118,6 @@ pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
 pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     let chunk = bytes.get(offset..offset + 4)?;
     Some(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-}
-
-pub(crate) fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
-    let chunk = bytes.get(offset..offset + 4)?;
-    Some(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
 }
 
 pub(crate) fn read_i64(bytes: &[u8], offset: usize) -> Option<i64> {

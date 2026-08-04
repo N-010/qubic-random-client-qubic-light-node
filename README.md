@@ -5,11 +5,10 @@
 required behavior from `D:\Work\MySelf\Qubic\QThirtyFour\core`; it is not a
 general relay node.
 
-Version `0.3.0` exposes exactly the four operations used by RandomClient:
+The current service exposes the four operations used by RandomClient:
 
-- authenticated current epoch/tick status;
-- balance lookup with a Merkle proof bound to a spectrum root from verified
-  tick quorum state;
+- current epoch/tick status from one structurally valid public-peer message;
+- authenticated current-epoch tick transaction-presence lookup;
 - read-only contract-function query with raw input and output bytes;
 - validation and broadcast of an already signed transaction.
 
@@ -53,14 +52,18 @@ The principal options are `--peer`, `--peer-port`, `--target-outbound`,
 
 Service: `lightnode.LightNode`
 
-- `GetStatus` returns only tick state confirmed by at least 451 distinct valid
-  FourQ signatures from an arbitrator-signed computor list.
-- `GetBalance` validates the exact Core `RespondEntity` layout, request public
-  key, arithmetic, spectrum index, and 24-level K12 Merkle path against a
-  verified spectrum root for the reported tick or its immediate successor.
-  The two-tick window mirrors Core's concurrent entity-response and tick-state
-  transition. An absent entity (`spectrumIndex == -1`), an incomplete root
-  window, or a proof mismatch fails closed.
+- `GetStatus` returns the greatest epoch/tick observed in one exact-size,
+  structurally valid Core `BroadcastTick` or `RespondCurrentTickInfo` message.
+  This fast path deliberately performs no signature or quorum authentication;
+  the accepted availability/security tradeoff is documented in
+  `docs/adr/0002-unauthenticated-tick-status.md` and warned about at startup.
+- `GetTickTransactions` sends Core `RequestTickData` to up to three existing
+  peer sessions and accepts only an exact-size `TickData` for the requested
+  tick whose leader index, calendar fields, unique non-zero transaction
+  digests, current-epoch computor key, K12 digest, and FourQ signature are
+  valid. The response exposes only `has_transactions`; it never returns raw
+  transactions or trusts an unsigned peer claim. `--max-frame-bytes` cannot be
+  configured below the 139,384-byte Core TickData response frame.
 - `QueryContractFunction` races up to three existing public-peer sessions and
   returns the first valid non-empty Core response. This response is not
   cryptographically authenticated. The accepted risk and revisit criteria are
@@ -71,8 +74,8 @@ Service: `lightnode.LightNode`
   canonical FourQ signature before any network fanout. `ok=true` means the
   validated bytes were queued to at least one peer; it is not confirmation.
 
-The canonical schema is `proto/lightnode.proto`. RandomClient must regenerate
-its client from the matching schema whenever this file changes.
+The canonical server schema is `proto/lightnode.proto` and contains exactly
+the four current RandomClient operations.
 
 ## Operational behavior
 
@@ -81,7 +84,9 @@ its client from the matching schema whenever this file changes.
 - Computor broadcasts accept the canonical Core payload plus its permitted
   zero-to-four bytes of C++ struct padding; only the signed canonical prefix is
   authenticated.
-- Tick votes use the exact 352-byte layout and Core's wire-year leap rule.
+- Tick status accepts only the exact Core 352-byte `BroadcastTick` or 16-byte
+  `RespondCurrentTickInfo` payload layout. The cached packed epoch/tick value is
+  monotonic, so delayed lower values do not move status backwards.
 - Request/response correlation uses `dejavu`; bounded pending routes enforce
   response types, frame counts, total bytes, and deadlines.
 - Peer queues and the shared byte budget are bounded. A peer-specific queue
@@ -92,10 +97,10 @@ its client from the matching schema whenever this file changes.
 
 ## Trust boundary
 
-Status, balance proof roots, balance proofs, and submitted transaction
-signatures are locally verified. Contract-function output remains trusted on
-the first responding public peer by explicit architectural decision. Do not
-use that output as authenticated consensus state.
+Computor lists, TickData, and submitted transaction signatures are locally
+verified. Tick status and contract-function output are explicit unauthenticated
+public-peer trust exceptions governed by ADR-0002 and ADR-0001 respectively.
+Do not use either result as authenticated consensus state.
 
 ## Verification
 

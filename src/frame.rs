@@ -1,5 +1,4 @@
 use crate::codec::{kangaroo_twelve, read_i64, read_u16, read_u32};
-#[cfg(test)]
 use crate::types::TickStatus;
 use qubic_fourq_verifier::verify_digest;
 use rand::Rng;
@@ -14,18 +13,18 @@ pub(crate) const EXCHANGE_PUBLIC_PEERS_FRAME_SIZE: usize =
 
 pub(crate) const BROADCAST_COMPUTORS_TYPE: u8 = 2;
 pub(crate) const BROADCAST_TICK_TYPE: u8 = 3;
+pub(crate) const BROADCAST_FUTURE_TICK_DATA_TYPE: u8 = 8;
 pub(crate) const REQUEST_COMPUTORS_TYPE: u8 = 11;
+pub(crate) const REQUEST_TICK_DATA_TYPE: u8 = 16;
 pub(crate) const BROADCAST_TRANSACTION_TYPE: u8 = 24;
-#[cfg(test)]
 pub(crate) const RESPOND_CURRENT_TICK_INFO_TYPE: u8 = 28;
-pub(crate) const REQUEST_ENTITY_TYPE: u8 = 31;
-pub(crate) const RESPOND_ENTITY_TYPE: u8 = 32;
 pub(crate) const END_RESPONSE_TYPE: u8 = 35;
 pub(crate) const REQUEST_CONTRACT_FUNCTION_TYPE: u8 = 42;
 pub(crate) const RESPOND_CONTRACT_FUNCTION_TYPE: u8 = 43;
 pub(crate) const TRY_AGAIN_TYPE: u8 = 54;
 
 pub(crate) const NUMBER_OF_COMPUTORS: usize = 676;
+pub(crate) const NUMBER_OF_TRANSACTIONS_PER_TICK: usize = 4096;
 pub(crate) const MAX_NUMBER_OF_CONTRACTS: u32 = 1024;
 pub(crate) const MAX_INPUT_SIZE: usize = 1024;
 pub(crate) const MAX_CONTRACT_FUNCTION_INPUT_SIZE: usize = u16::MAX as usize;
@@ -33,16 +32,15 @@ pub(crate) const MAX_CONTRACT_FUNCTION_OUTPUT_SIZE: usize = u16::MAX as usize;
 pub(crate) const MAX_AMOUNT: i64 = 1_000_000_000_000_000;
 pub(crate) const TRANSACTION_BASE_SIZE: usize = 80;
 pub(crate) const SIGNATURE_SIZE: usize = 64;
-pub(crate) const SPECTRUM_DEPTH: usize = 24;
-pub(crate) const SPECTRUM_CAPACITY: i32 = 1 << SPECTRUM_DEPTH;
-pub(crate) const RESPOND_ENTITY_PAYLOAD_SIZE: usize = 64 + 8 + 32 * SPECTRUM_DEPTH;
 pub(crate) const BROADCAST_TICK_PAYLOAD_SIZE: usize = 352;
+pub(crate) const TICK_DATA_UNSIGNED_SIZE: usize =
+    8 + 8 + 32 + NUMBER_OF_TRANSACTIONS_PER_TICK * 32 + 8 * MAX_NUMBER_OF_CONTRACTS as usize;
+pub(crate) const TICK_DATA_PAYLOAD_SIZE: usize = TICK_DATA_UNSIGNED_SIZE + SIGNATURE_SIZE;
+pub(crate) const TICK_DATA_TRANSACTION_DIGESTS_OFFSET: usize = 8 + 8 + 32;
 pub(crate) const COMPUTORS_PUBLIC_KEYS_SIZE: usize = NUMBER_OF_COMPUTORS * 32;
 pub(crate) const BROADCAST_COMPUTORS_PAYLOAD_SIZE: usize =
     2 + COMPUTORS_PUBLIC_KEYS_SIZE + SIGNATURE_SIZE;
-pub(crate) const MIN_OPERATIONAL_FRAME_BYTES: usize =
-    HEADER_SIZE + 8 + MAX_CONTRACT_FUNCTION_INPUT_SIZE;
-#[cfg(test)]
+pub(crate) const MIN_OPERATIONAL_FRAME_BYTES: usize = HEADER_SIZE + TICK_DATA_PAYLOAD_SIZE;
 pub(crate) const RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE: usize = 16;
 
 pub(crate) fn frame_meta(frame: &[u8]) -> (usize, u8, u32) {
@@ -201,6 +199,11 @@ pub(crate) fn build_request_contract_function_frame(
     build_request_frame(REQUEST_CONTRACT_FUNCTION_TYPE, dejavu, &payload)
 }
 
+pub(crate) fn build_request_tick_data_frame(dejavu: u32, tick: u32) -> Vec<u8> {
+    build_request_frame(REQUEST_TICK_DATA_TYPE, dejavu, &tick.to_le_bytes())
+        .expect("fixed-size tick-data request always fits a Core frame")
+}
+
 pub(crate) fn frame_payload(frame: &[u8]) -> Result<&[u8], String> {
     if frame.len() < HEADER_SIZE {
         return Err("Frame is smaller than header".to_string());
@@ -216,7 +219,6 @@ pub(crate) fn frame_payload(frame: &[u8]) -> Result<&[u8], String> {
     Ok(&frame[HEADER_SIZE..])
 }
 
-#[cfg(test)]
 pub(crate) fn parse_tick_status_from_frame(frame: &[u8]) -> Option<TickStatus> {
     if frame.len() < HEADER_SIZE {
         return None;
@@ -282,7 +284,6 @@ pub(crate) fn random_non_zero_u32() -> u32 {
     }
 }
 
-#[cfg(test)]
 fn parse_current_tick_info_payload(payload: &[u8]) -> Result<TickStatus, String> {
     if payload.len() != RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE {
         return Err(format!(
@@ -444,6 +445,28 @@ mod tests {
     }
 
     #[test]
+    fn builds_request_tick_data_frame_for_current_core_layout() {
+        assert_eq!(
+            build_request_tick_data_frame(0x1122_3344, 0x5566_7788),
+            vec![
+                12,
+                0,
+                0,
+                REQUEST_TICK_DATA_TYPE,
+                0x44,
+                0x33,
+                0x22,
+                0x11,
+                0x88,
+                0x77,
+                0x66,
+                0x55,
+            ]
+        );
+        assert_eq!(TICK_DATA_PAYLOAD_SIZE, 139_376);
+    }
+
+    #[test]
     fn maximum_contract_request_fits_minimum_operational_frame_limit() {
         let frame = build_request_contract_function_frame(
             1,
@@ -453,7 +476,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(frame.len(), MIN_OPERATIONAL_FRAME_BYTES);
+        assert!(frame.len() <= MIN_OPERATIONAL_FRAME_BYTES);
+        assert_eq!(
+            MIN_OPERATIONAL_FRAME_BYTES,
+            HEADER_SIZE + TICK_DATA_PAYLOAD_SIZE
+        );
     }
 
     #[test]

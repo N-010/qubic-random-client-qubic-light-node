@@ -81,12 +81,16 @@ pub(crate) async fn run() -> std::io::Result<()> {
     let grpc_state = ApiState {
         node_state: Arc::clone(&state),
         pending_requests: Arc::clone(&pending_requests),
+        latest_epoch_tick: Arc::clone(&latest_epoch_tick),
         trusted_network: Arc::clone(&trusted_network),
         outbound_budget: Arc::clone(&outbound_budget),
         config: Arc::clone(&shared_config),
     };
     eprintln!(
         "WARNING: QueryContractFunction performs an unauthenticated first-success query against public peers; see docs/adr/0001-unauthenticated-contract-query.md"
+    );
+    eprintln!(
+        "WARNING: GetStatus accepts the greatest structurally valid epoch/tick observed from one public peer without authentication; see docs/adr/0002-unauthenticated-tick-status.md"
     );
 
     let network_resources = NetworkResources::new(

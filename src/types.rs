@@ -4,6 +4,7 @@ use crate::state::NodeState;
 use crate::verified::TrustedNetworkState;
 use serde::Serialize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -39,22 +40,8 @@ pub(crate) fn format_epoch_tick_packed(packed: u64) -> String {
 pub(crate) struct ApiState {
     pub(crate) node_state: Arc<Mutex<NodeState>>,
     pub(crate) pending_requests: Arc<PendingRequests>,
+    pub(crate) latest_epoch_tick: Arc<AtomicU64>,
     pub(crate) trusted_network: Arc<TrustedNetworkState>,
     pub(crate) outbound_budget: Arc<Semaphore>,
     pub(crate) config: Arc<Config>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct BalanceResponse {
-    pub(crate) wallet: String,
-    pub(crate) public_key_hex: String,
-    pub(crate) tick: u32,
-    pub(crate) spectrum_index: i32,
-    pub(crate) incoming_amount: i64,
-    pub(crate) outgoing_amount: i64,
-    pub(crate) balance: i64,
-    pub(crate) number_of_incoming_transfers: u32,
-    pub(crate) number_of_outgoing_transfers: u32,
-    pub(crate) latest_incoming_transfer_tick: u32,
-    pub(crate) latest_outgoing_transfer_tick: u32,
 }

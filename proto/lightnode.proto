@@ -4,7 +4,7 @@ package lightnode;
 
 service LightNode {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
-  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+  rpc GetTickTransactions(GetTickTransactionsRequest) returns (GetTickTransactionsResponse);
   rpc QueryContractFunction(QueryContractFunctionRequest) returns (QueryContractFunctionResponse);
   rpc BroadcastTransaction(BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
 }
@@ -14,7 +14,8 @@ message GetStatusRequest {}
 message TickStatus {
   uint32 epoch = 1;
   uint32 tick = 2;
-  // The quorum vote format does not provide initial_tick or tick_duration_ms.
+  // BroadcastTick does not provide initial_tick or tick_duration_ms. The
+  // structurally parsed cache currently exposes only epoch and tick.
   uint32 initial_tick = 3;
   uint32 tick_duration_ms = 4;
   uint32 aligned_votes = 5;
@@ -29,30 +30,16 @@ message GetStatusResponse {
   string error = 5;
 }
 
-message GetBalanceRequest {
-  string wallet = 1;
+message GetTickTransactionsRequest {
+  uint32 tick = 1;
 }
 
-message Balance {
-  string wallet = 1;
-  string public_key_hex = 2;
-  // Core's reported system tick. The authenticated spectrum root may be
-  // committed by this tick's vote or its immediate successor during a tick transition.
-  uint32 tick = 3;
-  int32 spectrum_index = 4;
-  int64 incoming_amount = 5;
-  int64 outgoing_amount = 6;
-  int64 balance = 7;
-  uint32 number_of_incoming_transfers = 8;
-  uint32 number_of_outgoing_transfers = 9;
-  uint32 latest_incoming_transfer_tick = 10;
-  uint32 latest_outgoing_transfer_tick = 11;
-}
-
-message GetBalanceResponse {
+message GetTickTransactionsResponse {
   bool ok = 1;
-  Balance balance = 2;
-  string error = 3;
+  uint32 tick = 2;
+  // Derived from the transaction-digest array in a FourQ-verified Core TickData.
+  bool has_transactions = 3;
+  string error = 4;
 }
 
 message QueryContractFunctionRequest {
