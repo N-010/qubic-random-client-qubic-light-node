@@ -1,115 +1,155 @@
 # QubicLightNode
 
-`QubicLightNode` is the outbound-only Qubic backend for RandomClient. It is a
-deliberately reduced port of the required Qubic Core behavior; it is not a
-general relay node.
+QubicLightNode is the outbound-only Qubic backend for RandomClient. It keeps a
+small pool of public-peer connections and exposes only the four gRPC operations
+that RandomClient uses. It is a deliberately reduced port of required Qubic
+Core behavior, not a general relay node or a complete Qubic implementation.
 
-The current service exposes the four operations used by RandomClient:
+## Release status
 
-- current epoch/tick status from one structurally valid public-peer message;
-- authenticated current-epoch tick transaction-presence lookup;
-- read-only contract-function query with raw input and output bytes;
-- validation and broadcast of an already signed transaction.
+This repository is being prepared as the compatible QubicLightNode v2.0.0
+release that must precede RandomClient v2.0.0. The crate currently reports
+version `0.3.0`; no v2.0.0 tag, packaged binaries, or checksums are published
+yet. Build and run the matching source checkout for now.
 
-The trust decisions are recorded in `docs/adr/`.
+The gRPC contract is versioned by the matching `proto/lightnode.proto` files in
+QubicLightNode and RandomClient. Do not mix revisions until a compatibility
+point is published.
 
-The matching RandomClient gRPC integration is still being prepared and has
-not been published or tagged. Until a compatibility point is published, use
-the `proto/lightnode.proto` schema from the matching local checkout.
+## Requirements
+
+The repository pins Rust 1.93.0, including `rustfmt` and `clippy`, in
+`rust-toolchain.toml`. A compatible Rust installation automatically selects
+that toolchain when commands are run from the repository.
 
 ## Build and run
 
+Build and verify the workspace:
+
 ```bash
 cargo build --release --locked
+cargo test --workspace --all-targets --all-features --locked
+```
+
+Start the node with DNS bootstrap and the default local gRPC endpoint:
+
+```bash
 cargo run --release --locked
 ```
 
-Manual seed peers can be supplied more than once:
+Manual seed peers can be supplied more than once. A plain IP uses the current
+`--peer-port` value:
 
 ```bash
-cargo run --release --locked -- --peer 1.2.3.4:21841 --peer 5.6.7.8:21841
+cargo run --release --locked -- \
+  --peer 1.2.3.4:21841 \
+  --peer 5.6.7.8:21841
 ```
 
-By default the backend:
-
-- maintains eight outbound Qubic TCP sessions;
-- uses remote Qubic port `21841`;
-- fetches bootstrap peers from `api.qubic.global` when no manual peer is set;
-- serves gRPC on `127.0.0.1:50051`.
-
-It does not listen for inbound Qubic connections, relay arbitrary peer
-traffic, expose an HTTP API, or enable gRPC reflection. To expose gRPC on a
-different address, use `--grpc-listen`, for example:
+Then run the matching RandomClient checkout against it:
 
 ```bash
-cargo run --release --locked -- --grpc-listen 0.0.0.0:50051
+cargo run --release --locked -- \
+  --backend grpc \
+  --endpoint http://127.0.0.1:50051
 ```
 
-Run `cargo run --release -- --help` for the complete generated option list.
-The principal options are `--peer`, `--peer-port`, `--target-outbound`,
-`--max-known-peers`, peer timeout controls, DNS bootstrap controls,
-`--api-timeout-ms`, `--grpc-listen`, and `--traffic-log`.
+Run `cargo run --release --locked -- --help` for the generated CLI reference.
+
+## Configuration
+
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--peer <IP[:PORT]>` | None | Add a manual seed peer; may be repeated. |
+| `--peer-port <PORT>` | `21841` | Set the remote port used for discovery and peer values without a port. |
+| `--target-outbound <N>` | `8` | Set the desired number of outbound Qubic sessions. |
+| `--max-known-peers <N>` | `500` | Bound the in-memory peer set. |
+| `--reconnect-ms <MS>` | `2000` | Set the delay between dial cycles. |
+| `--peer-write-timeout-ms <MS>` | `5000` | Bound one peer-frame write. |
+| `--peer-connect-timeout-ms <MS>` | `5000` | Bound one outbound TCP connection attempt. |
+| `--peer-handshake-timeout-ms <MS>` | `5000` | Bound the mandatory Qubic peer exchange. |
+| `--peer-frame-timeout-ms <MS>` | `30000` | Bound completion of an announced peer frame. |
+| `--max-frame-bytes <BYTES>` | `1048576` | Bound accepted Qubic frames. |
+| `--no-dns-bootstrap` | Disabled | Disable bootstrap requests to `api.qubic.global`. |
+| `--dns-lite-peers <N>` | `0` | Request a DNS peer count; zero selects automatic sizing. |
+| `--dns-timeout-ms <MS>` | `5000` | Bound one DNS bootstrap request. |
+| `--critical-peer-threshold <N>` | `0` | Trigger emergency DNS below this count; zero means half the target, at least one. |
+| `--no-emergency-dns` | Disabled | Disable emergency DNS when the connected pool is critically low. |
+| `--emergency-dns-backoff-initial-ms <MS>` | `10000` | Set the initial emergency-DNS retry backoff. |
+| `--emergency-dns-backoff-max-ms <MS>` | `300000` | Cap emergency-DNS retry backoff. |
+| `--api-timeout-ms <MS>` | `6000` | Set the end-to-end deadline for a peer-backed gRPC query. |
+| `--grpc-listen <IP:PORT>` | `127.0.0.1:50051` | Set the gRPC bind address. |
+| `--traffic-log` | Disabled | Log Qubic frame metadata for diagnostics. |
+
+The configured outbound target must not exceed the known-peer limit. The frame
+limit must be large enough for the exact Core `TickData` response used by
+`GetTickTransactions`.
 
 ## gRPC boundary
 
 Service: `lightnode.LightNode`
 
-- `GetStatus` returns the greatest epoch/tick observed in one exact-size,
-  structurally valid Core `BroadcastTick` or `RespondCurrentTickInfo` message.
-  This fast path deliberately performs no signature or quorum authentication;
-  the accepted availability/security tradeoff is documented in
-  `docs/adr/0002-unauthenticated-tick-status.md` and warned about at startup.
-- `GetTickTransactions` sends Core `RequestTickData` to up to three existing
-  peer sessions and accepts only an exact-size `TickData` for the requested
-  tick whose leader index, calendar fields, unique non-zero transaction
-  digests, current-epoch computor key, K12 digest, and FourQ signature are
-  valid. The response exposes only `has_transactions`; it never returns raw
-  transactions or trusts an unsigned peer claim. `--max-frame-bytes` cannot be
-  configured below the 139,384-byte Core TickData response frame.
-- `QueryContractFunction` races up to three existing public-peer sessions and
-  returns the first valid non-empty Core response. This response is not
-  cryptographically authenticated. The accepted risk and revisit criteria are
-  documented in `docs/adr/0001-unauthenticated-contract-query.md` and a warning
-  is printed at startup.
-- `BroadcastTransaction` enforces the current Core transaction layout and
-  limits, computes the K12 digest of the unsigned bytes, and verifies the
-  canonical FourQ signature before any network fanout. `ok=true` means the
-  validated bytes were queued to at least one peer; it is not confirmation.
+| Method | Result | Trust level |
+| --- | --- | --- |
+| `GetStatus` | Greatest observed epoch/tick | Structurally validated, but unauthenticated single-peer observation. |
+| `GetTickTransactions` | Whether one requested tick contains transaction digests | Authenticated with the active arbitrator-signed computor set and FourQ-verified Core `TickData`. |
+| `QueryContractFunction` | Raw non-empty contract output | First structurally valid response from up to three peers; unauthenticated. |
+| `BroadcastTransaction` | Canonical transaction ID after queueing to at least one peer | Transaction layout and FourQ signature are verified locally; queueing is not execution confirmation. |
 
-The canonical server schema is `proto/lightnode.proto` and contains exactly
-the four current RandomClient operations.
+The schema contains exactly these four methods. There is no balance RPC.
 
-## Operational behavior
+## Operating model
 
-- Peer handshake and discovery use Core message type `0` and the exact
-  24-byte exchange frame.
-- Computor broadcasts accept the canonical Core payload plus its permitted
-  zero-to-four bytes of C++ struct padding; only the signed canonical prefix is
-  authenticated.
-- Tick status accepts only the exact Core 352-byte `BroadcastTick` or 16-byte
-  `RespondCurrentTickInfo` payload layout. The cached packed epoch/tick value is
-  monotonic, so delayed lower values do not move status backwards.
-- Request/response correlation uses `dejavu`; bounded pending routes enforce
-  response types, frame counts, total bytes, and deadlines.
-- Peer queues and the shared byte budget are bounded. A peer-specific queue
-  failure disconnects that peer; global local-memory pressure does not punish
-  healthy peers.
-- Repeated valid transaction submissions are independent broadcasts. The
-  service coalesces only simultaneous submissions of identical bytes.
+- The node opens outbound Qubic TCP connections only. It does not accept
+  inbound Qubic sessions, relay arbitrary traffic, expose HTTP, or enable gRPC
+  reflection.
+- DNS, manual seeds, and peer-exchange gossip feed a bounded peer pool. Failed
+  peers enter cooldown; emergency DNS can repopulate a critically small pool.
+- Each session completes the exact 24-byte Core peer exchange before it becomes
+  usable. Reader and writer tasks enforce framing, deadlines, queue budgets,
+  request correlation, and protocol-specific response limits.
+- Peer-backed queries race at most three established sessions. The service
+  limits concurrent queries and broadcasts instead of allowing unbounded work.
+- Per-peer and global outbound byte budgets are bounded. Peer-specific queue
+  failure disconnects that peer; global local-memory pressure returns an
+  overload error without penalizing healthy peers.
+- Simultaneous submissions of identical transaction bytes share one network
+  broadcast. A later retry is an independent broadcast.
+- `Ctrl+C` stops the process. Peer, tick, computor, and pending-request state is
+  memory-only and is rebuilt after restart.
 
-## Trust boundary
+## Trust and exposure
 
-Computor lists, TickData, and submitted transaction signatures are locally
-verified. Tick status and contract-function output are explicit unauthenticated
-public-peer trust exceptions governed by ADR-0002 and ADR-0001 respectively.
-Do not use either result as authenticated consensus state.
+`GetStatus` and `QueryContractFunction` are explicit public-peer trust
+exceptions. They are not cryptographic authentication, quorum agreement, or a
+Qubic consensus proof. Their rationale, limits, and revisit criteria are in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Verification
+The gRPC server currently has no application authentication or TLS. Its default
+loopback bind is the safe deployment baseline. If `--grpc-listen` exposes it to
+another host, use a trusted private network, firewall, or authenticated proxy.
+In particular, do not expose transaction broadcast access directly to the
+public internet.
+
+QubicLightNode does not hold a wallet seed or sign transactions. It validates
+already signed bytes supplied by RandomClient and does not persist peer-backed
+responses as durable consensus state.
+
+The complete component boundaries, runtime flows, resource invariants, and
+source traceability are specified in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Development and security
+
+Run the primary checks used by CI:
 
 ```bash
-cargo fmt --all --check
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
-cargo audit
-cargo deny check advisories licenses sources
 ```
+
+CI also runs `cargo-audit` and enforces the dependency policies in
+[`deny.toml`](deny.toml). See [`SECURITY.md`](SECURITY.md) for private
+vulnerability reporting, [`CHANGELOG.md`](CHANGELOG.md) for release changes,
+and [`LICENSE`](LICENSE) for the MIT license.

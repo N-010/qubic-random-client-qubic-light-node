@@ -1,5 +1,0 @@
-{
-  "indexOnly": true,
-  "embeddings": false,
-  "workerTimeout": 60
-}
