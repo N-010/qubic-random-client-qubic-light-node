@@ -32,4 +32,16 @@ target*
 
 
 *.md
+!README.md
+!CHANGELOG.md
+!SECURITY.md
 !docs/**/*.md
+
+# Local container and operator tooling
+.dockerignore
+Dockerfile*
+compose*.yml
+compose*.yaml
+docker-compose*.yml
+docker-compose*.yaml
+*.ps1

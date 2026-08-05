@@ -95,4 +95,4 @@ Supersede this ADR if any of the following occurs:
 ## Related records
 
 - `docs/ARCHITECTURE_COMPLIANCE_AUDIT.md`, finding FIND-01.
-- `AGENTS.md`, strict product boundary and no-independent-design rules.
+- `README.md`, the strict four-operation product boundary.

@@ -1,8 +1,7 @@
 # QubicLightNode
 
-`QubicLightNode` is the outbound-only Qubic backend for
-`D:\Work\MySelf\Qubic\RandomCient`. It is a deliberately reduced port of the
-required behavior from `D:\Work\MySelf\Qubic\QThirtyFour\core`; it is not a
+`QubicLightNode` is the outbound-only Qubic backend for RandomClient. It is a
+deliberately reduced port of the required Qubic Core behavior; it is not a
 general relay node.
 
 The current service exposes the four operations used by RandomClient:
@@ -12,20 +11,23 @@ The current service exposes the four operations used by RandomClient:
 - read-only contract-function query with raw input and output bytes;
 - validation and broadcast of an already signed transaction.
 
-The architecture contract is in `AGENTS.md`. The point-in-time compliance
-report is in `docs/ARCHITECTURE_COMPLIANCE_AUDIT.md`.
+The trust decisions are recorded in `docs/adr/`.
+
+The matching RandomClient gRPC integration is still being prepared and has
+not been published or tagged. Until a compatibility point is published, use
+the `proto/lightnode.proto` schema from the matching local checkout.
 
 ## Build and run
 
 ```bash
-cargo build --release
-cargo run --release
+cargo build --release --locked
+cargo run --release --locked
 ```
 
 Manual seed peers can be supplied more than once:
 
 ```bash
-cargo run --release -- --peer 1.2.3.4:21841 --peer 5.6.7.8:21841
+cargo run --release --locked -- --peer 1.2.3.4:21841 --peer 5.6.7.8:21841
 ```
 
 By default the backend:
@@ -40,7 +42,7 @@ traffic, expose an HTTP API, or enable gRPC reflection. To expose gRPC on a
 different address, use `--grpc-listen`, for example:
 
 ```bash
-cargo run --release -- --grpc-listen 0.0.0.0:50051
+cargo run --release --locked -- --grpc-listen 0.0.0.0:50051
 ```
 
 Run `cargo run --release -- --help` for the complete generated option list.
@@ -106,6 +108,8 @@ Do not use either result as authenticated consensus state.
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --all-features --locked
+cargo audit
+cargo deny check advisories licenses sources
 ```

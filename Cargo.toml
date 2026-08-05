@@ -2,6 +2,10 @@
 name = "QubicLightNode"
 version = "0.3.0"
 edition = "2024"
+description = "Outbound-only Qubic backend for RandomClient"
+license = "MIT"
+repository = "https://github.com/N-010/qubic-random-client-qubic-light-node"
+readme = "README.md"
 
 [workspace]
 members = [".", "crates/qubic-fourq-verifier"]
