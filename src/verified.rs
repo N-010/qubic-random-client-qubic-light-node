@@ -49,12 +49,13 @@ pub(crate) struct TrustedNetworkState {
 }
 
 impl TrustedNetworkState {
-    pub(crate) fn has_computors(&self) -> bool {
-        self.inner
+    pub(crate) fn has_computors(&self, epoch: Option<u16>) -> bool {
+        let current = self
+            .inner
             .lock()
             .expect("trusted network mutex should not be poisoned")
-            .computor_epoch
-            .is_some()
+            .computor_epoch;
+        current.is_some() && epoch.is_none_or(|epoch| current == Some(epoch))
     }
 
     pub(crate) fn verify_tick_data(
@@ -434,5 +435,16 @@ mod tests {
 
         let inner = trusted.inner.lock().unwrap();
         assert_eq!(inner.computor_keys, first_keys);
+    }
+
+    #[test]
+    fn computor_availability_requires_the_observed_epoch() {
+        let trusted = TrustedNetworkState::default();
+        assert!(!trusted.has_computors(None));
+        trusted.set_computor_key_for_test(229, 0, [1; 32]);
+        assert!(trusted.has_computors(None));
+        assert!(trusted.has_computors(Some(229)));
+        assert!(!trusted.has_computors(Some(230)));
+        assert!(!trusted.has_computors(Some(228)));
     }
 }

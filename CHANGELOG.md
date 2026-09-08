@@ -2,7 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## v2.0.1 - 2026-09-08
+
+### Fixed
+
+- Refresh authenticated computor keys across epoch changes on existing
+  peer sessions, with bounded retry delays.
+- Check each peer's current epoch/tick on the same session before contract
+  queries, sharing one deadline and rejecting stale observations.
+- Align the crate version with the release tag and restore trust-decision
+  documentation links.
+
+## v2.0.0
 
 ### Added
 

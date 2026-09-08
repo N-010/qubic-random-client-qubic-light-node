@@ -11,7 +11,7 @@ use crate::state::{
     DedupReservationError, DedupWindow, DisconnectReason, NodeState, OutboundAdmissionError,
     OutboundFrame, PeerPoolStats, ProtocolViolationReason, RelayTarget,
 };
-use crate::types::{format_epoch_tick_packed, pack_epoch_tick};
+use crate::types::{format_epoch_tick_packed, pack_epoch_tick, unpack_epoch_tick};
 use crate::verified::{ComputorVerification, TrustedNetworkState};
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddrV4;
@@ -600,8 +600,14 @@ async fn computor_bootstrap(
     let mut retry_delay = resources.config.reconnect_interval;
     let max_retry_delay = Duration::from_secs(30);
     loop {
-        if resources.trusted_network.has_computors() {
-            return;
+        let epoch = unpack_epoch_tick(resources.latest_epoch_tick.load(Ordering::Relaxed))
+            .map(|(epoch, _)| epoch);
+        if resources.trusted_network.has_computors(epoch) {
+            retry_delay = resources.config.reconnect_interval;
+            tokio::select! {
+                _ = sleep(retry_delay) => continue,
+                _ = disconnect_rx.changed() => return,
+            }
         }
         let Some(target) = resources.state.lock().await.target(peer_id) else {
             return;
@@ -626,10 +632,13 @@ async fn computor_bootstrap(
             }
             true
         } else {
-            match timeout(resources.config.peer_frame_timeout, receiver.recv()).await {
+            let response = tokio::select! {
+                response = timeout(resources.config.peer_frame_timeout, receiver.recv()) => response,
+                _ = disconnect_rx.changed() => return,
+            };
+            match response {
                 Ok(Some(PendingEvent::Frame(frame))) if frame[3] == BROADCAST_COMPUTORS_TYPE => {
-                    sleep(Duration::from_millis(10)).await;
-                    !resources.trusted_network.has_computors()
+                    true
                 }
                 Ok(Some(PendingEvent::Frame(frame))) if frame[3] == END_RESPONSE_TYPE => true,
                 Ok(Some(PendingEvent::Frame(_))) => false,
@@ -639,8 +648,11 @@ async fn computor_bootstrap(
         };
         drop(registration);
 
-        if !retry || resources.trusted_network.has_computors() {
+        if !retry {
             return;
+        }
+        if resources.trusted_network.has_computors(epoch) {
+            continue;
         }
         println!(
             "Computor bootstrap unavailable from {remote}; retrying in {} ms",
@@ -2074,5 +2086,65 @@ mod tests {
             .expect("worker task should finish");
 
         assert_eq!(state.lock().await.pool_stats(Instant::now()).cooldown, 1);
+    }
+
+    #[tokio::test]
+    async fn computor_bootstrap_refreshes_epoch_on_the_same_session() {
+        let state = Arc::new(Mutex::new(NodeState::new(10, &[])));
+        let (tx, mut rx) = mpsc::channel(4);
+        let (disconnect_tx, disconnect_rx) = watch::channel(false);
+        let peer_id = state
+            .lock()
+            .await
+            .register_session(peer(80), true, tx, disconnect_tx.clone(), DEFAULT_PORT)
+            .unwrap();
+        let pending = Arc::new(PendingRequests::default());
+        let latest = Arc::new(AtomicU64::new(pack_epoch_tick(229, 100)));
+        let mut config = (*test_config()).clone();
+        config.reconnect_interval = Duration::from_millis(20);
+        let resources = network_resources(
+            state,
+            Arc::clone(&pending),
+            Arc::clone(&latest),
+            Arc::new(config),
+        );
+        let trusted = Arc::clone(&resources.trusted_network);
+        trusted.set_computor_key_for_test(228, 0, [1; 32]);
+        let task = tokio::spawn(computor_bootstrap(
+            peer_id,
+            peer(80),
+            disconnect_rx,
+            resources,
+        ));
+        let first = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .bytes;
+        assert_eq!(first[3], REQUEST_COMPUTORS_TYPE);
+        let first_dejavu = u32::from_le_bytes(first[4..8].try_into().unwrap());
+        trusted.set_computor_key_for_test(229, 0, [1; 32]);
+        assert!(pending.deliver(
+            peer_id,
+            first_dejavu,
+            Bytes::from(build_request_frame(END_RESPONSE_TYPE, first_dejavu, &[]).unwrap())
+        ));
+        assert!(timeout(Duration::from_millis(60), rx.recv()).await.is_err());
+        assert!(!task.is_finished());
+        latest.store(pack_epoch_tick(230, 200), Ordering::Relaxed);
+        let second = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .bytes;
+        let second_dejavu = u32::from_le_bytes(second[4..8].try_into().unwrap());
+        assert_ne!(first_dejavu, second_dejavu);
+        assert_eq!(second[3], REQUEST_COMPUTORS_TYPE);
+        disconnect_tx.send(true).unwrap();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.active_count(), 0);
     }
 }

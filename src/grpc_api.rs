@@ -4,7 +4,7 @@ use crate::frame::{
 };
 use crate::lightnodepb;
 use crate::network::broadcast_transaction_to_network;
-use crate::peer_api::{query_contract_function, query_tick_data};
+use crate::peer_api::{ContractQuery, query_contract_function, query_tick_data};
 use crate::types::{ApiState, TickStatus, unpack_epoch_tick};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -113,9 +113,12 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
             Arc::clone(&self.api.pending_requests),
             Arc::clone(&self.api.outbound_budget),
             Arc::clone(&self.api.config),
-            request.contract_index,
-            input_type,
-            &request.input,
+            ContractQuery {
+                contract_index: request.contract_index,
+                input_type,
+                input: request.input,
+                reference: unpack_epoch_tick(self.api.latest_epoch_tick.load(Ordering::Relaxed)),
+            },
         )
         .await
         {

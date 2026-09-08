@@ -7,14 +7,12 @@ Core behavior, not a general relay node or a complete Qubic implementation.
 
 ## Release status
 
-This repository is being prepared as the compatible QubicLightNode v2.0.0
-release that must precede RandomClient v2.0.0. The crate currently reports
-version `0.3.0`; no v2.0.0 tag, packaged binaries, or checksums are published
-yet. Build and run the matching source checkout for now.
+QubicLightNode v2.0.1 is a source release compatible with RandomClient
+v2.0.1. Build and run the tagged checkout; packaged binaries and checksums
+are not included. The crate version matches the release tag.
 
-The gRPC contract is versioned by the matching `proto/lightnode.proto` files in
-QubicLightNode and RandomClient. Do not mix revisions until a compatibility
-point is published.
+The gRPC contract is defined by the matching `proto/lightnode.proto` files
+in both v2.0.1 checkouts.
 
 ## Requirements
 
@@ -93,7 +91,7 @@ Service: `lightnode.LightNode`
 | --- | --- | --- |
 | `GetStatus` | Greatest observed epoch/tick | Structurally validated, but unauthenticated single-peer observation. |
 | `GetTickTransactions` | Whether one requested tick contains transaction digests | Authenticated with the active arbitrator-signed computor set and FourQ-verified Core `TickData`. |
-| `QueryContractFunction` | Raw non-empty contract output | First structurally valid response from up to three peers; unauthenticated. |
+| `QueryContractFunction` | Raw non-empty contract output | First eligible response from up to three peers after a same-session current-tick preflight; unauthenticated. |
 | `BroadcastTransaction` | Canonical transaction ID after queueing to at least one peer | Transaction layout and FourQ signature are verified locally; queueing is not execution confirmation. |
 
 The schema contains exactly these four methods. There is no balance RPC.
@@ -108,6 +106,14 @@ The schema contains exactly these four methods. There is no balance RPC.
 - Each session completes the exact 24-byte Core peer exchange before it becomes
   usable. Reader and writer tasks enforce framing, deadlines, queue budgets,
   request correlation, and protocol-specific response limits.
+- Computor retrieval stays active for each session and refreshes authenticated
+  keys when the observed epoch changes; temporary failures retry up to every
+  30 seconds without bypassing signature verification.
+- Contract queries snapshot the cached epoch/tick and first request current
+  tick info from each selected peer. Only the same epoch and at most one tick
+  of lag qualify. Missing status or no eligible result is a temporary error;
+  ordinary lag does not disconnect the peer. Preflight and contract response
+  share one API deadline.
 - Peer-backed queries race at most three established sessions. The service
   limits concurrent queries and broadcasts instead of allowing unbounded work.
 - Per-peer and global outbound byte budgets are bounded. Peer-specific queue

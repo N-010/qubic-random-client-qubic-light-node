@@ -5,6 +5,8 @@ package lightnode;
 service LightNode {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc GetTickTransactions(GetTickTransactionsRequest) returns (GetTickTransactionsResponse);
+  // Same-session current-tick preflight: same cached epoch, at most one tick
+  // behind the query snapshot. No eligible peer returns ok=false, not absence.
   rpc QueryContractFunction(QueryContractFunctionRequest) returns (QueryContractFunctionResponse);
   rpc BroadcastTransaction(BroadcastTransactionRequest) returns (BroadcastTransactionResponse);
 }

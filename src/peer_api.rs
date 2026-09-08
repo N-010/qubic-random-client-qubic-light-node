@@ -1,14 +1,17 @@
 use crate::config::Config;
 use crate::frame::{
     BROADCAST_FUTURE_TICK_DATA_TYPE, END_RESPONSE_TYPE, HEADER_SIZE,
-    MAX_CONTRACT_FUNCTION_OUTPUT_SIZE, RESPOND_CONTRACT_FUNCTION_TYPE, TICK_DATA_PAYLOAD_SIZE,
-    TRY_AGAIN_TYPE, build_request_contract_function_frame, build_request_tick_data_frame,
-    frame_payload,
+    MAX_CONTRACT_FUNCTION_OUTPUT_SIZE, REQUEST_CURRENT_TICK_INFO_TYPE,
+    RESPOND_CONTRACT_FUNCTION_TYPE, RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE,
+    RESPOND_CURRENT_TICK_INFO_TYPE, TICK_DATA_PAYLOAD_SIZE, TRY_AGAIN_TYPE,
+    build_request_contract_function_frame, build_request_frame, build_request_tick_data_frame,
+    frame_payload, parse_tick_status_from_frame,
 };
 use crate::pending::{PendingEvent, PendingRequests};
 use crate::pending::{PendingSpec, ResponseRule};
 use crate::state::{
     DisconnectReason, NodeState, OutboundAdmissionError, OutboundFrame, ProtocolViolationReason,
+    RelayTarget,
 };
 use crate::verified::{TickDataVerification, TrustedNetworkState};
 use bytes::Bytes;
@@ -102,17 +105,62 @@ impl From<String> for PeerQueryError {
     }
 }
 
+pub(crate) struct ContractQuery {
+    pub(crate) contract_index: u32,
+    pub(crate) input_type: u16,
+    pub(crate) input: Vec<u8>,
+    pub(crate) reference: Option<(u16, u32)>,
+}
+
+const CURRENT_TICK_RESPONSE_RULES: &[ResponseRule] = &[
+    ResponseRule {
+        message_type: RESPOND_CURRENT_TICK_INFO_TYPE,
+        min_frame_bytes: HEADER_SIZE + RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE,
+        max_frame_bytes: HEADER_SIZE + RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE,
+        max_frames: 1,
+        terminal: true,
+    },
+    ResponseRule {
+        message_type: END_RESPONSE_TYPE,
+        min_frame_bytes: HEADER_SIZE,
+        max_frame_bytes: HEADER_SIZE,
+        max_frames: 1,
+        terminal: true,
+    },
+    ResponseRule {
+        message_type: TRY_AGAIN_TYPE,
+        min_frame_bytes: HEADER_SIZE,
+        max_frame_bytes: HEADER_SIZE,
+        max_frames: 1,
+        terminal: true,
+    },
+];
+
 pub(crate) async fn query_contract_function(
     state: Arc<Mutex<NodeState>>,
     pending: Arc<PendingRequests>,
     outbound_budget: Arc<Semaphore>,
     config: Arc<Config>,
-    contract_index: u32,
-    input_type: u16,
-    input: &[u8],
+    query: ContractQuery,
 ) -> Result<Vec<u8>, PeerQueryError> {
     let timeout_duration = config.api_timeout;
     let deadline = Instant::now() + timeout_duration;
+    let reference = query
+        .reference
+        .filter(|(epoch, tick)| *epoch != 0 && *tick != 0)
+        .ok_or_else(|| {
+            PeerQueryError::PeerUnavailable("No current tick reference available".to_string())
+        })?;
+    let request = Bytes::from(
+        build_request_contract_function_frame(
+            0,
+            query.contract_index,
+            query.input_type,
+            &query.input,
+        )
+        .map_err(PeerQueryError::Internal)?,
+    );
+    ensure_local_request_size(&request, &config)?;
     let targets = timeout_at(deadline, state.lock())
         .await
         .map_err(|_| api_timeout_error(timeout_duration))?
@@ -120,46 +168,26 @@ pub(crate) async fn query_contract_function(
     if targets.is_empty() {
         return Err(PeerQueryError::NoPeers);
     }
-    let (registration, receivers) = pending.register_with_spec(
-        targets.iter().map(|target| target.peer_id),
-        PendingSpec {
-            response_rules: CONTRACT_RESPONSE_RULES,
-            max_response_frames: 1,
-            max_response_bytes: HEADER_SIZE + MAX_CONTRACT_FUNCTION_OUTPUT_SIZE,
-        },
-    );
-    let request = Bytes::from(
-        build_request_contract_function_frame(
-            registration.dejavu(),
-            contract_index,
-            input_type,
-            input,
-        )
-        .map_err(PeerQueryError::Internal)?,
-    );
-    ensure_local_request_size(&request, &config)?;
-    let accepted = timeout_at(
-        deadline,
-        send_request_to_targets(&state, &pending, targets, &request, &outbound_budget),
-    )
-    .await
-    .map_err(|_| api_timeout_error(timeout_duration))??;
-    registration.retain_peers(&accepted);
-
     let mut join_set = JoinSet::new();
-    for (peer_id, receiver) in receivers
-        .into_iter()
-        .filter(|(peer_id, _)| accepted.contains(peer_id))
-    {
-        join_set.spawn(async move { (peer_id, receive_contract_function(receiver).await) });
+    for target in targets {
+        let peer_id = target.peer_id;
+        let state = Arc::clone(&state);
+        let pending = Arc::clone(&pending);
+        let budget = Arc::clone(&outbound_budget);
+        let request = request.clone();
+        join_set.spawn(async move {
+            (
+                peer_id,
+                query_contract_on_peer(state, pending, budget, target, request, reference).await,
+            )
+        });
     }
-
     let mut last_err = String::new();
     loop {
         let result = tokio::select! {
             biased;
             _ = sleep_until(deadline) => {
-                join_set.abort_all();
+                join_set.shutdown().await;
                 return Err(api_timeout_error(timeout_duration));
             }
             result = join_set.join_next() => result,
@@ -168,8 +196,8 @@ pub(crate) async fn query_contract_function(
             break;
         };
         match result {
-            Ok((_peer_id, Ok(output))) => {
-                join_set.abort_all();
+            Ok((_, Ok(output))) => {
+                join_set.shutdown().await;
                 return Ok(output);
             }
             Ok((peer_id, Err(err))) => {
@@ -178,15 +206,89 @@ pub(crate) async fn query_contract_function(
                 }
                 last_err = format!("peer {peer_id}: {err}");
             }
-            Err(err) => {
-                last_err = format!("task join error: {err}");
-            }
+            Err(err) => last_err = format!("task join error: {err}"),
         }
     }
-
     Err(PeerQueryError::PeerUnavailable(format!(
         "Failed to query contract function from peers (parallel): {last_err}"
     )))
+}
+
+async fn query_contract_on_peer(
+    state: Arc<Mutex<NodeState>>,
+    pending: Arc<PendingRequests>,
+    outbound_budget: Arc<Semaphore>,
+    target: RelayTarget,
+    request: Bytes,
+    reference: (u16, u32),
+) -> Result<Vec<u8>, PeerQueryError> {
+    let peer_id = target.peer_id;
+    let (registration, mut receivers) = pending.register_with_spec(
+        [peer_id],
+        PendingSpec {
+            response_rules: CURRENT_TICK_RESPONSE_RULES,
+            max_response_frames: 1,
+            max_response_bytes: HEADER_SIZE + RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE,
+        },
+    );
+    let (_, mut receiver) = receivers.pop().expect("one peer has one receiver");
+    let status_request = Bytes::from(
+        build_request_frame(REQUEST_CURRENT_TICK_INFO_TYPE, registration.dejavu(), &[])
+            .map_err(PeerQueryError::Internal)?,
+    );
+    send_request_to_targets(
+        &state,
+        &pending,
+        vec![target.clone()],
+        &status_request,
+        &outbound_budget,
+    )
+    .await?;
+    match receiver.recv().await {
+        Some(PendingEvent::Frame(frame)) if frame[3] == RESPOND_CURRENT_TICK_INFO_TYPE => {
+            let status = parse_tick_status_from_frame(&frame).ok_or_else(|| {
+                PeerQueryError::Protocol("Malformed current tick info".to_string())
+            })?;
+            if status.tick == 0
+                || status.epoch != reference.0
+                || status.tick < reference.1.saturating_sub(1)
+            {
+                return Err(PeerQueryError::PeerUnavailable(format!(
+                    "Peer status is not current: epoch={} tick={}, required epoch={} tick>={}",
+                    status.epoch,
+                    status.tick,
+                    reference.0,
+                    reference.1.saturating_sub(1)
+                )));
+            }
+        }
+        Some(PendingEvent::Frame(_)) | Some(PendingEvent::PeerDisconnected) | None => {
+            return Err(PeerQueryError::PeerUnavailable(
+                "Peer current tick info unavailable".to_string(),
+            ));
+        }
+    }
+    drop(registration);
+    let (registration, mut receivers) = pending.register_with_spec(
+        [peer_id],
+        PendingSpec {
+            response_rules: CONTRACT_RESPONSE_RULES,
+            max_response_frames: 1,
+            max_response_bytes: HEADER_SIZE + MAX_CONTRACT_FUNCTION_OUTPUT_SIZE,
+        },
+    );
+    let (_, receiver) = receivers.pop().expect("one peer has one receiver");
+    let mut request = request.to_vec();
+    request[4..8].copy_from_slice(&registration.dejavu().to_le_bytes());
+    send_request_to_targets(
+        &state,
+        &pending,
+        vec![target],
+        &Bytes::from(request),
+        &outbound_budget,
+    )
+    .await?;
+    receive_contract_function(receiver).await
 }
 
 pub(crate) async fn query_tick_data(
@@ -610,6 +712,25 @@ mod tests {
         ));
     }
 
+    async fn answer_current_tick(
+        pending: &PendingRequests,
+        peer_id: u64,
+        peer_rx: &mut mpsc::Receiver<OutboundFrame>,
+        epoch: u16,
+        tick: u32,
+    ) {
+        let request = peer_rx.recv().await.unwrap().bytes;
+        assert_eq!(request[3], REQUEST_CURRENT_TICK_INFO_TYPE);
+        let dejavu = u32::from_le_bytes(request[4..8].try_into().unwrap());
+        let mut payload = [0; RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE];
+        payload[2..4].copy_from_slice(&epoch.to_le_bytes());
+        payload[4..8].copy_from_slice(&tick.to_le_bytes());
+        let response = Bytes::from(
+            build_request_frame(RESPOND_CURRENT_TICK_INFO_TYPE, dejavu, &payload).unwrap(),
+        );
+        assert!(pending.deliver(peer_id, dejavu, response));
+    }
+
     #[tokio::test]
     async fn contract_function_returns_first_peer_response_and_cleans_pending_request() {
         let (state, peer_id, mut peer_rx) = state_with_peer().await;
@@ -619,10 +740,14 @@ mod tests {
             Arc::clone(&pending),
             outbound_budget(),
             test_config(Duration::from_secs(1)),
-            3,
-            2,
-            &[9; 32],
+            ContractQuery {
+                contract_index: 3,
+                input_type: 2,
+                input: [9; 32].to_vec(),
+                reference: Some((229, 100)),
+            },
         ));
+        answer_current_tick(&pending, peer_id, &mut peer_rx, 229, 100).await;
         let request = peer_rx.recv().await.unwrap().bytes;
         let dejavu = u32::from_le_bytes(request[4..8].try_into().unwrap());
         let response = Bytes::from(
@@ -644,10 +769,14 @@ mod tests {
             Arc::clone(&pending),
             outbound_budget(),
             test_config(Duration::from_secs(1)),
-            3,
-            2,
-            &[],
+            ContractQuery {
+                contract_index: 3,
+                input_type: 2,
+                input: [].to_vec(),
+                reference: Some((229, 100)),
+            },
         ));
+        answer_current_tick(&pending, peer_id, &mut peer_rx, 229, 100).await;
         let request = peer_rx.recv().await.unwrap().bytes;
         let dejavu = u32::from_le_bytes(request[4..8].try_into().unwrap());
         let response =
@@ -791,5 +920,152 @@ mod tests {
         let locked = state.lock().await;
         assert_eq!(locked.outgoing_count(), 0);
         assert_eq!(locked.pool_stats(std::time::Instant::now()).cooldown, 1);
+    }
+
+    #[tokio::test]
+    async fn contract_query_accepts_only_current_same_epoch_peers() {
+        for (epoch, tick, accepted) in [
+            (229, 100, true),
+            (229, 99, true),
+            (229, 98, false),
+            (228, 100, false),
+            (230, 101, false),
+            (229, 0, false),
+        ] {
+            let (state, peer_id, mut rx) = state_with_peer().await;
+            let pending = Arc::new(PendingRequests::default());
+            let query = tokio::spawn(query_contract_function(
+                Arc::clone(&state),
+                Arc::clone(&pending),
+                outbound_budget(),
+                test_config(Duration::from_secs(1)),
+                ContractQuery {
+                    contract_index: 3,
+                    input_type: 2,
+                    input: vec![9; 32],
+                    reference: Some((229, 100)),
+                },
+            ));
+            answer_current_tick(&pending, peer_id, &mut rx, epoch, tick).await;
+            if accepted {
+                let request = rx.recv().await.unwrap().bytes;
+                assert_eq!(request[3], crate::frame::REQUEST_CONTRACT_FUNCTION_TYPE);
+                let dejavu = u32::from_le_bytes(request[4..8].try_into().unwrap());
+                assert!(pending.deliver(
+                    peer_id,
+                    dejavu,
+                    Bytes::from(
+                        build_request_frame(RESPOND_CONTRACT_FUNCTION_TYPE, dejavu, &[8]).unwrap()
+                    )
+                ));
+                assert_eq!(query.await.unwrap().unwrap(), vec![8]);
+            } else {
+                assert!(matches!(
+                    query.await.unwrap(),
+                    Err(PeerQueryError::PeerUnavailable(_))
+                ));
+                assert!(rx.try_recv().is_err());
+            }
+            assert_eq!(pending.active_count(), 0);
+            let locked = state.lock().await;
+            assert_eq!(locked.outgoing_count(), 1);
+            assert_eq!(locked.pool_stats(std::time::Instant::now()).cooldown, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_peer_cannot_win_the_race_against_a_current_peer() {
+        let (state, stale_id, mut stale_rx) = state_with_peer().await;
+        let (tx, mut current_rx) = mpsc::channel(4);
+        let (disconnect_tx, _) = watch::channel(false);
+        let current_id = state
+            .lock()
+            .await
+            .register_session(
+                "1.1.1.2:21841".parse().unwrap(),
+                true,
+                tx,
+                disconnect_tx,
+                DEFAULT_PORT,
+            )
+            .unwrap();
+        let pending = Arc::new(PendingRequests::default());
+        let query = tokio::spawn(query_contract_function(
+            state,
+            Arc::clone(&pending),
+            outbound_budget(),
+            test_config(Duration::from_secs(1)),
+            ContractQuery {
+                contract_index: 3,
+                input_type: 2,
+                input: vec![],
+                reference: Some((229, 78944125)),
+            },
+        ));
+        answer_current_tick(&pending, stale_id, &mut stale_rx, 229, 78787367).await;
+        answer_current_tick(&pending, current_id, &mut current_rx, 229, 78944125).await;
+        let request = current_rx.recv().await.unwrap().bytes;
+        let dejavu = u32::from_le_bytes(request[4..8].try_into().unwrap());
+        assert!(pending.deliver(
+            current_id,
+            dejavu,
+            Bytes::from(build_request_frame(RESPOND_CONTRACT_FUNCTION_TYPE, dejavu, &[7]).unwrap())
+        ));
+        assert_eq!(query.await.unwrap().unwrap(), vec![7]);
+        assert!(stale_rx.try_recv().is_err());
+        assert_eq!(pending.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn contract_preflight_and_response_share_deadline_and_cleanup() {
+        for answer_preflight in [false, true] {
+            let (state, peer_id, mut rx) = state_with_peer().await;
+            let pending = Arc::new(PendingRequests::default());
+            let duration = Duration::from_millis(50);
+            let query = tokio::spawn(query_contract_function(
+                state,
+                Arc::clone(&pending),
+                outbound_budget(),
+                test_config(duration),
+                ContractQuery {
+                    contract_index: 3,
+                    input_type: 2,
+                    input: vec![],
+                    reference: Some((229, 100)),
+                },
+            ));
+            if answer_preflight {
+                answer_current_tick(&pending, peer_id, &mut rx, 229, 100).await;
+                let request = rx.recv().await.unwrap().bytes;
+                assert_eq!(request[3], crate::frame::REQUEST_CONTRACT_FUNCTION_TYPE);
+            }
+            assert_eq!(
+                query.await.unwrap(),
+                Err(PeerQueryError::Deadline(duration))
+            );
+            assert_eq!(pending.active_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_query_without_reference_does_not_query_peers() {
+        let (state, _, mut rx) = state_with_peer().await;
+        let pending = Arc::new(PendingRequests::default());
+        let result = query_contract_function(
+            state,
+            Arc::clone(&pending),
+            outbound_budget(),
+            test_config(Duration::from_secs(1)),
+            ContractQuery {
+                contract_index: 3,
+                input_type: 2,
+                input: vec![],
+                reference: None,
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(PeerQueryError::PeerUnavailable(_))));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(pending.active_count(), 0);
     }
 }

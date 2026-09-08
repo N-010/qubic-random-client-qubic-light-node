@@ -184,8 +184,14 @@ false-future cache poisoning is observed in practice.
 
 ### Authenticated computor set
 
-Each new session may request `BroadcastComputors` until trusted keys are
-available. The payload must contain an epoch, 676 non-zero public keys, a
+Each session maintains computor retrieval until disconnect. At the configured
+reconnect interval it checks whether the applied authenticated set matches the
+observed epoch (or any authenticated set before the first tick observation).
+Missing or mismatched keys trigger Core `RequestComputors`, with exponential
+retry delays capped at 30 seconds. Success pauses requests rather than ending
+the task, so an epoch change refreshes keys on existing sessions. Receipt is
+not readiness: signature verification and application must finish first.
+Disconnect cancels both response waits and retry waits. The payload must contain an epoch, 676 non-zero public keys, a
 64-byte signature, and only Core's permitted zero-to-four trailing struct
 padding. The signature covers the canonical prefix with KangarooTwelve and is
 verified against the built-in arbitrator identity using FourQ.
@@ -236,12 +242,23 @@ or bad-signature peer response disconnects and penalizes that peer.
 
 The gRPC boundary requires contract index `1..=1023`, an input type fitting
 `u16`, and at most 65,535 input bytes. The service encodes the exact Core
-request, races up to three sessions, and returns the first structurally valid,
-non-empty response before the deadline. Empty output indicates invocation
+request and races up to three sessions under one end-to-end deadline. At query
+admission it snapshots the structural epoch/tick cache. Each selected session
+first answers a separately correlated Core `RequestCurrentTickInfo`; only a
+non-zero tick in the snapshot epoch, at most one tick behind its tick, permits
+the contract request on that same session. No reference or no eligible reply
+returns unavailable, never an empty provider status. Lag does not penalize or
+disconnect the peer. Both stages share the original API deadline and resource
+limits; completion or cancellation releases both registrations. The first
+structurally valid non-empty contract response from an eligible peer wins. Empty output indicates invocation
 failure; `TRY_AGAIN` and `END_RESPONSE` without data are errors.
 
 Core provides no proof for this response. Racing peers improves availability
-but not authenticity, and no agreement is required. This architecture
+but not authenticity, and no agreement is required. The freshness filter was
+explicitly approved on 2026-09-08 after a production peer was observed about
+157,000 ticks behind the other sampled peers. It is a local availability
+adaptation using Core messages, not a Core consensus rule. A lying peer or
+false-future cache observation can still defeat availability or integrity. This architecture
 explicitly accepts this HIGH integrity risk for the current RandomClient
 caller.
 
@@ -275,7 +292,7 @@ identity derived from K12 over the complete signed bytes.
 | RandomClient → gRPC | Local request validation and bounded admission | No TLS or application authentication; default loopback is the deployment boundary. |
 | QubicLightNode → public peers | Exact framing, deadlines, correlation, and peer penalties | Public peers are untrusted and can withhold, delay, or selectively answer. |
 | Status cache | Exact structural parsing and monotonicity | One peer can report an unauthenticated false future epoch/tick. |
-| Contract query | Exact Core request and bounded non-empty response | First-success output is unauthenticated and not consensus state. |
+| Contract query | Same-session current-tick preflight, exact Core request, bounded non-empty response | First eligible success and the reference cache are unauthenticated, not consensus state. |
 | Computors/TickData | Arbitrator and designated-computor FourQ verification | Availability depends on obtaining a current authenticated computor list. |
 | Transaction broadcast | Local layout and signature verification | Queue acceptance is not delivery or execution confirmation. |
 | DNS bootstrap | HTTPS bootstrap and bounded peer admission | DNS provides candidates, not trusted consensus data. |
@@ -297,8 +314,19 @@ as independent delivery attempts.
 | --- | --- | --- | --- |
 | `QlnBackend::tick_info` | `BroadcastTick`, `RespondCurrentTickInfo`, and their Core handlers define layouts; Core has no authenticated current-info proof. | `parse_tick_status_from_frame`, monotonic `latest_epoch_tick`, `get_status`. | Explicit unauthenticated-status adaptation. |
 | `QlnBackend::tick_has_transactions` | `RequestTickData`, `TickData`, `processRequestTickData`, and `processBroadcastFutureTickData` define response and verification semantics. | `query_tick_data`, `TrustedNetworkState::verify_tick_data`, `get_tick_transactions`. | Exact wire mapping with bounded async adaptation. |
-| `QlnBackend::query_contract_function` | `RequestContractFunction`, `RespondContractFunction`, and `processRequestContractFunction` define raw input/output and empty failure. | `query_contract_function`, pending response rules, tonic method. | Exact wire mapping plus explicit first-success trust exception. |
+| `QlnBackend::query_contract_function` | `RequestCurrentTickInfo`, `RespondCurrentTickInfo`, `processRequestCurrentTickInfo`, `RequestContractFunction`, `RespondContractFunction`, and `processRequestContractFunction` define current status, raw input/output and empty failure. | `query_contract_function`, `query_contract_on_peer`, pending response rules, tonic method. | Exact wire mapping plus approved freshness preflight and first-eligible-success trust exception. |
+| Current-epoch authenticated TickData keys | `Computors`, `processRequestComputors`, `processBroadcastComputors` define layout, retrieval and arbitrator authentication. | `computor_bootstrap`, `has_computors`, `apply_computors`. | Exact wire/authentication mapping; persistent bounded session retries are an async adaptation. |
 | `QlnBackend::broadcast_transaction` | `Transaction::checkValidity`, `processBroadcastTransaction`, K12, and FourQ define accepted bytes. | `validate_transaction`, `broadcast_transaction_to_network`, tonic method. | Exact validation with bounded outbound fanout adaptation. |
+
+The 2026-09-08 repair was traced against RandomClient `d840000a449cf8f8cae6658bb778762e87b108ca`
+plus its queue repair, QubicLightNode `8fa1b9cdd7d7f581341070ea05c6102a902d514f`
+plus this repair, and Core `f55b46126c99a1c3f3266164c744b3d0cd694d9c`.
+The Core worktree also contained unrelated test-project changes and untracked
+operator files; the relevant production handlers/layouts were unmodified.
+Regression tests cover epoch refresh on a live session, 0/1/2-tick freshness
+boundaries, wrong epochs, stale/current peer races, shared deadlines, and
+pending-registration cleanup. Client tests cover fair retry scheduling,
+deduplication including active checks, capped backoff and epoch cancellation.
 
 The local verifier is covered by Core-derived vectors and boundary tests. Frame,
 configuration, pending-route, peer-state, gRPC, query, verification, overload,

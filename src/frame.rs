@@ -17,6 +17,7 @@ pub(crate) const BROADCAST_FUTURE_TICK_DATA_TYPE: u8 = 8;
 pub(crate) const REQUEST_COMPUTORS_TYPE: u8 = 11;
 pub(crate) const REQUEST_TICK_DATA_TYPE: u8 = 16;
 pub(crate) const BROADCAST_TRANSACTION_TYPE: u8 = 24;
+pub(crate) const REQUEST_CURRENT_TICK_INFO_TYPE: u8 = 27;
 pub(crate) const RESPOND_CURRENT_TICK_INFO_TYPE: u8 = 28;
 pub(crate) const END_RESPONSE_TYPE: u8 = 35;
 pub(crate) const REQUEST_CONTRACT_FUNCTION_TYPE: u8 = 42;
