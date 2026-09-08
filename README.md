@@ -7,12 +7,12 @@ Core behavior, not a general relay node or a complete Qubic implementation.
 
 ## Release status
 
-QubicLightNode v2.0.1 is a source release compatible with RandomClient
-v2.0.1. Build and run the tagged checkout; packaged binaries and checksums
-are not included. The crate version matches the release tag.
+QubicLightNode v2.0.2 is compatible with RandomClient v2.0.1 and v2.0.2.
+Build from the tagged checkout; successful tag workflows also publish Linux
+and Windows binaries to GitHub Releases. The crate version matches the tag.
 
 The gRPC contract is defined by the matching `proto/lightnode.proto` files
-in both v2.0.1 checkouts.
+in these compatible checkouts.
 
 ## Requirements
 

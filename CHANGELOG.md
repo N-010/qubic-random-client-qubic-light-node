@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## v2.0.2 - 2026-09-08
+
+### Security
+
+- Update h2 to 0.4.16 to fix RUSTSEC-2026-0258.
+- Replace the yanked chacha20 0.10.1 with 0.10.2.
+
 ## v2.0.1 - 2026-09-08
 
 ### Fixed
