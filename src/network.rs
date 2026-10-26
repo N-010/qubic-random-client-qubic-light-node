@@ -25,9 +25,11 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 use tokio::time::{Instant as TokioInstant, sleep, timeout, timeout_at};
 
+#[path = "peer_selection.rs"]
+mod selection;
+
 const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 pub(crate) const GLOBAL_OUTBOUND_QUEUE_BYTES: usize = 256 * 1024 * 1024;
-const DISSEMINATION_MULTIPLIER: usize = 6;
 const READ_BUFFER_SIZE: usize = 128 * 1024;
 const ACCUMULATED_INITIAL_CAPACITY: usize = 256 * 1024;
 const ACCUMULATED_RETAIN_CAPACITY: usize = 512 * 1024;
@@ -234,6 +236,7 @@ pub(crate) async fn broadcast_transaction_to_network(
     state: Arc<Mutex<NodeState>>,
     outbound_budget: Arc<Semaphore>,
     transaction: crate::frame::ValidatedTransaction<'_>,
+    fanout: u8,
 ) -> Result<(), String> {
     let tx_bytes = transaction.bytes();
     if tx_bytes.is_empty() {
@@ -243,7 +246,7 @@ pub(crate) async fn broadcast_transaction_to_network(
     let frame = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, tx_bytes)?;
     let targets = {
         let locked = state.lock().await;
-        let targets = locked.collect_all_targets(DISSEMINATION_MULTIPLIER);
+        let targets = locked.collect_all_targets(usize::from(fanout));
         if targets.is_empty() {
             return Err("No connected peers available for broadcast".to_string());
         }
@@ -285,6 +288,7 @@ pub(crate) async fn broadcast_transaction_to_network(
 }
 
 pub(crate) async fn dial_loop(resources: NetworkResources) {
+    tokio::spawn(selection::run(resources.clone()));
     let state = Arc::clone(&resources.state);
     let config = Arc::clone(&resources.config);
     let mut emergency_dns_attempt = 0u32;
@@ -316,11 +320,7 @@ pub(crate) async fn dial_loop(resources: NetworkResources) {
                     config.critical_peer_threshold
                 );
 
-                let dns_lite_peers = if config.dns_lite_peers == 0 {
-                    (config.target_outbound * 3).max(8)
-                } else {
-                    config.dns_lite_peers
-                };
+                let dns_lite_peers = config.bootstrap_lite_peers();
 
                 match crate::dns::fetch_seed_peers_from_dns(
                     config.peer_port,
@@ -480,6 +480,16 @@ async fn establish_connection(
         }
     };
 
+    activate_connection(stream, remote, resources, handshake_frame, None).await;
+}
+
+async fn activate_connection(
+    stream: TcpStream,
+    remote: SocketAddrV4,
+    resources: NetworkResources,
+    handshake_frame: Bytes,
+    replacement: Option<u64>,
+) {
     update_discovered_peers(
         &resources.state,
         &handshake_frame,
@@ -493,7 +503,9 @@ async fn establish_connection(
     let (peer_id, outgoing_count) = {
         let mut locked = resources.state.lock().await;
 
-        if locked.outgoing_count() >= resources.config.target_outbound {
+        if locked.outgoing_count() >= resources.config.target_outbound
+            && !replacement.is_some_and(|id| locked.selection_retirement_ready(id))
+        {
             println!("Rejecting outbound {remote}: outbound target already reached.");
             locked.clear_pending_dial(remote);
             return;
@@ -510,6 +522,19 @@ async fn establish_connection(
             return;
         };
 
+        if locked.outgoing_count() > resources.config.target_outbound
+            && let Some(old_id) = replacement
+        {
+            let Some(old_remote) = locked.retire_selection_peer(old_id) else {
+                // Admission won the race. The new session was never visible outside this lock.
+                locked.unregister_session(peer_id);
+                println!("PEER_SELECTION retained busy peer; candidate={remote}");
+                return;
+            };
+            locked.defer_selection_candidate(old_remote, Instant::now(), Duration::from_secs(120));
+            resources.pending.peer_disconnected(old_id);
+            println!("PEER_SELECTION replaced peer={old_remote} with={remote}");
+        }
         (peer_id, locked.outgoing_count())
     };
 
@@ -531,8 +556,22 @@ async fn establish_connection(
             resources,
         },
     ));
+    finish_connection_worker(worker, peer_id, remote, &state, &pending).await;
+}
+
+async fn finish_connection_worker(
+    worker: tokio::task::JoinHandle<()>,
+    peer_id: u64,
+    remote: SocketAddrV4,
+    state: &Mutex<NodeState>,
+    pending: &PendingRequests,
+) {
     if let Err(error) = worker.await {
-        state.lock().await.unregister_session(peer_id);
+        {
+            let mut locked = state.lock().await;
+            locked.unregister_session(peer_id);
+            locked.take_disconnect_reason(peer_id);
+        }
         pending.peer_disconnected(peer_id);
         eprintln!("Connection worker failed for {remote}: {error}");
     }
@@ -700,7 +739,7 @@ async fn connection_worker(
             &mut writer,
             rx,
             remote,
-            resources.config.traffic_log,
+            resources.config.traffic_log || resources.config.transaction_log,
             Arc::clone(&resources.latest_epoch_tick),
             resources.config.peer_write_timeout,
         );
@@ -785,16 +824,35 @@ async fn write_peer_frames<W: AsyncWrite + Unpin>(
                 format_epoch_tick_packed(packed)
             );
         }
-        match timeout(peer_write_timeout, writer.write_all(&frame.bytes)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(format!("write failed: {err}")),
-            Err(_) => {
-                return Err(format!(
-                    "write timed out after {} ms",
-                    peer_write_timeout.as_millis()
-                ));
-            }
+        let transaction = if traffic_log && frame.bytes.get(3) == Some(&BROADCAST_TRANSACTION_TYPE)
+        {
+            frame.bytes.get(HEADER_SIZE..).and_then(|bytes| {
+                let target = u32::from_le_bytes(bytes.get(72..76)?.try_into().ok()?);
+                Some((target, crate::codec::tx_id_from_bytes(bytes)))
+            })
+        } else {
+            None
+        };
+        let queue_us = frame.queued_at.elapsed().as_micros();
+        let start_tick = latest_epoch_tick.load(Ordering::Relaxed) as u32;
+        let started = Instant::now();
+        let result = match timeout(peer_write_timeout, writer.write_all(&frame.bytes)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(format!("write failed: {err}")),
+            Err(_) => Err(format!(
+                "write timed out after {} ms",
+                peer_write_timeout.as_millis()
+            )),
+        };
+        if let Some((target, txid)) = transaction {
+            let write_us = started.elapsed().as_micros();
+            let end_tick = latest_epoch_tick.load(Ordering::Relaxed) as u32;
+            let outcome = if result.is_ok() { "written" } else { "failed" };
+            println!(
+                "TX_RESULT peer={remote} target={target} txid={txid} queue_us={queue_us} write_us={write_us} start_tick={start_tick} end_tick={end_tick} result={outcome}"
+            );
         }
+        result?;
     }
     Ok(())
 }
@@ -1185,6 +1243,8 @@ mod tests {
             dns_lite_peers: 0,
             dns_timeout: Duration::from_secs(1),
             traffic_log: false,
+            transaction_log: false,
+            broadcast_fanout: 6,
             seed_peers: Vec::new(),
             critical_peer_threshold: 4,
             emergency_dns_bootstrap: false,
@@ -1688,6 +1748,7 @@ mod tests {
             Arc::clone(&state),
             Arc::new(Semaphore::new(0)),
             transaction,
+            6,
         )
         .await;
 
@@ -1721,12 +1782,32 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_millis(50),
-            process_incoming_frame(1, frame, resources.clone()),
+            process_incoming_frame(1, frame.clone(), resources.clone()),
         )
         .await
         .expect("saturated verification must not block the peer reader");
         assert!(!resources.signed_invalid.contains(&digest));
+        assert!(!resources.signed_replay.contains(&digest));
         drop(all_permits);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            process_incoming_frame(1, frame, resources.clone()),
+        )
+        .await
+        .expect("verification should resume after local pressure clears");
+        assert_eq!(
+            outcome,
+            FrameProcessingOutcome::ConnectionFatal(
+                ProtocolViolationReason::InvalidComputorSignature
+            )
+        );
+        assert!(resources.signed_invalid.contains(&digest));
+        assert!(!resources.signed_replay.contains(&digest));
+        assert_eq!(
+            resources.verification_slots.available_permits(),
+            permit_count as usize
+        );
     }
 
     #[tokio::test]
@@ -1893,6 +1974,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_exit_releases_in_flight_and_queued_byte_budgets() {
+        for cancel in [false, true] {
+            let peer_budget = Arc::new(Semaphore::new(16));
+            let global_budget = Arc::new(Semaphore::new(16));
+            let (tx, rx) = mpsc::channel(2);
+            for _ in 0..2 {
+                tx.try_send(
+                    OutboundFrame::try_new(
+                        Bytes::from_static(b"12345678"),
+                        Arc::clone(&peer_budget),
+                        Arc::clone(&global_budget),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            let (mut writer, mut reader) = tokio::io::duplex(1);
+            let mut writing = Box::pin(write_peer_frames(
+                &mut writer,
+                rx,
+                peer(11),
+                false,
+                Arc::new(AtomicU64::new(0)),
+                Duration::from_millis(100),
+            ));
+            let mut first_byte = [0];
+            tokio::select! {
+                result = &mut writing => panic!("writer finished before blocking: {result:?}"),
+                result = reader.read_exact(&mut first_byte) => { result.unwrap(); }
+            }
+            assert_eq!(first_byte, [b'1']);
+            assert_eq!(
+                (
+                    peer_budget.available_permits(),
+                    global_budget.available_permits()
+                ),
+                (0, 0)
+            );
+            if cancel {
+                drop(writing);
+            } else {
+                assert_eq!(
+                    writing.await,
+                    Err("write timed out after 100 ms".to_string())
+                );
+            }
+            assert!(tx.is_closed());
+            assert_eq!(
+                (
+                    peer_budget.available_permits(),
+                    global_budget.available_permits()
+                ),
+                (16, 16)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn partial_header_is_subject_to_frame_timeout() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -1922,6 +2061,48 @@ mod tests {
 
         assert!(
             matches!(err, PeerReadError::Io(message) if message.contains("frame read timed out"))
+        );
+    }
+
+    #[tokio::test]
+    async fn trickled_body_does_not_extend_frame_deadline() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, remote) = listener.accept().await.unwrap();
+        let SocketAddr::V4(remote) = remote else {
+            panic!("IPv4 required")
+        };
+        let (reader, _writer) = server.into_split();
+        let mut config = (*test_config()).clone();
+        config.peer_frame_timeout = Duration::from_millis(100);
+        let resources = network_resources(
+            Arc::new(Mutex::new(NodeState::new(10, &[]))),
+            Arc::new(PendingRequests::default()),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(config),
+        );
+        // Announce a valid-size frame, but keep its body incomplete throughout.
+        client.write_all(&[0, 4, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let trickle = async move {
+            loop {
+                sleep(Duration::from_millis(10)).await;
+                if client.write_all(&[0]).await.is_err() {
+                    break;
+                }
+            }
+            std::future::pending::<()>().await;
+        };
+        let result = tokio::select! {
+            result = timeout(Duration::from_millis(500), read_peer_frames(reader, 1, remote, resources)) => result,
+            _ = trickle => unreachable!(),
+        };
+        let error = result
+            .expect("continuous trickle must not reset the deadline")
+            .unwrap_err();
+        assert!(
+            matches!(error, PeerReadError::Io(message) if message.contains("frame read timed out"))
         );
     }
 
@@ -1973,6 +2154,34 @@ mod tests {
         let locked = state.lock().await;
         assert_eq!(locked.outgoing_count(), 0);
         assert_eq!(locked.pool_stats(Instant::now()).cooldown, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_worker_clears_session_and_requested_disconnect_reason() {
+        for disconnect_first in [false, true] {
+            let state = Mutex::new(NodeState::new(1_000, &[]));
+            let pending = PendingRequests::default();
+            let remote = peer(12);
+            let (tx, _rx) = mpsc::channel(1);
+            let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+            let peer_id = state
+                .lock()
+                .await
+                .register_session(remote, true, tx, disconnect_tx, DEFAULT_PORT)
+                .expect("session should register");
+            if disconnect_first {
+                state
+                    .lock()
+                    .await
+                    .disconnect_session_with_reason(peer_id, DisconnectReason::Administrative);
+            }
+            let worker = tokio::spawn(async { panic!("injected worker failure") });
+            finish_connection_worker(worker, peer_id, remote, &state, &pending).await;
+            let mut locked = state.lock().await;
+            assert_eq!(locked.outgoing_count(), 0);
+            assert_eq!(locked.take_disconnect_reason(peer_id), None);
+            assert_eq!(locked.pool_stats(Instant::now()).cooldown, 0);
+        }
     }
 
     #[tokio::test]
@@ -2146,5 +2355,186 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(pending.active_count(), 0);
+    }
+    #[test]
+    fn concurrent_retirement_cannot_cancel_an_accepted_frame() {
+        for _ in 0..64 {
+            let mut state = NodeState::new(10, &[]);
+            let (tx, mut rx) = mpsc::channel(4);
+            let (disconnect, _watch) = watch::channel(false);
+            let id = state
+                .register_session(peer(1), true, tx, disconnect, DEFAULT_PORT)
+                .unwrap();
+            state.set_connected_at(id, Instant::now() - Duration::from_secs(31));
+            let copied = state.target(id).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let retire_barrier = Arc::clone(&barrier);
+            let retiring = std::thread::spawn(move || {
+                retire_barrier.wait();
+                let retired = state.retire_selection_peer(id);
+                (state, retired)
+            });
+            barrier.wait();
+            let result = dispatch_frame(
+                vec![copied],
+                &Bytes::from_static(b"transaction"),
+                &outbound_budget(),
+            );
+            let (state, retired) = retiring.join().unwrap();
+            match (result.sent_count, retired) {
+                (1, None) => {
+                    assert!(state.target(id).is_some());
+                    assert_eq!(
+                        rx.try_recv().unwrap().bytes,
+                        Bytes::from_static(b"transaction")
+                    );
+                }
+                (0, Some(remote)) => {
+                    assert_eq!(remote, peer(1));
+                    assert!(state.target(id).is_none());
+                    assert!(rx.is_empty());
+                }
+                outcome => panic!("retirement/admission were not exclusive: {outcome:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn retirement_and_copied_target_admission_are_mutually_exclusive() {
+        for retire_first in [false, true] {
+            let mut state = NodeState::new(10, &[]);
+            let (tx, mut rx) = mpsc::channel(4);
+            let (disconnect, watch) = watch::channel(false);
+            let id = state
+                .register_session(peer(1), true, tx, disconnect, DEFAULT_PORT)
+                .unwrap();
+            state.set_connected_at(id, Instant::now() - Duration::from_secs(31));
+            let copied = state.target(id).unwrap();
+            assert!(state.selection_retirement_ready(id));
+            if retire_first {
+                assert_eq!(state.retire_selection_peer(id), Some(peer(1)));
+            }
+            let result = dispatch_frame(
+                vec![copied],
+                &Bytes::from_static(b"transaction"),
+                &outbound_budget(),
+            );
+            if retire_first {
+                assert_eq!(result.sent_count, 0);
+                assert!(rx.is_empty());
+                assert!(*watch.borrow());
+            } else {
+                assert_eq!(result.sent_count, 1);
+                assert_eq!(state.retire_selection_peer(id), None);
+                let writing = rx.try_recv().unwrap();
+                assert_eq!(state.retire_selection_peer(id), None);
+                assert!(!*watch.borrow());
+                drop(writing);
+                assert_eq!(state.retire_selection_peer(id), Some(peer(1)));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn qualified_candidate_replaces_only_an_idle_peer_without_emptying_pool() {
+        for busy in [false, true] {
+            let state = Arc::new(Mutex::new(NodeState::new(10, &[peer(1), peer(2)])));
+            let (old_tx, _old_rx) = mpsc::channel(4);
+            let (disconnect_tx, mut disconnect_rx) = watch::channel(false);
+            let id = state
+                .lock()
+                .await
+                .register_session(peer(1), true, old_tx, disconnect_tx, DEFAULT_PORT)
+                .unwrap();
+            state
+                .lock()
+                .await
+                .set_connected_at(id, Instant::now() - Duration::from_secs(31));
+            assert_eq!(
+                state.lock().await.choose_dial_targets_at(1, Instant::now()),
+                vec![peer(2)]
+            );
+            let target = state.lock().await.target(id).unwrap();
+            let in_flight = busy.then(|| {
+                OutboundFrame::try_new(
+                    Bytes::from_static(b"test"),
+                    Arc::clone(&target.byte_budget),
+                    outbound_budget(),
+                )
+                .unwrap()
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (_server, _) = listener.accept().await.unwrap();
+            let mut config = (*test_config()).clone();
+            config.target_outbound = 1;
+            let resources = network_resources(
+                state.clone(),
+                Arc::new(PendingRequests::default()),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(config),
+            );
+            let task = tokio::spawn(activate_connection(
+                stream,
+                peer(2),
+                resources,
+                Bytes::from(build_exchange_public_peers_frame(
+                    [Ipv4Addr::UNSPECIFIED; 4],
+                )),
+                Some(id),
+            ));
+            if busy {
+                timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let locked = state.lock().await;
+                assert_eq!(
+                    (
+                        locked.outgoing_count(),
+                        locked.remote_ip(id),
+                        locked.pending_dial_count()
+                    ),
+                    (1, Some(*peer(1).ip()), 0)
+                );
+                assert!(!*disconnect_rx.borrow());
+            } else {
+                timeout(Duration::from_secs(1), disconnect_rx.changed())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut locked = state.lock().await;
+                let targets = locked.collect_all_targets(10);
+                assert_eq!(
+                    (
+                        locked.outgoing_count(),
+                        targets.len(),
+                        locked.target(id).is_none(),
+                        locked.pending_dial_count()
+                    ),
+                    (1, 1, true, 0)
+                );
+                assert_eq!(locked.remote_ip(targets[0].peer_id), Some(*peer(2).ip()));
+                let stale_dispatch = dispatch_frame(
+                    vec![target],
+                    &Bytes::from_static(b"late transaction"),
+                    &outbound_budget(),
+                );
+                assert_eq!(stale_dispatch.sent_count, 0);
+                assert!(_old_rx.is_empty());
+                locked.disconnect_session_with_reason(
+                    targets[0].peer_id,
+                    DisconnectReason::Administrative,
+                );
+                drop(locked);
+                timeout(Duration::from_secs(1), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            drop(in_flight);
+        }
     }
 }

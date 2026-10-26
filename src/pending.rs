@@ -39,10 +39,17 @@ pub(crate) enum DeliveryOutcome {
     ProtocolViolation,
 }
 
-#[derive(Debug)]
 pub(crate) struct PendingFrame {
     bytes: Bytes,
     _byte_permit: OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for PendingFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingFrame")
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::ops::Deref for PendingFrame {
@@ -102,10 +109,10 @@ struct PendingState {
     completed_order: VecDeque<(u32, Instant)>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct CompletedRequest {
     expires_at: Instant,
-    repeated_is_violation: bool,
+    duplicate_peers: HashSet<u64>,
 }
 
 #[derive(Debug)]
@@ -295,7 +302,7 @@ impl PendingRequests {
             .expect("pending mutex should not be poisoned");
         inner.prune_completed(Instant::now());
         if let Some(completed) = inner.completed.get(&dejavu) {
-            return if completed.repeated_is_violation {
+            return if completed.duplicate_peers.contains(&peer_id) {
                 DeliveryOutcome::ProtocolViolation
             } else {
                 DeliveryOutcome::Ignored
@@ -363,7 +370,8 @@ impl PendingRequests {
             peer.received_terminal_frames += 1;
         }
         let outcome = match peer.tx.try_send(PendingEvent::Frame(PendingFrame {
-            bytes: frame,
+            // A slice can retain a much larger TCP receive allocation than its length.
+            bytes: Bytes::copy_from_slice(&frame),
             _byte_permit: byte_permit,
         })) {
             Ok(()) if request.pass_through => DeliveryOutcome::PassThrough,
@@ -409,13 +417,21 @@ impl PendingRequests {
             .inner
             .lock()
             .expect("pending mutex should not be poisoned");
-        inner.requests.remove(&dejavu);
+        let request = inner.requests.remove(&dejavu);
+        // Cancellation or timeout before any response is not evidence of a duplicate.
+        let duplicate_peers = request
+            .into_iter()
+            .flat_map(|request| request.peers)
+            .filter_map(|(peer_id, peer)| {
+                (repeated_is_violation && peer.received_frames > 0).then_some(peer_id)
+            })
+            .collect();
         let expires_at = Instant::now() + COMPLETED_DEJAVU_TTL;
         inner.completed.insert(
             dejavu,
             CompletedRequest {
                 expires_at,
-                repeated_is_violation,
+                duplicate_peers,
             },
         );
         inner.completed_order.push_back((dejavu, expires_at));
@@ -471,7 +487,115 @@ impl Drop for PendingRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_frame_debug_omits_payload() {
+        let bytes = Bytes::from_static(b"secret-preimage");
+        let frame = PendingFrame::for_test(bytes.clone());
+        assert_eq!(format!("{frame:?}"), "PendingFrame { len: 15, .. }");
+        assert_eq!(&*frame, bytes.as_ref());
+        let event = PendingEvent::Frame(frame);
+        assert!(!format!("{event:#?}").contains("secret-preimage"));
+    }
+
     const CORE_MAX_RESPONSE_FRAMES: usize = 4096;
+
+    #[test]
+    fn completed_control_duplicate_is_bound_to_responding_peer() {
+        let pending = Arc::new(PendingRequests::default());
+        let (registration, _receiver) = pending.register_control(
+            10,
+            PendingSpec {
+                response_rules: &[ResponseRule {
+                    message_type: 35,
+                    min_frame_bytes: 8,
+                    max_frame_bytes: 8,
+                    max_frames: 1,
+                    terminal: true,
+                }],
+                max_response_frames: 1,
+                max_response_bytes: 8,
+            },
+        );
+        let dejavu = registration.dejavu();
+        let frame = Bytes::from(crate::frame::build_request_frame(35, dejavu, &[]).unwrap());
+        assert_eq!(
+            pending.deliver(10, dejavu, frame.clone()),
+            DeliveryOutcome::PassThrough
+        );
+        drop(registration);
+        assert_eq!(
+            pending.deliver(20, dejavu, frame.clone()),
+            DeliveryOutcome::Ignored
+        );
+        assert_eq!(
+            pending.deliver(10, dejavu, frame),
+            DeliveryOutcome::ProtocolViolation
+        );
+    }
+
+    #[test]
+    fn completed_cache_churn_and_expiry_preserve_active_request() {
+        let pending = Arc::new(PendingRequests::default());
+        let (active, mut receivers) = pending.register([10]);
+        for _ in 0..MAX_COMPLETED_DEJAVUS + 128 {
+            let (finished, _) = pending.register([10]);
+            assert_ne!(finished.dejavu(), active.dejavu());
+            drop(finished);
+        }
+        {
+            let mut state = pending.inner.lock().unwrap();
+            assert_eq!(state.completed.len(), MAX_COMPLETED_DEJAVUS);
+            assert_eq!(state.completed_order.len(), MAX_COMPLETED_DEJAVUS);
+            assert!(state.requests.contains_key(&active.dejavu()));
+            let expiry = state.completed_order.back().unwrap().1;
+            state.prune_completed(expiry);
+            assert!(state.completed.is_empty());
+            assert!(state.completed_order.is_empty());
+            assert!(state.requests.contains_key(&active.dejavu()));
+        }
+        let response =
+            Bytes::from(crate::frame::build_request_frame(35, active.dejavu(), &[]).unwrap());
+        assert_eq!(
+            pending.deliver(10, active.dejavu(), response.clone()),
+            DeliveryOutcome::Delivered
+        );
+        let PendingEvent::Frame(received) = receivers[0].1.try_recv().unwrap() else {
+            panic!("expected active response");
+        };
+        assert_eq!(received, response);
+        drop(active);
+        assert_eq!(pending.active_count(), 0);
+    }
+
+    #[test]
+    fn queued_response_does_not_retain_the_shared_receive_allocation() {
+        struct SharedBuffer(Arc<Vec<u8>>);
+        impl AsRef<[u8]> for SharedBuffer {
+            fn as_ref(&self) -> &[u8] {
+                self.0.as_slice()
+            }
+        }
+        let pending = Arc::new(PendingRequests::default());
+        let (registration, mut receivers) = pending.register([10]);
+        let expected = crate::frame::build_request_frame(35, registration.dejavu(), &[]).unwrap();
+        let mut storage = vec![0; 1024 * 1024];
+        storage[..expected.len()].copy_from_slice(&expected);
+        let owner = Arc::new(storage);
+        let allocation = Arc::downgrade(&owner);
+        let frame = Bytes::from_owner(SharedBuffer(owner)).slice(..expected.len());
+        assert_eq!(
+            pending.deliver(10, registration.dejavu(), frame),
+            DeliveryOutcome::Delivered
+        );
+        assert!(
+            allocation.upgrade().is_none(),
+            "small queued frame retained the entire receive allocation"
+        );
+        let PendingEvent::Frame(queued) = receivers[0].1.try_recv().unwrap() else {
+            panic!("expected queued response");
+        };
+        assert_eq!(&*queued, expected.as_slice());
+    }
 
     #[tokio::test]
     async fn routes_by_peer_and_dejavu_and_suppresses_late_frames() {
@@ -691,6 +815,40 @@ mod tests {
             pending.deliver(10, dejavu, Bytes::from_static(&[8, 0, 0, 24, 0, 0, 0, 0]),),
             DeliveryOutcome::ProtocolViolation
         );
+    }
+
+    #[test]
+    fn unanswered_control_request_ignores_late_first_response() {
+        let pending = Arc::new(PendingRequests::default());
+        let spec = PendingSpec {
+            response_rules: &[ResponseRule {
+                message_type: 35,
+                min_frame_bytes: 8,
+                max_frame_bytes: 8,
+                max_frames: 1,
+                terminal: true,
+            }],
+            max_response_frames: 1,
+            max_response_bytes: 8,
+        };
+        let (expired, expired_receiver) = pending.register_control(10, spec);
+        let old_nonce = expired.dejavu();
+        drop(expired_receiver);
+        drop(expired);
+        let (retry, mut receiver) = pending.register_control(10, spec);
+        let late = Bytes::from(crate::frame::build_request_frame(35, old_nonce, &[]).unwrap());
+        assert_eq!(
+            pending.deliver(10, old_nonce, late),
+            DeliveryOutcome::Ignored
+        );
+        assert!(receiver.try_recv().is_err());
+        let response =
+            Bytes::from(crate::frame::build_request_frame(35, retry.dejavu(), &[]).unwrap());
+        assert_eq!(
+            pending.deliver(10, retry.dejavu(), response),
+            DeliveryOutcome::PassThrough
+        );
+        assert!(receiver.try_recv().is_ok());
     }
 
     #[tokio::test]

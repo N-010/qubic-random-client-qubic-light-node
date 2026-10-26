@@ -12,7 +12,8 @@ pub(crate) struct TickStatus {
     pub(crate) epoch: u16,
     pub(crate) tick: u32,
     pub(crate) initial_tick: u32,
-    pub(crate) tick_duration_ms: u16,
+    // Core reports elapsed whole seconds in the current tick, converted to milliseconds.
+    pub(crate) tick_duration_ms: u32,
     pub(crate) aligned_votes: u16,
     pub(crate) misaligned_votes: u16,
 }

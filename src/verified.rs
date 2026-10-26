@@ -23,12 +23,12 @@ pub(crate) enum ComputorVerification {
     Accepted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TickDataVerification {
     Malformed,
     Unavailable,
     BadSignature,
-    Authenticated { has_transactions: bool },
+    Authenticated { transaction_digests: Vec<[u8; 32]> },
 }
 
 #[derive(Debug)]
@@ -155,7 +155,11 @@ impl TrustedNetworkState {
         }
 
         TickDataVerification::Authenticated {
-            has_transactions: !non_zero_digests.is_empty(),
+            transaction_digests: payload[TICK_DATA_TRANSACTION_DIGESTS_OFFSET..digests_end]
+                .chunks_exact(32)
+                .filter(|digest| digest.iter().any(|byte| *byte != 0))
+                .map(|digest| digest.try_into().expect("validated digest size"))
+                .collect(),
         }
     }
 
@@ -257,10 +261,6 @@ fn days_in_month(wire_year: u8, month: u8) -> u8 {
     }
 }
 
-fn is_qubic_leap_year(year: u16) -> bool {
-    year.is_multiple_of(4)
-}
-
 fn utc_millis(
     year: u16,
     month: u8,
@@ -270,19 +270,16 @@ fn utc_millis(
     second: u8,
     millisecond: u16,
 ) -> i64 {
-    let days_before_year: i64 = (1970..year)
-        .map(|candidate| {
-            if is_qubic_leap_year(candidate) {
-                366
-            } else {
-                365
-            }
-        })
-        .sum();
-    let days_before_month: i64 = (1..month)
-        .map(|candidate| i64::from(days_in_month((year - 2000) as u8, candidate)))
-        .sum();
-    let days = days_before_year + days_before_month + i64::from(day - 1);
+    // Core platform/time.h dayIndex, shifted to the Unix epoch (719468).
+    // Its Gregorian conversion is distinct from the packet's year % 4 day guard.
+    let shifted_month = (i64::from(month) + 9) % 12;
+    let adjusted_year = i64::from(year) - shifted_month / 10;
+    let days = adjusted_year * 365 + adjusted_year / 4 - adjusted_year / 100
+        + adjusted_year / 400
+        + (shifted_month * 306 + 5) / 10
+        + i64::from(day)
+        - 1
+        - 719_468;
     (((days * 24 + i64::from(hour)) * 60 + i64::from(minute)) * 60 + i64::from(second)) * 1_000
         + i64::from(millisecond)
 }
@@ -339,6 +336,60 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
+    fn tick_timestamp_matches_core_gregorian_century_boundaries() {
+        let cases = [
+            (2000, 2, 29, 951_782_400_000),
+            (2026, 10, 25, 1_792_886_400_000),
+            (2099, 12, 31, 4_102_358_400_000),
+            (2100, 3, 1, 4_107_542_400_000),
+            (2101, 1, 1, 4_133_980_800_000),
+            (2200, 3, 1, 7_263_216_000_000),
+            (2255, 12, 31, 9_025_171_200_000),
+        ];
+        for (year, month, day, expected) in cases {
+            assert_eq!(utc_millis(year, month, day, 0, 0, 0, 0), expected);
+            assert_eq!(
+                utc_millis(year, month, day, 23, 59, 59, 999),
+                expected + 86_399_999
+            );
+        }
+        // Core's packet field guard permits this day; its dayIndex maps it to March 1.
+        assert_eq!(days_in_month(100, 2), 29);
+        assert_eq!(
+            utc_millis(2100, 2, 29, 0, 0, 0, 0),
+            utc_millis(2100, 3, 1, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn authenticated_digests_preserve_slot_order_and_skip_zero_slots() {
+        let (epoch, tick) = (301, 12_345);
+        let (mut payload, computor, key) = signed_tick_data_for_test(epoch, tick, true);
+        let offset = TICK_DATA_TRANSACTION_DIGESTS_OFFSET + 2 * 32;
+        payload[offset..offset + 32].fill(3);
+        let last =
+            TICK_DATA_TRANSACTION_DIGESTS_OFFSET + (NUMBER_OF_TRANSACTIONS_PER_TICK - 1) * 32;
+        payload[last..last + 32].fill(7);
+        let mut body = payload[..TICK_DATA_UNSIGNED_SIZE].to_vec();
+        body[0] ^= BROADCAST_FUTURE_TICK_DATA_TYPE;
+        let (_, signature) = qubic_fourq_verifier::test_signing::sign_digest(&[7; 32], &k12(&body));
+        payload[TICK_DATA_UNSIGNED_SIZE..].copy_from_slice(&signature);
+        let trusted = TrustedNetworkState::default();
+        trusted.set_computor_key_for_test(epoch, computor, key);
+        assert_eq!(
+            trusted.verify_tick_data(&payload, tick),
+            TickDataVerification::Authenticated {
+                transaction_digests: vec![[9; 32], [3; 32], [7; 32]],
+            }
+        );
+        payload[offset] ^= 1;
+        assert_eq!(
+            trusted.verify_tick_data(&payload, tick),
+            TickDataVerification::BadSignature
+        );
+    }
+
+    #[test]
     fn tick_data_verification_distinguishes_empty_and_non_empty_ticks() {
         let epoch = 301;
         let tick = 12_345;
@@ -351,7 +402,7 @@ mod tests {
             assert_eq!(
                 trusted.verify_tick_data(&payload, tick),
                 TickDataVerification::Authenticated {
-                    has_transactions: expected
+                    transaction_digests: if expected { vec![[9; 32]] } else { vec![] }
                 }
             );
         }
@@ -435,6 +486,51 @@ mod tests {
 
         let inner = trusted.inner.lock().unwrap();
         assert_eq!(inner.computor_keys, first_keys);
+    }
+
+    #[test]
+    fn epoch_rotation_cannot_be_rolled_back_to_authenticate_old_tick_data() {
+        let trusted = TrustedNetworkState::default();
+        let tick = 12_345;
+        let (old_payload, _, key) = signed_tick_data_for_test(301, tick, true);
+        let (new_payload, _, _) = signed_tick_data_for_test(302, tick, true);
+        let keys = vec![key; NUMBER_OF_COMPUTORS].into_boxed_slice();
+        assert_eq!(
+            trusted.apply_computors(AuthenticatedComputors {
+                epoch: 301,
+                keys: keys.clone(),
+            }),
+            ComputorVerification::Accepted
+        );
+        let authenticated = TickDataVerification::Authenticated {
+            transaction_digests: vec![[9; 32]],
+        };
+        assert_eq!(trusted.verify_tick_data(&old_payload, tick), authenticated);
+        assert_eq!(
+            trusted.verify_tick_data(&new_payload, tick),
+            TickDataVerification::Unavailable
+        );
+        assert_eq!(
+            trusted.apply_computors(AuthenticatedComputors {
+                epoch: 302,
+                keys: keys.clone(),
+            }),
+            ComputorVerification::Accepted
+        );
+        assert_eq!(trusted.verify_tick_data(&new_payload, tick), authenticated);
+        assert_eq!(
+            trusted.verify_tick_data(&old_payload, tick),
+            TickDataVerification::Unavailable
+        );
+        assert_eq!(
+            trusted.apply_computors(AuthenticatedComputors { epoch: 301, keys }),
+            ComputorVerification::AuthenticatedStale
+        );
+        assert_eq!(
+            trusted.verify_tick_data(&old_payload, tick),
+            TickDataVerification::Unavailable
+        );
+        assert_eq!(trusted.verify_tick_data(&new_payload, tick), authenticated);
     }
 
     #[test]

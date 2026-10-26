@@ -18,11 +18,7 @@ pub(crate) async fn run() -> std::io::Result<()> {
     let configured_seed_peers = config.seed_peers.clone();
 
     if config.dns_bootstrap && config.seed_peers.is_empty() {
-        let dns_lite_peers = if config.dns_lite_peers == 0 {
-            (config.target_outbound * 3).max(8)
-        } else {
-            config.dns_lite_peers
-        };
+        let dns_lite_peers = config.bootstrap_lite_peers();
 
         match fetch_seed_peers_from_dns(config.peer_port, dns_lite_peers, config.dns_timeout).await
         {

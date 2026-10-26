@@ -87,11 +87,19 @@ impl std::fmt::Display for DisconnectReason {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct OutboundFrame {
     pub(crate) bytes: Bytes,
+    pub(crate) queued_at: Instant,
     _peer_bytes: OwnedSemaphorePermit,
     _global_bytes: OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for OutboundFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutboundFrame")
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl OutboundFrame {
@@ -110,6 +118,7 @@ impl OutboundFrame {
             .map_err(|_| OutboundAdmissionError::GlobalBudgetExhausted)?;
         Ok(Self {
             bytes,
+            queued_at: Instant::now(),
             _peer_bytes: peer_bytes,
             _global_bytes: global_bytes,
         })
@@ -298,6 +307,43 @@ impl NodeState {
             .choose_multiple(&mut rand::rng(), limit)
     }
 
+    pub(crate) fn selection_retirement_ready(&self, peer_id: u64) -> bool {
+        self.sessions.get(&peer_id).is_some_and(|session| {
+            session.connected_at.elapsed() >= Duration::from_secs(30)
+                && session.tx.capacity() == session.tx.max_capacity()
+                && session.byte_budget.available_permits() == PEER_OUTBOUND_QUEUE_BYTES
+        })
+    }
+
+    pub(crate) fn retire_selection_peer(&mut self, peer_id: u64) -> Option<SocketAddrV4> {
+        if !self.selection_retirement_ready(peer_id) {
+            return None;
+        }
+        let budget = Arc::clone(&self.sessions.get(&peer_id)?.byte_budget);
+        // Frame permits are held from admission through completion of the write.
+        // Acquiring the entire budget atomically excludes even copied targets.
+        let _exclusive = Arc::clone(&budget)
+            .try_acquire_many_owned(PEER_OUTBOUND_QUEUE_BYTES as u32)
+            .ok()?;
+        budget.close();
+        self.disconnect_session_with_reason(peer_id, DisconnectReason::Administrative)
+    }
+
+    pub(crate) fn defer_selection_candidate(
+        &mut self,
+        peer: SocketAddrV4,
+        now: Instant,
+        delay: Duration,
+    ) {
+        self.pending_dials.remove(&peer);
+        let health = self.peer_health.entry(peer).or_insert(PeerHealth {
+            consecutive_failures: 0,
+            retry_after: now,
+        });
+        health.retry_after = health.retry_after.max(now + delay);
+        self.enforce_known_peer_limit();
+    }
+
     pub(crate) fn target(&self, peer_id: u64) -> Option<RelayTarget> {
         let session = self.sessions.get(&peer_id)?;
         Some(RelayTarget {
@@ -308,7 +354,7 @@ impl NodeState {
     }
 
     #[cfg(test)]
-    fn set_connected_at(&mut self, peer_id: u64, connected_at: Instant) {
+    pub(crate) fn set_connected_at(&mut self, peer_id: u64, connected_at: Instant) {
         self.sessions
             .get_mut(&peer_id)
             .expect("test session should exist")
@@ -691,6 +737,19 @@ impl Drop for DedupReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn outbound_frame_debug_omits_payload() {
+        let bytes = Bytes::from_static(b"secret-preimage");
+        let frame = OutboundFrame::try_new(
+            bytes.clone(),
+            Arc::new(Semaphore::new(100)),
+            Arc::new(Semaphore::new(100)),
+        )
+        .unwrap();
+        assert_eq!(format!("{frame:?}"), "OutboundFrame { len: 15, .. }");
+        assert_eq!(frame.bytes, bytes);
+    }
+
     use crate::config::DEFAULT_PORT;
     use pretty_assertions::assert_eq;
 
@@ -1017,5 +1076,50 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(global_error, OutboundAdmissionError::GlobalBudgetExhausted);
+    }
+    #[test]
+    fn selection_never_retires_a_new_or_busy_connection() {
+        let remote = peer(1, 1, 1, 1);
+        let mut state = NodeState::new(10, &[remote]);
+        let (tx, mut rx) = mpsc::channel(4);
+        let (disconnect, _watch) = watch::channel(false);
+        let id = state
+            .register_session(remote, true, tx, disconnect, DEFAULT_PORT)
+            .unwrap();
+        assert!(!state.selection_retirement_ready(id));
+        state.set_connected_at(id, Instant::now() - Duration::from_secs(31));
+        assert!(state.selection_retirement_ready(id));
+        let target = state.target(id).unwrap();
+        let frame = OutboundFrame::try_new(
+            Bytes::from_static(b"test"),
+            target.byte_budget,
+            Arc::new(Semaphore::new(100)),
+        )
+        .unwrap();
+        target.tx.try_send(frame).unwrap();
+        assert!(!state.selection_retirement_ready(id));
+        let in_flight = rx.try_recv().unwrap();
+        assert!(!state.selection_retirement_ready(id));
+        drop(in_flight);
+        assert!(state.selection_retirement_ready(id));
+    }
+
+    #[test]
+    fn rejected_candidate_releases_reservation_and_observes_cooldown() {
+        let remote = peer(1, 1, 1, 1);
+        let mut state = NodeState::new(10, &[remote]);
+        let now = Instant::now();
+        assert_eq!(state.choose_dial_targets_at(1, now), vec![remote]);
+        state.defer_selection_candidate(remote, now, Duration::from_secs(120));
+        assert_eq!(state.pending_dial_count(), 0);
+        assert!(
+            state
+                .choose_dial_targets_at(1, now + Duration::from_secs(119))
+                .is_empty()
+        );
+        assert_eq!(
+            state.choose_dial_targets_at(1, now + Duration::from_secs(120)),
+            vec![remote]
+        );
     }
 }

@@ -294,7 +294,9 @@ fn parse_current_tick_info_payload(payload: &[u8]) -> Result<TickStatus, String>
     }
 
     Ok(TickStatus {
-        tick_duration_ms: read_u16(payload, 0).ok_or_else(|| "tickDuration missing".to_string())?,
+        tick_duration_ms: u32::from(
+            read_u16(payload, 0).ok_or_else(|| "tickDuration missing".to_string())?,
+        ) * 1_000,
         epoch: read_u16(payload, 2).ok_or_else(|| "epoch missing".to_string())?,
         tick: read_u32(payload, 4).ok_or_else(|| "tick missing".to_string())?,
         aligned_votes: read_u16(payload, 8).ok_or_else(|| "aligned votes missing".to_string())?,
@@ -314,9 +316,17 @@ pub(crate) struct TransactionLayout {
     pub(crate) signature_start: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) struct ValidatedTransaction<'a> {
     bytes: &'a [u8],
+}
+
+impl std::fmt::Debug for ValidatedTransaction<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatedTransaction")
+            .field("len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> ValidatedTransaction<'a> {
@@ -412,6 +422,17 @@ pub(crate) fn parse_transaction_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validated_transaction_debug_omits_payload() {
+        let bytes = [173; 144];
+        let transaction = ValidatedTransaction { bytes: &bytes };
+        assert_eq!(
+            format!("{transaction:?}"),
+            "ValidatedTransaction { len: 144, .. }"
+        );
+        assert_eq!(transaction.bytes(), &bytes);
+    }
+
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
 
@@ -669,6 +690,22 @@ mod tests {
         let oversized_current_tick =
             build_request_frame(RESPOND_CURRENT_TICK_INFO_TYPE, 1, &[0; 17]).unwrap();
         assert_eq!(parse_tick_status_from_frame(&oversized_current_tick), None);
+    }
+
+    #[test]
+    fn current_tick_elapsed_seconds_are_converted_to_milliseconds() {
+        for seconds in [0u16, 1, 65, 66, u16::MAX] {
+            let mut payload = [0; RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE];
+            payload[..2].copy_from_slice(&seconds.to_le_bytes());
+            payload[2..4].copy_from_slice(&236u16.to_le_bytes());
+            payload[4..8].copy_from_slice(&123u32.to_le_bytes());
+            let frame = build_request_frame(RESPOND_CURRENT_TICK_INFO_TYPE, 1, &payload).unwrap();
+            let status = parse_tick_status_from_frame(&frame).unwrap();
+            assert_eq!(
+                u64::from(status.tick_duration_ms),
+                u64::from(seconds) * 1_000
+            );
+        }
     }
 
     #[test]

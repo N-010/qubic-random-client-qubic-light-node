@@ -62,7 +62,8 @@ transactions, and persists no peer or consensus state.
 The product boundary contains exactly four RandomClient operations:
 
 - observe current epoch/tick status;
-- report whether one current-epoch historical tick has transactions;
+- report transaction presence and the complete authenticated digest set for
+  one current-epoch historical tick;
 - execute a read-only contract-function query with raw input/output bytes;
 - validate and broadcast exact signed transaction bytes.
 
@@ -77,6 +78,7 @@ a locally invented peer-consensus algorithm.
 | `src/main.rs` / `src/app.rs` | Enter Tokio, build shared state, start networking and gRPC, emit trust warnings, and handle `Ctrl+C`. |
 | `src/config.rs` / `src/dns.rs` | Parse and validate CLI configuration, manual peers, bootstrap peers, timeouts, and resource limits. |
 | `src/network.rs` | Maintain outbound sessions, perform the Core handshake, read/write frames, bootstrap computors, dispatch broadcasts, and enforce connection policy. |
+| `src/peer_selection.rs` | Measure active peers and qualify one replacement independently of broadcasts. |
 | `src/state.rs` | Own the bounded peer pool, session registry, cooldowns, queue admissions, and signed-message deduplication windows. |
 | `src/frame.rs` / `src/codec.rs` | Encode and decode the required Core layouts, validate transactions, compute K12 digests and Qubic identifiers, and reject bogon gossip. |
 | `src/pending.rs` / `src/peer_api.rs` | Correlate responses by peer and `dejavu`, enforce response contracts, race bounded peer queries, and apply deadlines. |
@@ -109,6 +111,12 @@ connected peers, no authenticated computor list, and no tick observation.
 
 ## Peer lifecycle and discovery
 
+- HTTPS bootstrap response bodies are limited to 1 MiB before JSON parsing.
+  Both declared Content-Length and streamed chunks are checked; an oversized
+  response fails bootstrap under the existing retry policy.
+- Initial, emergency, and periodic DNS requests share the same count policy:
+  a non-zero `--dns-lite-peers` is used exactly; zero selects three times the
+  outbound target (saturating), with a minimum of eight.
 - Manual, DNS, and gossip peers enter one bounded pool with that priority
   order. Manual peers are not displaced by lower-priority discoveries.
 - Bogon, multicast, documentation, loopback, and private addresses received
@@ -125,11 +133,81 @@ connected peers, no authenticated computor list, and no tick observation.
 - Each registered session owns a bounded writer queue, reader task, disconnect
   signal, and computor-bootstrap task. I/O failure, malformed protocol input,
   or peer-specific queue failure removes and cools down the peer.
+- If a connection worker panics or is cancelled, its supervisor unregisters
+  the session, removes any saved disconnect reason, and notifies pending requests.
+  This local task failure does not add a peer penalty; an already applied
+  peer-specific penalty is retained.
 - If the established count remains below the configured critical threshold,
   emergency DNS bootstrap retries with bounded exponential backoff.
 
 QubicLightNode accepts no inbound Qubic sessions and does not advertise itself
 as a public peer.
+
+Initial and emergency DNS bootstrap share the automatic lite-peer count:
+`max(8, target_outbound * 3)`, using saturating multiplication so accepted CLI
+values cannot panic or wrap the count. A non-zero explicit `dns_lite_peers`
+overrides this automatic count. Response-body and known-peer bounds still apply.
+
+### Background peer selection (approved 2026-10-25)
+
+RandomClient needs ready connections at its T-4 reveal gate. A separate Tokio
+task evaluates the active pool without probing or dialing on the broadcast
+path. A cycle starts after a ten-second delay and probes at most three sessions
+concurrently, each with a one-second deadline, using Core RequestCurrentTickInfo
+(27) and its exact 16-byte response (28). Existing pending correlation, queues
+and byte budgets apply; local overload is not scored as peer failure. A good
+sample has the snapshot epoch and a tick no more than three behind the snapshot
+taken before the probe. This uses the existing unauthenticated cache, not a
+consensus rule. RTT uses a 3/4 previous + 1/4 current EWMA.
+
+At most once per 30 seconds, when the working pool is full and no ordinary dial
+is pending, one eligible address is reserved from the bounded discovery pool.
+There may be one additional TCP socket beyond target_outbound during qualification.
+It completes the Core handshake and three correlated probes, 250 ms apart,
+within ten seconds overall. Each probe has a one-second deadline and budgets
+of 4,096 frames and 8 MiB, plus the configured per-frame maximum. Unrelated frames
+are discarded during qualification and do not update trusted state or the tick
+cache. The candidate is not an API or broadcast recipient before activation.
+
+Replacement requires three good candidate samples and either three consecutive
+bad old-peer samples, or three good old-peer samples with an RTT improvement
+greater than both 25% and 20 ms. Comparison observations expire after 60 seconds.
+A gap longer than 60 seconds between scored samples resets both streaks and
+the RTT estimate before recording the next sample. Skipped local-overload samples
+do not renew evidence; one new observation cannot revive an expired history.
+Recovery resets the bad streak. A single failure cannot trigger replacement.
+The old session must be at least 30 seconds old with no queued or in-flight
+outbound bytes. Ranking excludes sessions that cannot currently be retired,
+so a busy worst peer cannot hide another eligible improvement. Quality history
+is retained for busy peers. Activation rechecks eligibility and registers the new connection
+before administratively removing the old one in the same state-lock section.
+Before retirement, it atomically acquires the entire old peer byte budget and
+closes that semaphore while holding all permits. Every outbound frame holds its
+permits from admission through write completion, so a concurrent admission
+either prevents retirement or fails against the closed budget, including through
+a previously copied RelayTarget. If admission wins after the initial idle check,
+the unexposed candidate registration is rolled back under the same state lock.
+No queued or in-flight frame is cancelled by quality-based retirement.
+If a competing ordinary dial filled a vacancy, the candidate is discarded;
+another peer is not evicted. A vacancy can accept the qualified candidate without
+retiring a connection. Existing queue-acceptance semantics still apply: this
+does not prove remote receipt of a previously accepted frame.
+
+Rejected candidates and retired addresses have a 120-second selection cooldown,
+not a protocol-violation penalty. Candidate failure leaves the active pool intact.
+One-connection-per-IP checks and connected-plus-pending accounting still apply.
+DNS candidates refresh every five minutes only when DNS bootstrap is enabled.
+Origin priorities, pool bounds and ordinary reconnect backoff remain unchanged.
+With no spare eligible address (for example max_known_peers equals target_outbound),
+measurement continues but replacement is impossible. PEER_SELECTION logs report
+candidate checks, qualification, replacement and rejection without payloads.
+
+This user-approved availability adaptation supports the existing four client
+operations. Core supplies the messages and handshake, not this RTT policy.
+Peers can lie about ticks or prioritize probes over broadcasts; a false-future
+cache can make healthy peers appear stale. No authentication, consensus or
+inclusion guarantee is added. Wire formats, RPCs, signatures, fanout, client
+scheduling and VPN routes are unchanged. The <=1% goal needs live verification.
 
 ## Framing, correlation, and resource limits
 
@@ -145,18 +223,34 @@ types, sizes, counts, terminal frames, total frames, and total bytes for each
 peer. Responses from a wrong peer, repeated terminal response, incompatible
 type, or incompatible size cannot satisfy the request. Completed identifiers
 remain in a bounded 60-second cache so late frames are ignored or treated as a
-protocol violation according to request type.
+protocol violation according to request type. A control request cancelled or
+timed out before receiving any response ignores late frames; it must not penalize
+a peer for its first delayed response. A completed control request that received
+a response retains duplicate-response rejection only for the session that
+actually responded. Another peer with the same identifier is ignored, as it is
+while the request is active; identifier equality alone cannot justify a penalty.
 
 Resource invariants are:
 
 - at most 64 concurrent peer-backed gRPC queries;
 - at most 32 concurrent broadcasts;
 - at most three peer sessions raced per query;
-- at most six peer sessions selected for transaction dissemination;
+- a configured 1–32 peer sessions selected for local transaction dissemination
+  (default six);
 - 1,024 queued frames and 32 MiB of queued bytes per peer;
 - 256 MiB shared outbound-byte budget;
 - bounded per-request response channels and byte permits;
+- at most eight queued or executing TickData verification jobs process-wide;
+  each blocking job owns its permit through completion, even when its query is
+  cancelled or times out. Admission precedes copying the verification payload;
+  exhaustion returns local overload without penalizing the responding peer;
 - bounded signed-message verification concurrency and deduplication caches.
+
+After response validation and byte-budget admission, each queued pending
+response owns a compact copy of its frame. It must not retain a shared TCP
+receive allocation larger than the charged frame length. Copies are bounded by
+the existing response contracts and permits; correlation, ordering, deadlines,
+and overload results are unchanged.
 
 Peer-specific queue exhaustion disconnects and penalizes that peer. Global
 local-memory pressure rejects new work without attributing the condition to a
@@ -214,9 +308,20 @@ accepted set supplies TickData verification keys.
 - K12 over the Core signed body, with the message-type transform, verifies
   under the designated computor's FourQ key.
 
+Calendar field bounds follow Core's wire guard (February uses wire year modulo
+four). Timestamp conversion separately follows Core `platform/time.h::dayIndex`,
+including Gregorian century exceptions, shifted to the Unix epoch for comparison
+with the host clock. The field guard and timestamp conversion are not interchangeable.
+
 Missing current-epoch keys produces an unavailable observation, never a false
 empty result. `has_transactions` is true if at least one verified digest is
-non-zero; raw transactions and TickData are not returned over gRPC.
+non-zero. All non-zero 32-byte digests are returned over gRPC in Core slot
+order as `transaction_digests`, with `digests_complete=true` only for a
+successfully authenticated response (including an empty set). Raw transaction
+bytes and the full TickData structure are not returned. These digests identify
+K12 of complete signed transactions, not successful contract execution or
+consensus finality. The local gRPC consumer trusts this node to authenticate
+the leader signature; the response is not a portable cryptographic proof.
 
 ## gRPC operation flows
 
@@ -229,14 +334,30 @@ greatest observed epoch/tick and identifies the structural cache as its source.
 zero; RandomClient conservatively derives its epoch initial tick and uses a
 1,000 ms duration fallback.
 
+The internal `RespondCurrentTickInfo` decoder converts Core's unsigned 16-bit
+elapsed whole seconds in the current tick to unsigned 32-bit milliseconds.
+This is elapsed time, not an average tick-duration estimate. It is not published
+by the atomic status cache or used for peer RTT ranking. The maximum wire value
+converts to 65,535,000 ms without truncation.
+
 ### GetTickTransactions
 
 The service admits the request through the shared peer-query semaphore, sends
 Core `RequestTickData` to up to three established sessions, and waits within
 the configured end-to-end deadline. The first fully authenticated TickData
-returns its transaction-presence boolean. `END_RESPONSE`, `TRY_AGAIN`, missing
+returns its transaction-presence boolean and complete digest list. Errors leave
+`digests_complete=false` and the list empty. The additive protobuf fields 5/6
+preserve the existing fields; new clients distinguish legacy presence-only
+responses from authenticated empty lists. `END_RESPONSE`, `TRY_AGAIN`, missing
 computor keys, timeout, and disconnection are unavailable outcomes. A malformed
 or bad-signature peer response disconnects and penalizes that peer.
+
+The query deadline also bounds waiting for the state mutex when applying a
+protocol penalty. If that wait exceeds the deadline, the query returns timeout
+and releases its registrations and owned tasks; the pending penalty is cancelled,
+as it is on external request cancellation. No detached penalty task is spawned.
+The same rule applies to contract queries. With an available mutex, malformed
+responses retain the existing disconnect and cooldown behavior.
 
 ### QueryContractFunction
 
@@ -274,11 +395,30 @@ Before network fanout, the service requires the exact Core transaction layout:
 non-negative amount within Core's maximum, exact total length, and a valid K12
 plus FourQ signature under the source public key.
 
-Admission then applies a global token bucket of 100 requests/second with burst
-200 and a per-client bucket of 10 requests/second with burst 20. Simultaneous
+Before signature verification, admission applies a global token bucket of 100 requests/second with burst
+200 and a per-client bucket of 10 requests/second with burst 20. The broadcast
+concurrency permit is also acquired before verification. Non-empty malformed or
+bad-signature submissions consume admission capacity; they cannot bypass the
+CPU-work limits by failing validation. No unverified bytes reach fanout. Simultaneous
 identical byte sequences are coalesced behind one leader; completed submissions
-are not permanently deduplicated. The transaction frame is offered to up to
-six established peer queues.
+are not permanently deduplicated. Registering a follower removes closed follower
+channels first, so repeated cancellation cannot grow the waiter list beyond the
+broadcast concurrency bound while the leader is pending. Leader completion or
+cancellation removes the entry and releases all remaining followers. The transaction frame is offered to up to
+`broadcast_fanout` established peer queues (1–32, default six).
+
+On 2026-10-25 the user explicitly approved an experiment up to 32 direct
+recipients. Core `src/network_core/peers.h` defines
+`DISSEMINATION_MULTIPLIER = 6` and random recipient selection. The default
+preserves that count and selection; `--broadcast-fanout` is an explicit local
+submission adaptation, not a change to Core wire format or a general relay.
+The production caller remains RandomClient `QlnBackend::broadcast_transaction`.
+It addresses measured short dissemination windows after the T-4 reveal gate.
+Recipients are distinct established sessions, limited by the configured count
+and available sessions. Raising fanout increases traffic and queue pressure;
+all signature checks, rate limits, FIFO queues, byte budgets, per-peer failure
+handling, immutable bytes, and queue-acceptance semantics remain unchanged.
+No new peer trust or inclusion guarantee is introduced.
 
 `ok=true` means at least one peer queue accepted the validated frame. It does
 not mean a peer transmitted it, a computor received it, or the contract
@@ -347,6 +487,13 @@ retry, and protocol-violation behavior are tested in their owning Rust modules.
 - New protocol behavior requires a demonstrated RandomClient production caller
   and a current Core parity review.
 
+The 2026-10-25 digest API extension is traced in
+`docs/ARCHITECTURE_COMPLIANCE_AUDIT.md` against RandomClient
+`ab98d55b9bd10f61690f4fa017dcc13ab50faef2` plus the existing T-4 worktree change,
+this node's `b959418775c1f1d0da833a04c596b87719e9d479`, and Core
+`98102e74d50db4c21473ef3e9ad21cdca6fd69aa`. It exposes Core digests for the
+client's delayed full-hash comparison without changing validation or trust.
+
 ## Change consistency checklist
 
 Before changing behavior, record current RandomClient and Core baselines, trace
@@ -361,3 +508,41 @@ GitNexus change detection, and execute formatting, Clippy, and the complete
 workspace test suite. A known discrepancy between code, schema, README,
 architecture, trust decisions, and the traced upstream behavior must not
 remain.
+
+
+With `--traffic-log` or `--transaction-log`, transaction writes also emit `TX_RESULT` with the full
+public transaction ID, target tick, peer, queue/write durations in microseconds,
+observed ticks before/after the write, and written/failed result. A completed
+write means delivery to the local TCP stack, not peer or leader acceptance.
+No transaction bytes or preimages are logged.
+Debug formatting of `ValidatedTransaction`, `OutboundFrame`, and `PendingFrame`
+includes only the type and byte length, never the payload. This also protects
+nested queue/event diagnostics. Queue timestamps do not change
+FIFO ordering, byte budgets, deadlines, or broadcast acceptance semantics.
+
+`--transaction-log` enables outbound frame and transaction diagnostics without
+verbose inbound traffic. Both diagnostics switches default to off. The bounded
+logger can drop records under overload; missing log entries are not evidence of
+a missing network write.
+
+## Build and release boundary
+
+The workflow is supporting deployment infrastructure for the existing four
+RandomClient operations. It uses `rust-toolchain.toml`, checks formatting,
+Clippy and all workspace test targets on Linux and Windows, and runs dependency
+security checks. Push, pull-request and manual events run these checks; a
+weekly schedule runs security only. Jobs have bounded durations. Concurrency
+is separated by workflow, event and ref; tag runs are not automatically cancelled.
+
+Only pushed `v*` tags release, and the tag must equal the root package version.
+Read-only build jobs produce both platform binaries, verify their version and
+help commands, and upload artifacts with SHA256 sidecars. One publication job
+waits for the complete matrix, requires both artifacts and matching checksums,
+and publishes both binaries plus `SHA256SUMS`. Only that job has contents-write
+permission. Remote publication is not atomic. No smoke command starts the node
+or connects to Qubic peers. Protocol, API and trust mappings remain unchanged.
+
+This workflow update was checked against RandomClient
+`7ffec2a5e3fddbf77ed4b59469a02e93163a12f6` and Core
+`98102e74d50db4c21473ef3e9ad21cdca6fd69aa` (unrelated NFT/asset worktree edits).
+It preserves the existing node worktree changes based on `b959418775c1f1d0da833a04c596b87719e9d479`.

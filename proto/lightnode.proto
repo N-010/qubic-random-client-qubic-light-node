@@ -42,6 +42,11 @@ message GetTickTransactionsResponse {
   // Derived from the transaction-digest array in a FourQ-verified Core TickData.
   bool has_transactions = 3;
   string error = 4;
+  // All non-zero 32-byte K12 digests from authenticated TickData, in slot order.
+  // These identify complete signed transactions, not successful contract calls.
+  repeated bytes transaction_digests = 5;
+  // False on legacy servers/errors. True also for an authenticated empty list.
+  bool digests_complete = 6;
 }
 
 message QueryContractFunctionRequest {

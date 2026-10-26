@@ -34,6 +34,7 @@ pub(crate) struct Config {
     pub(crate) grpc_listen_addr: SocketAddr,
     pub(crate) peer_port: u16,
     pub(crate) target_outbound: usize,
+    pub(crate) broadcast_fanout: u8,
     pub(crate) max_known_peers: usize,
     pub(crate) reconnect_interval: Duration,
     pub(crate) peer_write_timeout: Duration,
@@ -45,6 +46,7 @@ pub(crate) struct Config {
     pub(crate) dns_lite_peers: usize,
     pub(crate) dns_timeout: Duration,
     pub(crate) traffic_log: bool,
+    pub(crate) transaction_log: bool,
     pub(crate) seed_peers: Vec<SocketAddrV4>,
     pub(crate) critical_peer_threshold: usize,
     pub(crate) emergency_dns_bootstrap: bool,
@@ -80,6 +82,15 @@ struct Cli {
         help_heading = "P2P"
     )]
     target_outbound: usize,
+
+    #[arg(
+        long,
+        default_value_t = 6,
+        value_parser = clap::value_parser!(u8).range(1..=32),
+        help = "Maximum peers per local transaction broadcast (1-32)",
+        help_heading = "P2P"
+    )]
+    broadcast_fanout: u8,
 
     #[arg(
         long = "max-known-peers",
@@ -139,7 +150,11 @@ struct Cli {
         long = "max-frame-bytes",
         value_name = "BYTES",
         default_value_t = DEFAULT_MAX_FRAME_BYTES,
-        help = "Maximum accepted Qubic frame size (minimum 65551; maximum 16777215 bytes)",
+        help = format!(
+            "Maximum accepted Qubic frame size (minimum {}; maximum {} bytes)",
+            crate::frame::MIN_OPERATIONAL_FRAME_BYTES,
+            crate::frame::MAX_FRAME_SIZE,
+        ),
         help_heading = "P2P"
     )]
     max_frame_bytes: usize,
@@ -150,6 +165,13 @@ struct Cli {
         help_heading = "Diagnostics"
     )]
     traffic_log: bool,
+
+    #[arg(
+        long,
+        help = "Log outbound frames and transaction write timing without inbound traffic",
+        help_heading = "Diagnostics"
+    )]
+    transaction_log: bool,
 
     #[arg(
         long = "no-dns-bootstrap",
@@ -230,6 +252,14 @@ struct Cli {
 }
 
 impl Config {
+    pub(crate) fn bootstrap_lite_peers(&self) -> usize {
+        if self.dns_lite_peers == 0 {
+            self.target_outbound.saturating_mul(3).max(8)
+        } else {
+            self.dns_lite_peers
+        }
+    }
+
     pub(crate) fn from_env() -> Result<Self, clap::Error> {
         Self::from_args(env::args_os())
     }
@@ -310,6 +340,7 @@ impl Config {
             grpc_listen_addr: cli.grpc_listen,
             peer_port: cli.peer_port,
             target_outbound: cli.target_outbound,
+            broadcast_fanout: cli.broadcast_fanout,
             max_known_peers: cli.max_known_peers,
             reconnect_interval: Duration::from_millis(cli.reconnect_ms.max(MIN_RECONNECT_MS)),
             peer_write_timeout: Duration::from_millis(cli.peer_write_timeout_ms),
@@ -328,6 +359,7 @@ impl Config {
             dns_lite_peers: cli.dns_lite_peers,
             dns_timeout: Duration::from_millis(cli.dns_timeout_ms.max(MIN_DNS_TIMEOUT_MS)),
             traffic_log: cli.traffic_log,
+            transaction_log: cli.transaction_log,
             seed_peers,
             critical_peer_threshold,
             emergency_dns_bootstrap: !cli.no_emergency_dns,
@@ -351,6 +383,28 @@ fn parse_peer_arg(value: &str, default_port: u16) -> Result<SocketAddrV4, String
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_count_handles_maximum_cli_target_without_wrapping() {
+        let largest = usize::MAX.to_string();
+        let config = super::Config::from_args([
+            "QubicLightNode",
+            "--target-outbound",
+            &largest,
+            "--max-known-peers",
+            &largest,
+        ])
+        .unwrap();
+        assert_eq!(config.bootstrap_lite_peers(), usize::MAX);
+        let config =
+            super::Config::from_args(["QubicLightNode", "--target-outbound", "8"]).unwrap();
+        assert_eq!(config.bootstrap_lite_peers(), 24);
+        let config =
+            super::Config::from_args(["QubicLightNode", "--target-outbound", "0"]).unwrap();
+        assert_eq!(config.bootstrap_lite_peers(), 8);
+        let config = super::Config::from_args(["QubicLightNode", "--dns-lite-peers", "7"]).unwrap();
+        assert_eq!(config.bootstrap_lite_peers(), 7);
+    }
+
     use super::{Config, DEFAULT_GRPC_PORT, DEFAULT_PORT};
     use clap::error::ErrorKind;
     use pretty_assertions::assert_eq;
@@ -391,6 +445,27 @@ mod tests {
     }
 
     #[test]
+    fn transaction_logging_does_not_enable_inbound_traffic_logging() {
+        let config = parse_config(&["--transaction-log"]);
+        assert!(config.transaction_log);
+        assert!(!config.traffic_log);
+    }
+
+    #[test]
+    fn broadcast_fanout_is_bounded_and_opt_in() {
+        assert_eq!(parse_config(&[]).broadcast_fanout, 6);
+        for value in ["1", "6", "32"] {
+            assert_eq!(
+                parse_config(&["--broadcast-fanout", value]).broadcast_fanout,
+                value.parse::<u8>().unwrap()
+            );
+        }
+        for value in ["0", "33", "256", "-1"] {
+            assert!(Config::from_args(["QubicLightNode", "--broadcast-fanout", value]).is_err());
+        }
+    }
+
+    #[test]
     fn uses_defaults_without_args() {
         assert_eq!(
             parse_config(&[]),
@@ -410,6 +485,8 @@ mod tests {
                 dns_lite_peers: 0,
                 dns_timeout: Duration::from_millis(5_000),
                 traffic_log: false,
+                transaction_log: false,
+                broadcast_fanout: 6,
                 seed_peers: Vec::new(),
                 critical_peer_threshold: 4,
                 emergency_dns_bootstrap: true,

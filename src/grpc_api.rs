@@ -145,6 +145,8 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
                 ok: false,
                 tick,
                 has_transactions: false,
+                transaction_digests: Vec::new(),
+                digests_complete: false,
                 error: PEER_QUERY_OVERLOADED_ERROR.to_string(),
             }));
         };
@@ -159,16 +161,22 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
         )
         .await
         {
-            Ok(has_transactions) => Ok(Response::new(lightnodepb::GetTickTransactionsResponse {
-                ok: true,
-                tick,
-                has_transactions,
-                error: String::new(),
-            })),
+            Ok(transaction_digests) => {
+                Ok(Response::new(lightnodepb::GetTickTransactionsResponse {
+                    ok: true,
+                    tick,
+                    has_transactions: !transaction_digests.is_empty(),
+                    transaction_digests: transaction_digests.into_iter().map(Vec::from).collect(),
+                    digests_complete: true,
+                    error: String::new(),
+                }))
+            }
             Err(err) => Ok(Response::new(lightnodepb::GetTickTransactionsResponse {
                 ok: false,
                 tick,
                 has_transactions: false,
+                transaction_digests: Vec::new(),
+                digests_complete: false,
                 error: err.to_string(),
             })),
         }
@@ -188,8 +196,6 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
             }));
         }
 
-        let transaction =
-            validate_transaction(&tx_bytes, None).map_err(Status::invalid_argument)?;
         let _broadcast_permit = Arc::clone(&self.broadcast_slots)
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("Broadcast concurrency limit reached"))?;
@@ -201,6 +207,9 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
         {
             return Err(Status::resource_exhausted("Broadcast rate limit exceeded"));
         }
+
+        let transaction =
+            validate_transaction(&tx_bytes, None).map_err(Status::invalid_argument)?;
 
         let tx_id = tx_id_from_bytes(&tx_bytes);
         let digest = *blake3::hash(&tx_bytes).as_bytes();
@@ -217,6 +226,7 @@ impl lightnodepb::light_node_server::LightNode for GrpcService {
                     Arc::clone(&self.api.node_state),
                     Arc::clone(&self.api.outbound_budget),
                     transaction,
+                    self.api.config.broadcast_fanout,
                 )
                 .await;
                 leader.complete(result.clone());
@@ -368,6 +378,8 @@ impl Drop for BroadcastLeaderGuard {
 impl BroadcastInflight {
     fn begin(&mut self, digest: [u8; 32]) -> InflightRole {
         if let Some(waiters) = self.waiters.get_mut(&digest) {
+            // Cancelled followers release admission slots; do not retain their channels.
+            waiters.retain(|waiter| !waiter.is_closed());
             let (tx, rx) = oneshot::channel();
             waiters.push(tx);
             InflightRole::Follower(rx)
@@ -397,7 +409,7 @@ fn map_tick_status(status: TickStatus) -> lightnodepb::TickStatus {
         epoch: status.epoch as u32,
         tick: status.tick,
         initial_tick: status.initial_tick,
-        tick_duration_ms: status.tick_duration_ms as u32,
+        tick_duration_ms: status.tick_duration_ms,
         aligned_votes: status.aligned_votes as u32,
         misaligned_votes: status.misaligned_votes as u32,
     }
@@ -433,6 +445,8 @@ mod tests {
             dns_lite_peers: 0,
             dns_timeout: Duration::from_secs(1),
             traffic_log: false,
+            transaction_log: false,
+            broadcast_fanout: 6,
             seed_peers: Vec::new(),
             critical_peer_threshold: 4,
             emergency_dns_bootstrap: false,
@@ -457,6 +471,85 @@ mod tests {
             broadcast_rate: Arc::new(StdMutex::new(BroadcastRateLimiter::default())),
             broadcasts_inflight: Arc::new(StdMutex::new(BroadcastInflight::default())),
         }
+    }
+
+    #[tokio::test]
+    async fn tick_data_api_returns_complete_authenticated_digests() {
+        for has_transactions in [false, true] {
+            let node_state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
+            let (peer_tx, mut peer_rx) = mpsc::channel(2);
+            let (disconnect_tx, _disconnect_rx) = watch::channel(false);
+            let peer_id = node_state
+                .lock()
+                .await
+                .register_session(
+                    SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DEFAULT_PORT),
+                    true,
+                    peer_tx,
+                    disconnect_tx,
+                    DEFAULT_PORT,
+                )
+                .unwrap();
+            let service = test_service(node_state);
+            let (epoch, tick) = (301, 12_345);
+            let (payload, computor, key) =
+                crate::verified::signed_tick_data_for_test(epoch, tick, has_transactions);
+            service
+                .api
+                .trusted_network
+                .set_computor_key_for_test(epoch, computor, key);
+            let pending = Arc::clone(&service.api.pending_requests);
+            let query = tokio::spawn(async move {
+                service
+                    .get_tick_transactions(Request::new(lightnodepb::GetTickTransactionsRequest {
+                        tick,
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+            });
+            let request = peer_rx.recv().await.unwrap().bytes;
+            let dejavu = u32::from_le_bytes(request[4..8].try_into().unwrap());
+            let frame = crate::frame::build_request_frame(
+                crate::frame::BROADCAST_FUTURE_TICK_DATA_TYPE,
+                dejavu,
+                &payload,
+            )
+            .unwrap();
+            pending.deliver(peer_id, dejavu, Bytes::from(frame));
+            assert_eq!(
+                query.await.unwrap(),
+                lightnodepb::GetTickTransactionsResponse {
+                    ok: true,
+                    tick,
+                    has_transactions,
+                    transaction_digests: if has_transactions {
+                        vec![vec![9; 32]]
+                    } else {
+                        vec![]
+                    },
+                    digests_complete: true,
+                    error: String::new(),
+                }
+            );
+            assert_eq!(pending.active_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn tick_data_api_error_does_not_claim_complete_empty_data() {
+        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
+        let response = service
+            .get_tick_transactions(Request::new(lightnodepb::GetTickTransactionsRequest {
+                tick: 42,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!response.ok);
+        assert!(!response.digests_complete);
+        assert!(response.transaction_digests.is_empty());
+        assert!(!response.error.is_empty());
     }
 
     fn valid_transaction(marker: u8) -> Vec<u8> {
@@ -517,6 +610,59 @@ mod tests {
         let expected_frame = build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &tx_bytes)
             .expect("broadcast frame should be buildable");
         assert_eq!(&*outbound_frame.bytes, expected_frame.as_slice());
+    }
+
+    #[tokio::test]
+    async fn configured_broadcast_fanout_preserves_exact_frames_and_limits_recipients() {
+        for (fanout, peer_count) in [(6, 40), (32, 40), (32, 8), (1, 40)] {
+            let state = Arc::new(Mutex::new(NodeState::new(100, &[])));
+            let mut receivers = Vec::new();
+            for peer in 1..=peer_count {
+                let (tx, rx) = mpsc::channel(1);
+                let (disconnect, _) = watch::channel(false);
+                state
+                    .lock()
+                    .await
+                    .register_session(
+                        SocketAddrV4::new(Ipv4Addr::new(11, 1, 1, peer), DEFAULT_PORT),
+                        true,
+                        tx,
+                        disconnect,
+                        DEFAULT_PORT,
+                    )
+                    .unwrap();
+                receivers.push(rx);
+            }
+            let mut service = test_service(state);
+            Arc::make_mut(&mut service.api.config).broadcast_fanout = fanout;
+            let tx_bytes = valid_transaction(1);
+            let expected_frame =
+                build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &tx_bytes).unwrap();
+            let response = service
+                .broadcast_transaction(Request::new(lightnodepb::BroadcastTransactionRequest {
+                    tx_bytes: tx_bytes.clone(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                response,
+                lightnodepb::BroadcastTransactionResponse {
+                    ok: true,
+                    tx_id: tx_id_from_bytes(&tx_bytes),
+                    error: String::new(),
+                }
+            );
+            let frames: Vec<_> = receivers
+                .iter_mut()
+                .filter_map(|rx| rx.try_recv().ok())
+                .map(|frame| frame.bytes.to_vec())
+                .collect();
+            assert_eq!(
+                frames,
+                vec![expected_frame; usize::from(fanout.min(peer_count))]
+            );
+        }
     }
 
     #[tokio::test]
@@ -635,7 +781,21 @@ mod tests {
 
     #[tokio::test]
     async fn sixty_fifth_peer_backed_request_is_rejected_without_blocking_other_methods() {
-        let service = test_service(Arc::new(Mutex::new(NodeState::new(1_000, &[]))));
+        let state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
+        let (tx, mut rx) = mpsc::channel(2);
+        let (disconnect, _watch) = watch::channel(false);
+        state
+            .lock()
+            .await
+            .register_session(
+                SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DEFAULT_PORT),
+                true,
+                tx,
+                disconnect,
+                DEFAULT_PORT,
+            )
+            .unwrap();
+        let service = test_service(state);
         let permits = (0..MAX_CONCURRENT_PEER_QUERIES)
             .map(|_| {
                 service
@@ -665,18 +825,72 @@ mod tests {
                 .into_inner();
         assert!(status.error.contains("No tick data"));
 
-        let broadcast = LightNode::broadcast_transaction(
-            &service,
-            Request::new(lightnodepb::BroadcastTransactionRequest {
-                tx_bytes: Vec::new(),
-            }),
+        let bytes = valid_transaction(8);
+        let broadcast = tokio::time::timeout(
+            Duration::from_secs(1),
+            LightNode::broadcast_transaction(
+                &service,
+                Request::new(lightnodepb::BroadcastTransactionRequest {
+                    tx_bytes: bytes.clone(),
+                }),
+            ),
         )
         .await
+        .expect("peer-query saturation must not block a valid broadcast")
         .expect("broadcast should remain available")
         .into_inner();
-        assert_eq!(broadcast.error, "Transaction payload is empty");
+        assert_eq!(
+            broadcast,
+            lightnodepb::BroadcastTransactionResponse {
+                ok: true,
+                tx_id: tx_id_from_bytes(&bytes),
+                error: String::new(),
+            }
+        );
+        let sent = rx
+            .try_recv()
+            .expect("validated transaction must reach the peer queue");
+        assert_eq!(
+            &*sent.bytes,
+            build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &bytes).unwrap()
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(service.peer_query_slots.available_permits(), 0);
+        assert_eq!(
+            service.broadcast_slots.available_permits(),
+            MAX_CONCURRENT_BROADCASTS
+        );
 
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn broadcast_limits_apply_before_invalid_signature_verification() {
+        for concurrent_limit in [false, true] {
+            let service = test_service(Arc::new(Mutex::new(NodeState::new(10, &[]))));
+            let held = if concurrent_limit {
+                Some(
+                    Arc::clone(&service.broadcast_slots)
+                        .try_acquire_many_owned(MAX_CONCURRENT_BROADCASTS as u32)
+                        .unwrap(),
+                )
+            } else {
+                let mut rate = service.broadcast_rate.lock().unwrap();
+                rate.global.tokens = 0.0;
+                rate.global.last_refill = Instant::now() + Duration::from_secs(60);
+                None
+            };
+            let mut tx_bytes = crate::frame::signed_transaction_for_test(1);
+            *tx_bytes.last_mut().unwrap() ^= 1;
+            let error = LightNode::broadcast_transaction(
+                &service,
+                Request::new(lightnodepb::BroadcastTransactionRequest { tx_bytes }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+            drop(held);
+        }
     }
 
     #[test]
@@ -732,6 +946,108 @@ mod tests {
 
         assert!(!limiter.allow(Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), now));
         assert!(limiter.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn broadcast_handler_releases_cancelled_followers_and_sends_once() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let state = Arc::new(Mutex::new(NodeState::new(1_000, &[])));
+        let service = test_service(Arc::clone(&state));
+        let (tx, mut rx) = mpsc::channel(2);
+        let (disconnect, _watch) = watch::channel(false);
+        let mut locked = state.lock().await;
+        locked
+            .register_session(
+                SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DEFAULT_PORT),
+                true,
+                tx,
+                disconnect,
+                DEFAULT_PORT,
+            )
+            .unwrap();
+        let bytes = valid_transaction(8);
+        let digest = *blake3::hash(&bytes).as_bytes();
+        let request = lightnodepb::BroadcastTransactionRequest {
+            tx_bytes: bytes.clone(),
+        };
+        let mut leader = Box::pin(service.broadcast_transaction(Request::new(request.clone())));
+        poll_fn(|cx| {
+            assert!(leader.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        for _ in 0..10 {
+            let mut follower =
+                Box::pin(service.broadcast_transaction(Request::new(request.clone())));
+            poll_fn(|cx| {
+                assert!(follower.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                service.broadcast_slots.available_permits(),
+                MAX_CONCURRENT_BROADCASTS - 2
+            );
+            assert_eq!(
+                service.broadcasts_inflight.lock().unwrap().waiters[&digest].len(),
+                1
+            );
+            drop(follower);
+            assert_eq!(
+                service.broadcast_slots.available_permits(),
+                MAX_CONCURRENT_BROADCASTS - 1
+            );
+        }
+        drop(locked);
+        assert_eq!(
+            leader.await.unwrap().into_inner(),
+            lightnodepb::BroadcastTransactionResponse {
+                ok: true,
+                tx_id: tx_id_from_bytes(&bytes),
+                error: String::new(),
+            }
+        );
+        assert_eq!(
+            service.broadcast_slots.available_permits(),
+            MAX_CONCURRENT_BROADCASTS
+        );
+        assert!(
+            service
+                .broadcasts_inflight
+                .lock()
+                .unwrap()
+                .waiters
+                .is_empty()
+        );
+        let sent = rx.try_recv().unwrap();
+        assert_eq!(
+            &*sent.bytes,
+            build_request_frame(BROADCAST_TRANSACTION_TYPE, 0, &bytes).unwrap()
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_broadcast_followers_do_not_accumulate() {
+        let mut inflight = BroadcastInflight::default();
+        let digest = [7; 32];
+        assert!(matches!(inflight.begin(digest), InflightRole::Leader));
+        let InflightRole::Follower(active) = inflight.begin(digest) else {
+            panic!("expected follower");
+        };
+        for _ in 0..1_000 {
+            let InflightRole::Follower(cancelled) = inflight.begin(digest) else {
+                panic!("expected follower");
+            };
+            assert!(inflight.waiters[&digest].len() <= 2);
+            drop(cancelled);
+        }
+        inflight.complete(digest, Ok(()));
+        assert_eq!(active.await.unwrap(), Ok(()));
+        assert!(inflight.waiters.is_empty());
+        assert!(matches!(inflight.begin(digest), InflightRole::Leader));
     }
 
     #[tokio::test]

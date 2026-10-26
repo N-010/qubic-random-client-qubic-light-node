@@ -17,12 +17,14 @@ use crate::verified::{TickDataVerification, TrustedNetworkState};
 use bytes::Bytes;
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
 const MAX_PARALLEL_PEER_QUERIES: usize = 3;
+static TICK_VERIFICATION_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(8)));
 const CONTRACT_RESPONSE_RULES: &[ResponseRule] = &[
     ResponseRule {
         message_type: RESPOND_CONTRACT_FUNCTION_TYPE,
@@ -136,6 +138,43 @@ const CURRENT_TICK_RESPONSE_RULES: &[ResponseRule] = &[
     },
 ];
 
+pub(crate) async fn probe_current_tick(
+    state: Arc<Mutex<NodeState>>,
+    pending: Arc<PendingRequests>,
+    outbound_budget: Arc<Semaphore>,
+    target: RelayTarget,
+    timeout_duration: std::time::Duration,
+) -> Result<crate::types::TickStatus, PeerQueryError> {
+    timeout_at(Instant::now() + timeout_duration, async {
+        let (registration, mut receivers) = pending.register_with_spec(
+            [target.peer_id],
+            PendingSpec {
+                response_rules: CURRENT_TICK_RESPONSE_RULES,
+                max_response_frames: 1,
+                max_response_bytes: HEADER_SIZE + RESPOND_CURRENT_TICK_INFO_PAYLOAD_SIZE,
+            },
+        );
+        let (_, mut receiver) = receivers.pop().expect("one peer receiver");
+        let request = Bytes::from(
+            build_request_frame(REQUEST_CURRENT_TICK_INFO_TYPE, registration.dejavu(), &[])
+                .map_err(PeerQueryError::Internal)?,
+        );
+        send_request_to_targets(&state, &pending, vec![target], &request, &outbound_budget).await?;
+        match receiver.recv().await {
+            Some(PendingEvent::Frame(frame)) if frame[3] == RESPOND_CURRENT_TICK_INFO_TYPE => {
+                parse_tick_status_from_frame(&frame).ok_or_else(|| {
+                    PeerQueryError::Protocol("Malformed current tick info".to_string())
+                })
+            }
+            Some(PendingEvent::Frame(_)) | Some(PendingEvent::PeerDisconnected) | None => Err(
+                PeerQueryError::PeerUnavailable("Peer current tick info unavailable".to_string()),
+            ),
+        }
+    })
+    .await
+    .map_err(|_| api_timeout_error(timeout_duration))?
+}
+
 pub(crate) async fn query_contract_function(
     state: Arc<Mutex<NodeState>>,
     pending: Arc<PendingRequests>,
@@ -202,7 +241,9 @@ pub(crate) async fn query_contract_function(
             }
             Ok((peer_id, Err(err))) => {
                 if matches!(err, PeerQueryError::Protocol(_)) {
-                    penalize_protocol_peer(&state, peer_id).await;
+                    timeout_at(deadline, penalize_protocol_peer(&state, peer_id))
+                        .await
+                        .map_err(|_| api_timeout_error(timeout_duration))?;
                 }
                 last_err = format!("peer {peer_id}: {err}");
             }
@@ -298,7 +339,7 @@ pub(crate) async fn query_tick_data(
     trusted_network: Arc<TrustedNetworkState>,
     config: Arc<Config>,
     tick: u32,
-) -> Result<bool, PeerQueryError> {
+) -> Result<Vec<[u8; 32]>, PeerQueryError> {
     let timeout_duration = config.api_timeout;
     let deadline = Instant::now() + timeout_duration;
     let targets = timeout_at(deadline, state.lock())
@@ -354,13 +395,15 @@ pub(crate) async fn query_tick_data(
             break;
         };
         match result {
-            Ok((_peer_id, Ok(has_transactions))) => {
+            Ok((_peer_id, Ok(transaction_digests))) => {
                 join_set.abort_all();
-                return Ok(has_transactions);
+                return Ok(transaction_digests);
             }
             Ok((peer_id, Err(err))) => {
                 if matches!(err, PeerQueryError::Protocol(_)) {
-                    penalize_protocol_peer(&state, peer_id).await;
+                    timeout_at(deadline, penalize_protocol_peer(&state, peer_id))
+                        .await
+                        .map_err(|_| api_timeout_error(timeout_duration))?;
                 }
                 last_err = format!("peer {peer_id}: {err}");
             }
@@ -420,29 +463,45 @@ async fn receive_contract_function(
     ))
 }
 
+async fn verify_tick_data_bounded(
+    trusted_network: Arc<TrustedNetworkState>,
+    payload: &[u8],
+    requested_tick: u32,
+    slots: &Arc<Semaphore>,
+) -> Result<TickDataVerification, PeerQueryError> {
+    let permit = Arc::clone(slots)
+        .try_acquire_owned()
+        .map_err(|_| PeerQueryError::LocalOverload("TickData verification is overloaded"))?;
+    let payload = payload.to_vec();
+    tokio::task::spawn_blocking(move || {
+        // Cancellation of the awaiting query must not release this work's slot.
+        let _permit = permit;
+        trusted_network.verify_tick_data(&payload, requested_tick)
+    })
+    .await
+    .map_err(|err| PeerQueryError::Internal(format!("TickData verification task failed: {err}")))
+}
+
 async fn receive_tick_data(
     mut receiver: mpsc::Receiver<PendingEvent>,
     trusted_network: Arc<TrustedNetworkState>,
     requested_tick: u32,
-) -> Result<bool, PeerQueryError> {
+) -> Result<Vec<[u8; 32]>, PeerQueryError> {
     while let Some(event) = receiver.recv().await {
         match event {
             PendingEvent::Frame(frame) => match frame[3] {
                 BROADCAST_FUTURE_TICK_DATA_TYPE => {
-                    let payload = frame_payload(&frame)?.to_vec();
-                    let verification = tokio::task::spawn_blocking(move || {
-                        trusted_network.verify_tick_data(&payload, requested_tick)
-                    })
-                    .await
-                    .map_err(|err| {
-                        PeerQueryError::Internal(format!(
-                            "TickData verification task failed: {err}"
-                        ))
-                    })?;
+                    let verification = verify_tick_data_bounded(
+                        trusted_network,
+                        frame_payload(&frame)?,
+                        requested_tick,
+                        &TICK_VERIFICATION_SLOTS,
+                    )
+                    .await?;
                     return match verification {
-                        TickDataVerification::Authenticated { has_transactions } => {
-                            Ok(has_transactions)
-                        }
+                        TickDataVerification::Authenticated {
+                            transaction_digests,
+                        } => Ok(transaction_digests),
                         TickDataVerification::Unavailable => Err(PeerQueryError::PeerUnavailable(
                             "authenticated computor keys for TickData are unavailable".to_string(),
                         )),
@@ -577,6 +636,73 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::watch;
 
+    #[tokio::test]
+    async fn tick_verification_overload_is_local_and_releases_after_completion() {
+        let slots = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&slots).acquire_owned().await.unwrap();
+        let trusted = Arc::new(TrustedNetworkState::default());
+        assert_eq!(
+            verify_tick_data_bounded(trusted.clone(), &[], 1, &slots).await,
+            Err(PeerQueryError::LocalOverload(
+                "TickData verification is overloaded"
+            )),
+        );
+        drop(held);
+        assert_eq!(
+            verify_tick_data_bounded(trusted, &[], 1, &slots).await,
+            Ok(TickDataVerification::Malformed),
+        );
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[test]
+    fn cancelled_tick_query_keeps_slot_until_blocking_work_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                let _ = wait.recv();
+            });
+            ready.await.unwrap();
+            let slots = Arc::new(Semaphore::new(1));
+            let worker_slots = Arc::clone(&slots);
+            let query = tokio::spawn(async move {
+                verify_tick_data_bounded(
+                    Arc::new(TrustedNetworkState::default()),
+                    &[],
+                    1,
+                    &worker_slots,
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while slots.available_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            query.abort();
+            assert!(query.await.unwrap_err().is_cancelled());
+            assert_eq!(slots.available_permits(), 0);
+            drop(release);
+            blocker.await.unwrap();
+            let permit =
+                tokio::time::timeout(Duration::from_secs(1), Arc::clone(&slots).acquire_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            drop(permit);
+            assert_eq!(slots.available_permits(), 1);
+        });
+    }
+
     fn pending_frame(bytes: Bytes) -> PendingEvent {
         PendingEvent::Frame(crate::pending::PendingFrame::for_test(bytes))
     }
@@ -598,6 +724,8 @@ mod tests {
             dns_lite_peers: 0,
             dns_timeout: Duration::from_secs(1),
             traffic_log: false,
+            transaction_log: false,
+            broadcast_fanout: 6,
             seed_peers: Vec::new(),
             critical_peer_threshold: 4,
             emergency_dns_bootstrap: false,
@@ -875,8 +1003,81 @@ mod tests {
             pending.deliver(peer_id, dejavu, response),
             crate::pending::DeliveryOutcome::Delivered
         );
-        assert!(!query.await.unwrap().unwrap());
+        assert_eq!(query.await.unwrap().unwrap(), Vec::<[u8; 32]>::new());
         assert_eq!(pending.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn protocol_penalty_lock_wait_respects_query_deadline() {
+        for contract in [false, true] {
+            let (state, peer_id, mut peer_rx) = state_with_peer().await;
+            let pending = Arc::new(PendingRequests::default());
+            let query_state = Arc::clone(&state);
+            let query_pending = Arc::clone(&pending);
+            let mut query = tokio::spawn(async move {
+                let config = test_config(Duration::from_millis(100));
+                if contract {
+                    query_contract_function(
+                        query_state,
+                        query_pending,
+                        outbound_budget(),
+                        config,
+                        ContractQuery {
+                            contract_index: 3,
+                            input_type: 2,
+                            input: vec![0; 32],
+                            reference: Some((229, 100)),
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    query_tick_data(
+                        query_state,
+                        query_pending,
+                        outbound_budget(),
+                        Arc::new(TrustedNetworkState::default()),
+                        config,
+                        100,
+                    )
+                    .await
+                    .map(|_| ())
+                }
+            });
+            if contract {
+                answer_current_tick(&pending, peer_id, &mut peer_rx, 229, 100).await;
+            }
+            let request = peer_rx.recv().await.unwrap();
+            let dejavu = u32::from_le_bytes(request.bytes[4..8].try_into().unwrap());
+            drop(request);
+            let locked = state.lock().await;
+            let (message_type, payload) = if contract {
+                (END_RESPONSE_TYPE, Vec::new())
+            } else {
+                (
+                    BROADCAST_FUTURE_TICK_DATA_TYPE,
+                    vec![0; TICK_DATA_PAYLOAD_SIZE],
+                )
+            };
+            assert!(pending.deliver(
+                peer_id,
+                dejavu,
+                Bytes::from(build_request_frame(message_type, dejavu, &payload).unwrap())
+            ));
+            let result = tokio::time::timeout(Duration::from_secs(1), &mut query).await;
+            if result.is_err() {
+                query.abort();
+                let _ = query.await;
+            }
+            assert!(matches!(
+                result
+                    .expect("penalty lock must not bypass API deadline")
+                    .unwrap(),
+                Err(PeerQueryError::Deadline(_))
+            ));
+            assert_eq!(pending.active_count(), 0);
+            drop(locked);
+        }
     }
 
     #[tokio::test]
@@ -1048,6 +1249,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_contract_cancellation_cleans_both_request_phases() {
+        for answer_preflight in [false, true] {
+            let (state, peer_id, mut rx) = state_with_peer().await;
+            let pending = Arc::new(PendingRequests::default());
+            let budget = outbound_budget();
+            let initial_budget = budget.available_permits();
+            let query = tokio::spawn(query_contract_function(
+                Arc::clone(&state),
+                Arc::clone(&pending),
+                Arc::clone(&budget),
+                test_config(Duration::from_secs(30)),
+                ContractQuery {
+                    contract_index: 3,
+                    input_type: 2,
+                    input: vec![],
+                    reference: Some((229, 100)),
+                },
+            ));
+            if answer_preflight {
+                answer_current_tick(&pending, peer_id, &mut rx, 229, 100).await;
+            }
+            let request = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                request.bytes[3],
+                if answer_preflight {
+                    crate::frame::REQUEST_CONTRACT_FUNCTION_TYPE
+                } else {
+                    REQUEST_CURRENT_TICK_INFO_TYPE
+                }
+            );
+            let dejavu = u32::from_le_bytes(request.bytes[4..8].try_into().unwrap());
+            drop(request);
+            assert_eq!(pending.active_count(), 1);
+            query.abort();
+            assert!(query.await.unwrap_err().is_cancelled());
+            // Dropping the parent's JoinSet aborts children at their next poll.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while pending.active_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(budget.available_permits(), initial_budget);
+            assert!(state.lock().await.target(peer_id).is_some());
+            let late = Bytes::from(build_request_frame(END_RESPONSE_TYPE, dejavu, &[]).unwrap());
+            assert_eq!(
+                pending.deliver(peer_id, dejavu, late),
+                crate::pending::DeliveryOutcome::Ignored
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn contract_query_without_reference_does_not_query_peers() {
         let (state, _, mut rx) = state_with_peer().await;
         let pending = Arc::new(PendingRequests::default());
@@ -1065,6 +1323,61 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(PeerQueryError::PeerUnavailable(_))));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(pending.active_count(), 0);
+    }
+    #[tokio::test]
+    async fn background_probe_uses_core_frame_and_cleans_all_outcomes() {
+        for answer in [true, false] {
+            let (state, id, mut rx) = state_with_peer().await;
+            let pending = Arc::new(PendingRequests::default());
+            let target = state.lock().await.target(id).unwrap();
+            let duration = Duration::from_millis(30);
+            let task = tokio::spawn(probe_current_tick(
+                state,
+                pending.clone(),
+                outbound_budget(),
+                target,
+                duration,
+            ));
+            if answer {
+                answer_current_tick(&pending, id, &mut rx, 229, 100).await;
+            }
+            let result = task.await.unwrap();
+            if answer {
+                assert_eq!(
+                    result.unwrap(),
+                    crate::types::TickStatus {
+                        epoch: 229,
+                        tick: 100,
+                        initial_tick: 0,
+                        tick_duration_ms: 0,
+                        aligned_votes: 0,
+                        misaligned_votes: 0
+                    }
+                );
+            } else {
+                assert_eq!(result, Err(PeerQueryError::Deadline(duration)));
+            }
+            assert_eq!(pending.active_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn background_probe_local_pressure_does_not_penalize_peer() {
+        let (state, id, mut rx) = state_with_peer().await;
+        let pending = Arc::new(PendingRequests::default());
+        let target = state.lock().await.target(id).unwrap();
+        let result = probe_current_tick(
+            state.clone(),
+            pending.clone(),
+            Arc::new(Semaphore::new(0)),
+            target,
+            Duration::from_millis(30),
+        )
+        .await;
+        assert!(matches!(result, Err(PeerQueryError::LocalOverload(_))));
+        assert!(state.lock().await.target(id).is_some());
         assert!(rx.try_recv().is_err());
         assert_eq!(pending.active_count(), 0);
     }
